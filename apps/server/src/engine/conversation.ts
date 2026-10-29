@@ -23,6 +23,8 @@ import { tanstackAgent } from "./tanstack-agent.ts";
 import { generateImageTool } from "./foundry-image.ts";
 import { analyzeDocumentTool } from "./foundry-document.ts";
 
+import { searchKnowledgeDeskTool } from "./knowledge-desk.ts";
+import { todaysSigningsTool, searchJobsTool, getJobTool } from "./veritas-readonly.ts";
 function clipCalendarText(text: string, limit: number) {
   const clipped = text.slice(0, limit);
   return text.length > limit && /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
@@ -151,6 +153,10 @@ export class ConversationAgent extends AbstractAgent {
     const tools = [
       generateImageTool,
             analyzeDocumentTool,
+      searchKnowledgeDeskTool,
+      todaysSigningsTool,
+      searchJobsTool,
+      getJobTool,
       ...computerTools(
         this.service.computer,
         this.service.files,
