@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
 import { fillPdf, inspectPdf } from "../../../packages/integrations/src/pdf.ts";
@@ -73,9 +73,19 @@ export class Files {
         try {
           await link(temporary, path);
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-          bytes = await readFile(path);
-          metadata = await inspectPdf(bytes);
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            bytes = await readFile(path);
+            metadata = await inspectPdf(bytes);
+          } else if ((error as NodeJS.ErrnoException).code === "ENOTSUP") {
+            // Azure Files (SMB) does not support hard links: fall back to rename.
+            try {
+              bytes = await readFile(path);
+              metadata = await inspectPdf(bytes);
+            } catch (readError) {
+              if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
+              await rename(temporary, path);
+            }
+          } else throw error;
         }
       } finally {
         await rm(temporary, { force: true });
