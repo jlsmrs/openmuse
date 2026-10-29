@@ -12,7 +12,7 @@ RUN corepack enable && corepack prepare pnpm@11.19.0 --activate
 # with ERR_PNPM_UNUSED_PATCH if the metro patch is present but metro itself
 # is absent from the install tree (the selective-copy attempt failed this way).
 COPY . .
-RUN pnpm install --frozen-lockfile && pnpm build:server && pnpm prune --prod
+RUN pnpm install --frozen-lockfile && pnpm build:server && CI=true pnpm prune --prod
 FROM node:24-bookworm-slim AS run
 WORKDIR /app
 ENV NODE_ENV=production
