@@ -21,6 +21,7 @@ import { searchDescription, searchInputSchema, searchInstructions } from "../sea
 import type { AgentService } from "./service.ts";
 import { tanstackAgent } from "./tanstack-agent.ts";
 import { generateImageTool } from "./foundry-image.ts";
+import { analyzeDocumentTool } from "./foundry-document.ts";
 
 function clipCalendarText(text: string, limit: number) {
   const clipped = text.slice(0, limit);
@@ -149,6 +150,7 @@ export class ConversationAgent extends AbstractAgent {
     const browserConfigured = !!(this.config.workerUrl && this.config.workerToken);
     const tools = [
       generateImageTool,
+            analyzeDocumentTool,
       ...computerTools(
         this.service.computer,
         this.service.files,
