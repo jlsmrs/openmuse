@@ -1,5 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { link, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
@@ -95,10 +95,20 @@ export async function readOrCreate(path: string, create: () => string) {
     // Publish only complete bytes, without replacing another process's value.
     await link(temporary, path);
   } catch (error) {
-    if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
-    value = await readFile(path, "utf8");
+    if (error instanceof Error && "code" in error && error.code === "EEXIST") {
+      value = await readFile(path, "utf8");
+    } else if (error instanceof Error && "code" in error && error.code === "ENOTSUP") {
+      // Azure Files (SMB) does not support hard links: fall back to an atomic rename,
+      // still preserving another process's value when one already exists.
+      try {
+        value = await readFile(path, "utf8");
+      } catch (readError) {
+        if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT")) throw readError;
+        await rename(temporary, path);
+      }
+    } else throw error;
   } finally {
-    await unlink(temporary);
+    await unlink(temporary).catch(() => {});
   }
   return value;
 }
