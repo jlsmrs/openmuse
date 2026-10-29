@@ -25,6 +25,7 @@ import { analyzeDocumentTool } from "./foundry-document.ts";
 
 import { searchKnowledgeDeskTool } from "./knowledge-desk.ts";
 import { todaysSigningsTool, searchJobsTool, getJobTool } from "./veritas-readonly.ts";
+import { captureReceiptTool } from "./azure-receipt.ts";
 function clipCalendarText(text: string, limit: number) {
   const clipped = text.slice(0, limit);
   return text.length > limit && /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
@@ -157,6 +158,7 @@ export class ConversationAgent extends AbstractAgent {
       todaysSigningsTool,
       searchJobsTool,
       getJobTool,
+      captureReceiptTool,
       ...computerTools(
         this.service.computer,
         this.service.files,
