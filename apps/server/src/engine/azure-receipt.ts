@@ -50,7 +50,7 @@ export const captureReceiptTool = defineTool({
     const start = await fetch(analyzeUrl, {
       method: "POST",
       headers: { "Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream" },
-      body: raw,
+    body: new Uint8Array(raw),
       signal: AbortSignal.timeout(120_000),
     });
     if (!start.ok) return { error: `Receipt analysis failed to start: HTTP ${start.status}.` };
