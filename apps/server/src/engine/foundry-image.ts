@@ -20,9 +20,9 @@
 // - Foundry rate limit observed: 2 requests/minute — the tool returns a clear
 //   "rate limited, retry shortly" error instead of hanging.
 
-import { defineTool } from "@copilotkit/runtime/v2";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { defineTool } from "@copilotkit/runtime/v2";
 import { z } from "zod";
 
 const imageParams = z.object({
@@ -45,7 +45,9 @@ export const generateImageTool = defineTool({
         : undefined);
     const key = process.env.FOUNDRY_IMAGES_KEY || process.env.OPENAI_API_KEY;
     if (!endpoint || !key) {
-      return { error: "Image generation is not configured: FOUNDRY_IMAGES_ENDPOINT/KEY are missing." };
+      return {
+        error: "Image generation is not configured: FOUNDRY_IMAGES_ENDPOINT/KEY are missing.",
+      };
     }
     const res = await fetch(endpoint, {
       method: "POST",
@@ -62,9 +64,10 @@ export const generateImageTool = defineTool({
     const payload = (await res.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
     const item = payload.data?.[0];
     if (!item) return { error: "Image generation returned no image." };
+    if (!item.b64_json && !item.url) return { error: "Image generation returned no image data." };
     const raw = item.b64_json
       ? Buffer.from(item.b64_json, "base64")
-      : Buffer.from(await (await fetch(item.url!)).arrayBuffer());
+      : Buffer.from(await (await fetch(item.url as string)).arrayBuffer());
     const dir = join(process.env.DATA_DIR || ".openmuse", "generated-images");
     await mkdir(dir, { recursive: true });
     const safe = (filename || `image-${Date.now()}`).replace(/[^A-Za-z0-9._-]/g, "_");

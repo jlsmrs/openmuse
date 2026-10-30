@@ -245,13 +245,17 @@ export function ComputerSheet() {
         ) : tab === "Files" ? (
           <>
             <Text style={s.heading}>Documents</Text>
-            <Text style={s.small}>PDFs saved from mail, browser downloads, and your uploads.</Text>
+            <Text style={s.small}>Files saved from mail, browser downloads, and your uploads.</Text>
             {workspace.files.map((file) => (
               <LinkRow
                 key={file.id}
                 icon={FileText}
                 title={file.name}
-                detail={`${file.pageCount} pages · PDF`}
+                detail={
+                  file.mimeType === "application/pdf"
+                    ? `${file.pageCount} pages · PDF`
+                    : `${Math.max(1, Math.round(file.size / 1024))} KB`
+                }
                 onPress={() => open({ type: "file", file })}
               />
             ))}

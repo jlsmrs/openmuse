@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
-import { fillPdf, inspectPdf } from "../../../packages/integrations/src/pdf.ts";
+import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integrations/src/pdf.ts";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
@@ -18,6 +18,77 @@ export function sanitizeFileName(name: string): string {
     .slice(0, 180)
     .join("");
   return cleaned || "document.pdf";
+}
+
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+// MIME types the workspace recognises by file extension. Anything else is
+// still accepted and stored — it is recorded as application/octet-stream and
+// flagged as not text-readable, never rejected for its type.
+const MIME_BY_EXTENSION: Record<string, string> = {
+  txt: "text/plain",
+  md: "text/markdown",
+  markdown: "text/markdown",
+  csv: "text/csv",
+  tsv: "text/tab-separated-values",
+  json: "application/json",
+  xml: "text/xml",
+  html: "text/html",
+  htm: "text/html",
+  log: "text/plain",
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  bmp: "image/bmp",
+  svg: "image/svg+xml",
+  doc: "application/msword",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xls: "application/vnd.ms-excel",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ppt: "application/vnd.ms-powerpoint",
+  pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  zip: "application/zip",
+  mp3: "audio/mpeg",
+  wav: "audio/wav",
+  mp4: "video/mp4",
+};
+
+export function extensionOf(name: string): string {
+  const base = name.split(/[\\/]/).at(-1) ?? "";
+  const match = /\.([A-Za-z0-9]{1,10})$/.exec(base);
+  return match ? match[1].toLowerCase() : "";
+}
+
+export function mimeTypeForFile(name: string, provided?: string): string {
+  const clean = (provided ?? "").split(";")[0].trim().toLowerCase();
+  if (clean && clean !== "application/octet-stream") return clean;
+  return MIME_BY_EXTENSION[extensionOf(name)] ?? "application/octet-stream";
+}
+
+// Formats Charlie can actually read as text in chat (via read_workspace_file).
+export function isTextReadableMime(mime: string): boolean {
+  return mime.startsWith("text/") || mime === "application/json" || mime.endsWith("+json");
+}
+
+// Plain-language readability note for a stored file. Used by the agent tool so
+// an unreadable file is flagged, never silently ignored or faked.
+export function readabilityNote(mime: string): string {
+  if (isTextReadableMime(mime)) return "readable as text in chat";
+  if (mime === "application/pdf") return "PDF — page text via document intake";
+  if (mime.startsWith("image/"))
+    return "image — stored and viewable by the user, not readable as text in chat";
+  if (
+    mime.includes("officedocument") ||
+    mime === "application/msword" ||
+    mime === "application/vnd.ms-excel" ||
+    mime === "application/vnd.ms-powerpoint"
+  ) {
+    return "office document — stored; text extraction is not available in chat yet";
+  }
+  return "stored but not readable as text in chat";
 }
 
 function assertFileId(id: string): void {
@@ -52,18 +123,28 @@ export class Files {
     source: string,
     parentId?: string,
     operationKey?: string,
+    mimeType?: string,
   ): Promise<Artifact> {
     const id = operationKey === undefined ? randomUUID() : deterministicFileId(owner, operationKey);
     if (operationKey !== undefined) {
       const existing = await this.db.get<Artifact>(owner, "files", id);
       if (existing) return this.signed(owner, existing);
     }
-    if (bytes.length > 10 * 1024 * 1024) throw new AppError("PDFs must be 10 MB or smaller", 413);
-    let metadata = await inspectPdf(bytes);
-    if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
+    if (bytes.length > MAX_FILE_BYTES) throw new AppError("Files must be 10 MB or smaller", 413);
+    const safeName = sanitizeFileName(name);
+    const mime = mimeTypeForFile(safeName, mimeType);
+    const isPdf = mime === "application/pdf";
+    // PDFs keep the existing inspection (page count + form fields). Every
+    // other type is accepted as-is: pageCount 0, no fields, stored under its
+    // real extension. Nothing is rejected for its type.
+    let metadata: PdfInspection | undefined;
+    if (isPdf) {
+      metadata = await inspectPdf(bytes);
+      if (metadata.pageCount > 500) throw new AppError("PDFs must have 500 pages or fewer", 422);
+    }
     const directory = join(this.config.dataDir, "files");
     await mkdir(directory, { recursive: true, mode: 0o700 });
-    const path = this.pathFor(id);
+    const path = this.pathFor(id, safeName);
     if (operationKey === undefined) {
       await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
     } else {
@@ -75,12 +156,12 @@ export class Files {
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === "EEXIST") {
             bytes = await readFile(path);
-            metadata = await inspectPdf(bytes);
+            if (isPdf) metadata = await inspectPdf(bytes);
           } else if ((error as NodeJS.ErrnoException).code === "ENOTSUP") {
             // Azure Files (SMB) does not support hard links: fall back to rename.
             try {
               bytes = await readFile(path);
-              metadata = await inspectPdf(bytes);
+              if (isPdf) metadata = await inspectPdf(bytes);
             } catch (readError) {
               if ((readError as NodeJS.ErrnoException).code !== "ENOENT") throw readError;
               await rename(temporary, path);
@@ -91,14 +172,13 @@ export class Files {
         await rm(temporary, { force: true });
       }
     }
-    const safeName = sanitizeFileName(name);
     const artifact: Artifact = {
       id,
       name: safeName,
-      mimeType: "application/pdf",
+      mimeType: mime,
       size: bytes.length,
-      pageCount: metadata.pageCount,
-      fields: metadata.fields,
+      pageCount: metadata?.pageCount ?? 0,
+      fields: metadata?.fields,
       url: "",
       createdAt: new Date().toISOString(),
       source,
@@ -123,16 +203,19 @@ export class Files {
     if (!file) throw new AppError("File not found", 404);
     return file;
   }
-  private pathFor(id: string): string {
+  private pathFor(id: string, name?: string): string {
     assertFileId(id);
     const directory = resolve(this.config.dataDir, "files");
-    const resolved = resolve(directory, `${id}.pdf`);
+    // Legacy rows (and callers without a name) are PDFs stored as <id>.pdf.
+    // New rows store under their real extension so the bytes round-trip.
+    const ext = name === undefined ? "pdf" : extensionOf(name);
+    const resolved = resolve(directory, `${id}${ext ? `.${ext}` : ""}`);
     if (!resolved.startsWith(`${directory}${sep}`)) throw new AppError("File not found", 404);
     return resolved;
   }
   async bytes(owner: string, id: string) {
-    await this.get(owner, id);
-    return readFile(this.pathFor(id));
+    const file = await this.get(owner, id);
+    return readFile(this.pathFor(id, file.name));
   }
   async fill(
     owner: string,
@@ -141,6 +224,8 @@ export class Files {
     operationKey?: string,
   ) {
     const file = await this.get(owner, id);
+    if (file.mimeType !== "application/pdf")
+      throw new AppError("Only PDF forms can be filled", 422);
     const bytes = await this.bytes(owner, id);
     const output = await fillPdf(bytes, values);
     return this.import(

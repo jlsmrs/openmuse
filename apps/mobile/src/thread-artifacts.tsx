@@ -13,7 +13,7 @@ export function FileThreadCard({ file }: { file: Artifact }) {
   return (
     <Pressable
       accessibilityRole="button"
-      accessibilityLabel={`Open PDF: ${file.name}`}
+      accessibilityLabel={`Open file: ${file.name}`}
       onPress={() => open({ type: "file", file })}
       style={{ width: "100%", maxWidth: 440 }}
     >
@@ -37,9 +37,13 @@ export function FileThreadCard({ file }: { file: Artifact }) {
                 <Text style={[s.text, { fontSize: 12 }]}>{field.value || "—"}</Text>
               </View>
             ))
-          ) : (
+          ) : file.mimeType === "application/pdf" ? (
             <Text style={s.muted}>
               {file.pageCount} {file.pageCount === 1 ? "page" : "pages"} · Tap to read the document
+            </Text>
+          ) : (
+            <Text style={s.muted}>
+              {Math.max(1, Math.round(file.size / 1024))} KB · Tap to open the file
             </Text>
           )}
         </View>
@@ -51,7 +55,13 @@ export function FileThreadCard({ file }: { file: Artifact }) {
             <Text numberOfLines={2} style={s.heading}>
               {file.name}
             </Text>
-            <Text style={s.muted}>PDF</Text>
+            <Text style={s.muted}>
+              {file.mimeType === "application/pdf"
+                ? "PDF"
+                : (file.name.includes(".") ? (file.name.split(".").pop() ?? "FILE") : "FILE")
+                    .toUpperCase()
+                    .slice(0, 10)}
+            </Text>
           </View>
           <ChevronRight size={18} color={colors.muted} />
         </View>

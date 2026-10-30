@@ -103,7 +103,8 @@ export async function readOrCreate(path: string, create: () => string) {
       try {
         value = await readFile(path, "utf8");
       } catch (readError) {
-        if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT")) throw readError;
+        if (!(readError instanceof Error && "code" in readError && readError.code === "ENOENT"))
+          throw readError;
         await rename(temporary, path);
       }
     } else throw error;

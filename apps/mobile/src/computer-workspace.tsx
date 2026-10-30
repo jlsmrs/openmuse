@@ -645,16 +645,18 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
               <Text style={[s.small, { marginTop: 6 }]}>
                 Copies into this folder. A file with the same name will be replaced.
               </Text>
-              {workspace.files.map((file) => (
-                <LinkRow
-                  key={file.id}
-                  icon={FileText}
-                  title={file.name}
-                  onPress={() => void importDocument(file)}
-                />
-              ))}
-              {!workspace.files.length && (
-                <Text style={s.muted}>Add a document from mail or Files first.</Text>
+              {workspace.files
+                .filter((file) => file.mimeType === "application/pdf")
+                .map((file) => (
+                  <LinkRow
+                    key={file.id}
+                    icon={FileText}
+                    title={file.name}
+                    onPress={() => void importDocument(file)}
+                  />
+                ))}
+              {!workspace.files.some((file) => file.mimeType === "application/pdf") && (
+                <Text style={s.muted}>Add a PDF from mail or Files first.</Text>
               )}
             </Card>
           )}
