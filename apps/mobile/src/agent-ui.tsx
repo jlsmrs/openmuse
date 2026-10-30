@@ -580,7 +580,11 @@ export function TaskDetail({ taskId }: { taskId: string }) {
             <LinkRow
               key={file.id}
               title={file.name}
-              detail={`${file.pageCount} pages · PDF`}
+              detail={
+                file.mimeType === "application/pdf"
+                  ? `${file.pageCount} pages · PDF`
+                  : `${Math.max(1, Math.round(file.size / 1024))} KB`
+              }
               icon={FileText}
               onPress={() => open({ type: "file", file })}
             />
@@ -1777,7 +1781,7 @@ export function AppsScreen() {
     {
       section: "files" as const,
       title: "Files",
-      detail: "PDFs, forms and filled copies",
+      detail: "Documents, files and filled copies",
       icon: FileText,
     },
   ];

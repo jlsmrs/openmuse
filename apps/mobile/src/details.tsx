@@ -173,7 +173,11 @@ function MailDetail({ mail: m }: { mail: Mail }) {
               <LinkRow
                 key={id}
                 title={file.name}
-                detail={`${file.pageCount} pages · PDF attachment`}
+                detail={
+                  file.mimeType === "application/pdf"
+                    ? `${file.pageCount} pages · PDF attachment`
+                    : `${Math.max(1, Math.round(file.size / 1024))} KB · attachment`
+                }
                 icon={FileText}
                 onPress={() => open({ type: "file", file })}
               />
@@ -776,12 +780,16 @@ function FileDetail({ file: f }: { file: Artifact }) {
         await Linking.openURL(url);
         return;
       }
-      const target = `${FileSystem.cacheDirectory}${f.id}.pdf`;
+      const ext = f.name.split(".").pop();
+      const target = `${FileSystem.cacheDirectory}${f.id}${ext && ext !== f.name ? `.${ext}` : ""}`;
       await FileSystem.downloadAsync(url, target, {
         headers: { Authorization: `Bearer ${api.token}` },
       });
       if (await Sharing.isAvailableAsync())
-        await Sharing.shareAsync(target, { mimeType: "application/pdf", UTI: "com.adobe.pdf" });
+        await Sharing.shareAsync(target, {
+          mimeType: f.mimeType || "application/octet-stream",
+          UTI: f.mimeType === "application/pdf" ? "com.adobe.pdf" : undefined,
+        });
       else throw new Error("Sharing is not available on this device.");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -790,11 +798,20 @@ function FileDetail({ file: f }: { file: Artifact }) {
   return (
     <Sheet
       title={f.name}
-      subtitle={`${f.pageCount} pages · ${Math.max(1, Math.round(f.size / 1024))} KB · ${f.source}`}
+      subtitle={`${f.mimeType === "application/pdf" ? `${f.pageCount} pages · ` : ""}${Math.max(1, Math.round(f.size / 1024))} KB · ${f.source}`}
       onClose={close}
       wide
     >
-      <PdfReader url={url} token={api.token} pageCount={f.pageCount} />
+      {f.mimeType === "application/pdf" ? (
+        <PdfReader url={url} token={api.token} pageCount={f.pageCount} />
+      ) : (
+        <Card>
+          <Text style={s.muted}>
+            This file is stored in your workspace. Use Open / download below to view it. Charlie can
+            read plain-text files in chat; other types are stored and shared, not read as text.
+          </Text>
+        </Card>
+      )}
       <View style={[s.row, { gap: 10, marginVertical: 18, flexWrap: "wrap" }]}>
         <Button icon={Download} onPress={() => void share()}>
           {Platform.OS === "web" ? "Open / download" : "Save or share"}
@@ -895,8 +912,8 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
       const files = result.files;
       notify(
         files.length
-          ? `${files.length} PDF download${files.length === 1 ? "" : "s"} added to Files.`
-          : "No new PDF downloads in this session.",
+          ? `${files.length} download${files.length === 1 ? "" : "s"} added to Files.`
+          : "No new downloads in this session.",
       );
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -994,7 +1011,7 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
         )}
         {!loading && browser.status !== "closed" && (
           <Button icon={Download} busy={busy} onPress={() => void importDownloads()}>
-            Import PDF downloads
+            Import downloads
           </Button>
         )}
         {!loading && browser.status !== "closed" && (

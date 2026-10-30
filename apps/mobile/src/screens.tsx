@@ -935,6 +935,11 @@ export function BrowserScreen() {
     </View>
   );
 }
+function fileTypeLabel(f: Artifact): string {
+  if (f.mimeType === "application/pdf") return "PDF";
+  const ext = f.name.split(".").pop();
+  return ext && ext !== f.name ? ext.toUpperCase().slice(0, 10) : "FILE";
+}
 export function FilesScreen() {
   const { workspace: w, api, refresh, open } = useWorkspace();
   const [busy, setBusy] = useState(false);
@@ -944,7 +949,7 @@ export function FilesScreen() {
     setBusy(true);
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: "application/pdf",
+        type: "*/*",
         copyToCacheDirectory: true,
       });
       if (result.canceled) return;
@@ -961,12 +966,12 @@ export function FilesScreen() {
           httpMethod: "POST",
           uploadType: FileSystem.FileSystemUploadType.MULTIPART,
           fieldName: "file",
-          mimeType: "application/pdf",
+          mimeType: file.mimeType || "application/octet-stream",
           headers: { Authorization: `Bearer ${api.token}` },
         });
         const payload = JSON.parse(result.body);
         if (result.status < 200 || result.status >= 300)
-          throw new Error(payload.error || "Could not import this PDF.");
+          throw new Error(payload.error || "Could not import this file.");
         artifact = payload;
       }
       await refresh();
@@ -984,7 +989,7 @@ export function FilesScreen() {
           Documents, with a little room to work.
         </Text>
         <Button primary icon={Upload} busy={busy} onPress={() => void upload()}>
-          Import PDF
+          Import file
         </Button>
       </View>
       <ErrorNotice error={error} />
@@ -1034,7 +1039,7 @@ export function FilesScreen() {
                   ))}
                 </View>
                 <View style={{ position: "absolute", bottom: 12, right: 14 }}>
-                  <Chip>PDF</Chip>
+                  <Chip>{fileTypeLabel(f)}</Chip>
                 </View>
               </View>
               <View style={{ padding: 21, gap: 6 }}>
@@ -1042,7 +1047,9 @@ export function FilesScreen() {
                   {f.name}
                 </Text>
                 <Text style={s.small}>
-                  {f.pageCount} {f.pageCount === 1 ? "page" : "pages"} ·{" "}
+                  {f.mimeType === "application/pdf"
+                    ? `${f.pageCount} ${f.pageCount === 1 ? "page" : "pages"} · `
+                    : ""}
                   {Math.max(1, Math.round(f.size / 1024))} KB
                 </Text>
                 <View style={[s.between, { marginTop: 9 }]}>
@@ -1059,7 +1066,7 @@ export function FilesScreen() {
           <Empty
             icon={FileText}
             title="Your documents live here"
-            detail="Import a PDF or open a mail attachment to read, fill supported form fields, and share a copy."
+            detail="Import a file or open a mail attachment to read, fill supported PDF form fields, and share a copy."
           />
         </Card>
       )}
