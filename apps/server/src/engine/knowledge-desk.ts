@@ -20,9 +20,9 @@
 // agent can cite it; the agent must never state Texas law from memory when
 // the desk has an entry.
 
-import { defineTool } from "@copilotkit/runtime/v2";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
+import { defineTool } from "@copilotkit/runtime/v2";
 import { z } from "zod";
 
 const params = z.object({
@@ -33,15 +33,22 @@ const params = z.object({
 type Entry = { id: string; source: string; title: string; text: string; embedding?: number[] };
 
 function cosine(a: number[], b: number[]): number {
-  let dot = 0, na = 0, nb = 0;
+  let dot = 0,
+    na = 0,
+    nb = 0;
   for (let i = 0; i < Math.min(a.length, b.length); i++) {
-    dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
   }
   return dot / (Math.sqrt(na) * Math.sqrt(nb) || 1);
 }
 
 function keywordScore(query: string, text: string): number {
-  const terms = query.toLowerCase().split(/\W+/).filter((t) => t.length > 2);
+  const terms = query
+    .toLowerCase()
+    .split(/\W+/)
+    .filter((t) => t.length > 2);
   const hay = text.toLowerCase();
   let hits = 0;
   for (const t of terms) if (hay.includes(t)) hits++;
@@ -60,7 +67,10 @@ export const searchKnowledgeDeskTool = defineTool({
     try {
       entries = JSON.parse(await readFile(join(dataDir, "knowledge-desk", "index.json"), "utf8"));
     } catch {
-      return { error: "Knowledge Desk index is not built yet (DATA_DIR/knowledge-desk/index.json missing)." };
+      return {
+        error:
+          "Knowledge Desk index is not built yet (DATA_DIR/knowledge-desk/index.json missing).",
+      };
     }
     const endpoint = process.env.FOUNDRY_EMBEDDINGS_ENDPOINT;
     const key = process.env.FOUNDRY_EMBEDDINGS_KEY || process.env.OPENAI_API_KEY;
@@ -79,21 +89,32 @@ export const searchKnowledgeDeskTool = defineTool({
           queryEmbedding = payload?.data?.[0]?.embedding;
           if (queryEmbedding) method = "embeddings";
         }
-      } catch { /* fall through to keyword */ }
+      } catch {
+        /* fall through to keyword */
+      }
     }
     const scored = entries.map((e) => ({
       entry: e,
-      score: queryEmbedding && e.embedding
-        ? cosine(queryEmbedding, e.embedding)
-        : keywordScore(query, `${e.title} ${e.text}`),
+      score:
+        queryEmbedding && e.embedding
+          ? cosine(queryEmbedding, e.embedding)
+          : keywordScore(query, `${e.title} ${e.text}`),
     }));
     scored.sort((a, b) => b.score - a.score);
-    const hits = scored.slice(0, topK).filter((s) => s.score > 0).map((s) => ({
-      source: s.entry.source,
-      title: s.entry.title,
-      score: Number(s.score.toFixed(4)),
-      excerpt: s.entry.text.slice(0, 600),
-    }));
-    return { method, query, hits, note: hits.length ? undefined : "No desk entry matched. Do not answer from memory." };
+    const hits = scored
+      .slice(0, topK)
+      .filter((s) => s.score > 0)
+      .map((s) => ({
+        source: s.entry.source,
+        title: s.entry.title,
+        score: Number(s.score.toFixed(4)),
+        excerpt: s.entry.text.slice(0, 600),
+      }));
+    return {
+      method,
+      query,
+      hits,
+      note: hits.length ? undefined : "No desk entry matched. Do not answer from memory.",
+    };
   },
 });

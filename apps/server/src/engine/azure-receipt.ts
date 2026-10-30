@@ -16,8 +16,8 @@
 // operation URL until done, return the extracted fields as a DRAFT expense
 // record. The backup never records the expense itself — Josh confirms first.
 
-import { defineTool } from "@copilotkit/runtime/v2";
 import { readFile } from "node:fs/promises";
+import { defineTool } from "@copilotkit/runtime/v2";
 import { z } from "zod";
 
 const params = z.object({
@@ -50,7 +50,7 @@ export const captureReceiptTool = defineTool({
     const start = await fetch(analyzeUrl, {
       method: "POST",
       headers: { "Ocp-Apim-Subscription-Key": key, "Content-Type": "application/octet-stream" },
-    body: new Uint8Array(raw),
+      body: new Uint8Array(raw),
       signal: AbortSignal.timeout(120_000),
     });
     if (!start.ok) return { error: `Receipt analysis failed to start: HTTP ${start.status}.` };
@@ -76,10 +76,12 @@ export const captureReceiptTool = defineTool({
           date: pick("TransactionDate"),
           total: pick("Total"),
           tax: pick("TotalTax"),
-          items: fields["Items"]?.valueArray?.map((it: { valueObject?: Record<string, { value?: unknown }> }) => ({
-            description: it.valueObject?.["Description"]?.value,
-            amount: it.valueObject?.["TotalPrice"]?.value,
-          })),
+          items: fields.Items?.valueArray?.map(
+            (it: { valueObject?: Record<string, { value?: unknown }> }) => ({
+              description: it.valueObject?.Description?.value,
+              amount: it.valueObject?.TotalPrice?.value,
+            }),
+          ),
           note: "DRAFT expense record — confirm before recording.",
         };
       }

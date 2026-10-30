@@ -18,8 +18,8 @@
 // Notarial acts (oath, seal, witnessing, journal completion) are human-only
 // and are never performed by this tool.
 
-import { defineTool } from "@copilotkit/runtime/v2";
 import { readFile } from "node:fs/promises";
+import { defineTool } from "@copilotkit/runtime/v2";
 import { z } from "zod";
 
 const docParams = z.object({
@@ -36,11 +36,11 @@ export const analyzeDocumentTool = defineTool({
     const { file, prompt } = docParams.parse(args);
     const endpoint = process.env.FOUNDRY_DOCAI_ENDPOINT;
     const key =
-      process.env.FOUNDRY_DOCAI_KEY ||
-      process.env.FOUNDRY_IMAGES_KEY ||
-      process.env.OPENAI_API_KEY;
+      process.env.FOUNDRY_DOCAI_KEY || process.env.FOUNDRY_IMAGES_KEY || process.env.OPENAI_API_KEY;
     if (!endpoint || !key) {
-      return { error: "Document intake is not configured: FOUNDRY_DOCAI_ENDPOINT/KEY are missing." };
+      return {
+        error: "Document intake is not configured: FOUNDRY_DOCAI_ENDPOINT/KEY are missing.",
+      };
     }
     let raw: Buffer;
     try {
