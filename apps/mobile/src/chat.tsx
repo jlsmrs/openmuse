@@ -7,7 +7,16 @@ import {
   useRenderTool,
   useRenderToolCall,
 } from "@copilotkit/react-native/headless";
-import { ArrowDown, ArrowUp, FileText, RotateCcw, Square, X } from "lucide-react-native";
+import {
+  ArrowDown,
+  ArrowUp,
+  FileText,
+  Mic,
+  RotateCcw,
+  Square,
+  Volume2,
+  X,
+} from "lucide-react-native";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import {
   Keyboard,
@@ -43,6 +52,15 @@ import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
 import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
+import {
+  type DictationHandle,
+  defaultSpeechEnv,
+  type SpeechHandle,
+  speakText,
+  startDictation,
+  stopSpeaking,
+  voiceSupport,
+} from "./voice";
 import { useWorkspace } from "./workspace";
 
 const displayParameters = z.record(z.string(), z.unknown());
@@ -232,6 +250,11 @@ export function ChatScreen({
   const [syncing, setSyncing] = useState(false);
   const [picking, setPicking] = useState(false);
   const [attachments, setAttachments] = useState<string[]>([]);
+  const [dictating, setDictating] = useState(false);
+  const [speaking, setSpeaking] = useState(false);
+  const [voiceError, setVoiceError] = useState("");
+  const dictationRef = useRef<DictationHandle | null>(null);
+  const speechRef = useRef<SpeechHandle | null>(null);
   const list = useRef<ScrollView>(null);
   const [queue] = useState(() => new ConversationQueue());
   const choiceCompletions = useRef(
@@ -454,7 +477,73 @@ export function ChatScreen({
       setError(`Could not stop response: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
+  // Voice v1 is web-only: the browser's own speech recognition for input and
+  // the device voice for readback. The voice is the browser's default, not
+  // Charlie's persona voice, and native apps get no voice buttons.
+  const voice =
+    Platform.OS === "web"
+      ? voiceSupport(defaultSpeechEnv())
+      : { dictation: false, readback: false };
+  function toggleDictation() {
+    if (dictating) {
+      dictationRef.current?.stop();
+      dictationRef.current = null;
+      setDictating(false);
+      return;
+    }
+    const base = draft;
+    const handle = startDictation(defaultSpeechEnv(), {
+      onTranscript: (transcript) => {
+        setDraft(base ? `${base} ${transcript}` : transcript);
+      },
+      onError: (message) => {
+        setVoiceError(message);
+        setDictating(false);
+      },
+      onEnd: () => setDictating(false),
+    });
+    if (!handle) {
+      setVoiceError("Speech recognition is not available in this browser.");
+      return;
+    }
+    dictationRef.current = handle;
+    setVoiceError("");
+    setDictating(true);
+  }
+  function toggleReadAloud() {
+    if (speaking) {
+      speechRef.current?.stop();
+      stopSpeaking(defaultSpeechEnv());
+      speechRef.current = null;
+      setSpeaking(false);
+      return;
+    }
+    const latest = [...(agent.messages || [])]
+      .reverse()
+      .find((m) => m.role === "assistant" && typeof m.content === "string" && m.content.trim());
+    if (!latest || typeof latest.content !== "string") {
+      setVoiceError("There is no reply to read aloud yet.");
+      return;
+    }
+    const handle = speakText(defaultSpeechEnv(), latest.content, {
+      onEnd: () => setSpeaking(false),
+      onError: (message) => {
+        setVoiceError(message);
+        setSpeaking(false);
+      },
+    });
+    if (!handle) {
+      setVoiceError("Read-aloud is not available in this browser.");
+      return;
+    }
+    speechRef.current = handle;
+    setVoiceError("");
+    setSpeaking(true);
+  }
   function send() {
+    speechRef.current?.stop();
+    stopSpeaking(defaultSpeechEnv());
+    setSpeaking(false);
     const text = draft.trim();
     if (!text || !isReady || !loaded) return;
     // A new submission can continue after Stop; held follow-ups still need explicit resume.
@@ -905,6 +994,11 @@ export function ChatScreen({
                 ))}
             </View>
           )}
+          {voiceError ? (
+            <Text style={{ fontSize: 12, color: colors.muted, paddingHorizontal: 8 }}>
+              {voiceError}
+            </Text>
+          ) : null}
           <View style={[s.row, { gap: 7, alignItems: "flex-end" }]}>
             <Pressable
               accessibilityRole="button"
@@ -973,6 +1067,42 @@ export function ChatScreen({
                   : undefined
               }
             />
+            {voice.dictation && (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={dictating ? "Stop dictation" : "Start dictation"}
+                onPress={toggleDictation}
+                style={({ pressed }) => ({
+                  width: 44,
+                  height: 44,
+                  borderRadius: 24,
+                  backgroundColor: dictating ? colors.blue : "transparent",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  transform: [{ scale: pressed ? 0.94 : 1 }],
+                })}
+              >
+                <Mic size={22} color={dictating ? colors.text : colors.blueDark} />
+              </Pressable>
+            )}
+            {voice.readback && (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel={speaking ? "Stop reading aloud" : "Read reply aloud"}
+                onPress={toggleReadAloud}
+                style={({ pressed }) => ({
+                  width: 44,
+                  height: 44,
+                  borderRadius: 24,
+                  backgroundColor: speaking ? colors.blue : "transparent",
+                  alignItems: "center",
+                  justifyContent: "center",
+                  transform: [{ scale: pressed ? 0.94 : 1 }],
+                })}
+              >
+                <Volume2 size={22} color={speaking ? colors.text : colors.blueDark} />
+              </Pressable>
+            )}
             <Pressable
               accessibilityRole="button"
               accessibilityLabel={replying ? "Stop reply" : "Send message"}
