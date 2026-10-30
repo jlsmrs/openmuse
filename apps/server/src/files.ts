@@ -6,6 +6,8 @@ import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integ
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
+import { isExtractableDocumentMime } from "./engine/document-text.ts";
+import { isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -79,14 +81,16 @@ export function readabilityNote(mime: string): string {
   if (isTextReadableMime(mime)) return "readable as text in chat";
   if (mime === "application/pdf") return "PDF — page text via document intake";
   if (mime.startsWith("image/"))
-    return "image — stored and viewable by the user, not readable as text in chat";
+    return isVisionMime(mime)
+      ? "image — shown to the model in chat"
+      : "image type cannot be viewed in chat";
+  if (isExtractableDocumentMime(mime)) return "office document — text is extracted for chat";
   if (
-    mime.includes("officedocument") ||
     mime === "application/msword" ||
     mime === "application/vnd.ms-excel" ||
     mime === "application/vnd.ms-powerpoint"
   ) {
-    return "office document — stored; text extraction is not available in chat yet";
+    return "legacy binary Office format — text extraction is not available in chat";
   }
   return "stored but not readable as text in chat";
 }

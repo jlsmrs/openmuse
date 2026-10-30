@@ -88,11 +88,13 @@ test("readability flags: text readable, PDF via intake, the rest plainly flagged
   assert.equal(isTextReadableMime("image/png"), false);
   assert.equal(isTextReadableMime("application/octet-stream"), false);
   assert.match(readabilityNote("text/plain"), /readable as text/);
-  assert.match(readabilityNote("image/png"), /not readable as text/);
+  // Vision + extraction batch: PNGs are shown to the model and office docs
+  // are extracted, so these no longer read as unreadable.
+  assert.match(readabilityNote("image/png"), /shown to the model/);
   assert.match(readabilityNote("application/octet-stream"), /not readable as text/);
   assert.match(
     readabilityNote("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
-    /not available in chat yet/,
+    /text is extracted/,
   );
 });
 
