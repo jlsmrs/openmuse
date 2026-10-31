@@ -21,8 +21,8 @@ const pngBytes = Buffer.from(
   "base64",
 );
 
-test("vision parts are valid content parts that round-trip the image bytes", () => {
-  const result = visionParts("photo.png", "image/png", pngBytes);
+test("vision parts are valid content parts that round-trip the image bytes", async () => {
+  const result = await visionParts("photo.png", "image/png", pngBytes);
   assert.ok(!("error" in result));
   assert.equal(isContentPartArray(result.parts), true);
   const [text, image] = result.parts;
@@ -36,21 +36,23 @@ test("vision parts are valid content parts that round-trip the image bytes", () 
   }
 });
 
-test("vision rejects unsupported image types and oversized images plainly", () => {
+test("vision rejects unsupported image types and oversized images plainly", async () => {
   assert.equal(isVisionMime("image/png"), true);
   assert.equal(isVisionMime("image/jpeg"), true);
   assert.equal(isVisionMime("image/bmp"), false);
   assert.equal(isVisionMime("image/svg+xml"), false);
-  const bmp = visionParts("scan.bmp", "image/bmp", pngBytes);
+  // PNG bytes labeled as BMP are not a BMP at all, so conversion fails
+  // plainly instead of producing a fake image.
+  const bmp = await visionParts("scan.bmp", "image/bmp", pngBytes);
   assert.ok("error" in bmp);
-  assert.match(bmp.error, /cannot be viewed in chat/);
-  const big = visionParts("huge.png", "image/png", Buffer.alloc(VISION_MAX_BYTES + 1));
+  assert.match(bmp.error, /could not be converted/);
+  const big = await visionParts("huge.png", "image/png", Buffer.alloc(VISION_MAX_BYTES + 1));
   assert.ok("error" in big);
   assert.match(big.error, /too large to view in chat/);
 });
 
-test("stored history keeps only the text parts of a vision tool result", () => {
-  const result = visionParts("photo.png", "image/png", pngBytes);
+test("stored history keeps only the text parts of a vision tool result", async () => {
+  const result = await visionParts("photo.png", "image/png", pngBytes);
   assert.ok(!("error" in result));
   const event = {
     type: EventType.TOOL_CALL_RESULT,
@@ -122,20 +124,28 @@ test("pptx text is extracted from slide text runs", async () => {
   assert.match(extracted.text, /Welcome slide/);
 });
 
-test("legacy binary office formats and unknown types are refused plainly", async () => {
+test("legacy binary PowerPoint and unknown types are refused plainly", async () => {
   assert.equal(
     isExtractableDocumentMime(
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ),
     true,
   );
-  assert.equal(isExtractableDocumentMime("application/msword"), false);
-  const legacy = await extractDocumentText(new Uint8Array([1, 2, 3]), "application/msword");
+  // Legacy .doc and .xls are now extracted (word-extractor / xlsx); only
+  // legacy .ppt still has no sound pure-JS extractor.
+  assert.equal(isExtractableDocumentMime("application/msword"), true);
+  assert.equal(isExtractableDocumentMime("application/vnd.ms-excel"), true);
+  assert.equal(isExtractableDocumentMime("application/vnd.ms-powerpoint"), false);
+  const legacy = await extractDocumentText(
+    new Uint8Array([1, 2, 3]),
+    "application/vnd.ms-powerpoint",
+  );
   assert.ok(!legacy.ok);
-  assert.match(legacy.error, /legacy binary Office format/);
+  assert.match(legacy.error, /not available/);
   const unknown = await extractDocumentText(new Uint8Array([1, 2, 3]), "application/zip");
   assert.ok(!unknown.ok);
   assert.match(unknown.error, /not readable as text/);
-  assert.match(readabilityNote("image/bmp"), /cannot be viewed/);
-  assert.match(readabilityNote("application/msword"), /legacy binary Office format/);
+  assert.match(readabilityNote("image/bmp"), /converted to PNG/);
+  assert.match(readabilityNote("application/msword"), /text is extracted/);
+  assert.match(readabilityNote("application/vnd.ms-powerpoint"), /not available/);
 });

@@ -7,7 +7,7 @@ import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { isExtractableDocumentMime } from "./engine/document-text.ts";
-import { isVisionMime } from "./engine/vision.ts";
+import { isConvertibleImageMime, isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -46,6 +46,10 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   webp: "image/webp",
   bmp: "image/bmp",
   svg: "image/svg+xml",
+  tif: "image/tiff",
+  tiff: "image/tiff",
+  tar: "application/x-tar",
+  tgz: "application/gzip",
   doc: "application/msword",
   docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   xls: "application/vnd.ms-excel",
@@ -79,19 +83,24 @@ export function isTextReadableMime(mime: string): boolean {
 // an unreadable file is flagged, never silently ignored or faked.
 export function readabilityNote(mime: string): string {
   if (isTextReadableMime(mime)) return "readable as text in chat";
-  if (mime === "application/pdf") return "PDF — page text via document intake";
-  if (mime.startsWith("image/"))
-    return isVisionMime(mime)
-      ? "image — shown to the model in chat"
-      : "image type cannot be viewed in chat";
-  if (isExtractableDocumentMime(mime)) return "office document — text is extracted for chat";
-  if (
-    mime === "application/msword" ||
-    mime === "application/vnd.ms-excel" ||
-    mime === "application/vnd.ms-powerpoint"
-  ) {
-    return "legacy binary Office format — text extraction is not available in chat";
+  if (mime === "application/pdf") return "PDF — full text is extracted for chat";
+  if (mime.startsWith("image/")) {
+    if (isVisionMime(mime)) return "image — shown to the model in chat";
+    if (isConvertibleImageMime(mime))
+      return "image — converted to PNG and shown to the model in chat";
+    return "image type cannot be viewed in chat";
   }
+  if (isExtractableDocumentMime(mime)) return "office document — text is extracted for chat";
+  if (mime === "application/vnd.ms-powerpoint")
+    return "legacy binary PowerPoint format — text extraction is not available in chat";
+  if (
+    mime === "application/zip" ||
+    mime === "application/x-zip-compressed" ||
+    mime === "application/x-zip" ||
+    mime === "application/x-tar" ||
+    mime === "application/gzip"
+  )
+    return "archive — members are read through the same pipeline in chat";
   return "stored but not readable as text in chat";
 }
 
