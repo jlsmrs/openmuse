@@ -1,3 +1,5 @@
+import * as DocumentPicker from "expo-document-picker";
+import * as FileSystem from "expo-file-system/legacy";
 import {
   ArrowRight,
   Bell,
@@ -20,11 +22,12 @@ import {
   X,
 } from "lucide-react-native";
 import { useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Image, Linking, Pressable, Text, View } from "react-native";
+import { ActivityIndicator, Image, Linking, Platform, Pressable, Text, View } from "react-native";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import type { Artifact, BrowserSession } from "../../../packages/domain/src";
 import type {
   AgentArtifact,
+  AgentIdentity,
   AgentMemory,
   AgentTask,
   Evidence,
@@ -34,6 +37,8 @@ import type {
   RunEvent,
 } from "../../../packages/domain/src/agent";
 import { useAgentWorkspace } from "./agent-workspace";
+import { API_URL } from "./api";
+import { AgentAvatar } from "./custom-avatar";
 import { ActivityScreen, ConnectionsScreen } from "./screens";
 import {
   Button,
@@ -1723,13 +1728,28 @@ export function NotificationsSheet() {
   );
 }
 export function AppsScreen() {
-  const { navigate, open } = useWorkspace();
+  const { api, navigate, open } = useWorkspace();
   const { data, mutate } = useAgentWorkspace();
   const [query, setQuery] = useState("");
   const [settings, setSettings] = useState(false);
   const [name, setName] = useState(data?.identity.name || "OpenMuse");
   const [tone, setTone] = useState(data?.identity.tone || "warm");
-  const [avatar, setAvatar] = useState(data?.identity.avatar || "sky");
+  const [avatar, setAvatar] = useState<"sky" | "sand" | "lilac" | "custom">(
+    data?.identity.avatar || "sky",
+  );
+  const [customAvatar, setCustomAvatar] = useState<AgentIdentity["customAvatar"]>(
+    data?.identity.customAvatar,
+  );
+  const [customSection, setCustomSection] = useState<"generated" | "files" | null>(null);
+  const [generatedImages, setGeneratedImages] = useState<
+    Array<{ name: string; size: number; mimeType: string; url: string }>
+  >([]);
+  const [imageFiles, setImageFiles] = useState<
+    Array<{ id: string; name: string; mimeType: string; url: string }>
+  >([]);
+  const [previewUrl, setPreviewUrl] = useState<string | undefined>();
+  const [pickerBusy, setPickerBusy] = useState(false);
+  const [pickerError, setPickerError] = useState("");
   const [showChatUpdates, setShowChatUpdates] = useState(data?.identity.showChatUpdates !== false);
   const [memory, setMemory] = useState("");
   const [error, setError] = useState("");
@@ -1739,14 +1759,81 @@ export function AppsScreen() {
       setName(data.identity.name);
       setTone(data.identity.tone);
       setAvatar(data.identity.avatar || "sky");
+      setCustomAvatar(data.identity.customAvatar);
+      setPreviewUrl(undefined);
       setShowChatUpdates(data.identity.showChatUpdates !== false);
     }
   }, [
     data?.identity.name,
     data?.identity.tone,
     data?.identity.avatar,
+    data?.identity.customAvatar?.source,
+    data?.identity.customAvatar?.id,
     data?.identity.showChatUpdates,
   ]);
+  async function loadCustomSection(section: "generated" | "files") {
+    setCustomSection(section);
+    setPickerError("");
+    setPickerBusy(true);
+    try {
+      if (section === "generated") {
+        setGeneratedImages(
+          await api.request<Array<{ name: string; size: number; mimeType: string; url: string }>>(
+            "/api/generated-images",
+          ),
+        );
+      } else {
+        const files =
+          await api.request<Array<{ id: string; name: string; mimeType: string; url: string }>>(
+            "/api/files",
+          );
+        setImageFiles(files.filter((f) => f.mimeType.startsWith("image/")));
+      }
+    } catch (e) {
+      setPickerError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPickerBusy(false);
+    }
+  }
+  async function uploadCustomImage() {
+    setPickerError("");
+    setPickerBusy(true);
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "image/*",
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled) return;
+      const file = result.assets[0];
+      let artifact: Artifact;
+      if (Platform.OS === "web") {
+        const form = new FormData();
+        if (!file.file)
+          throw new Error("The selected file could not be read. Please choose it again.");
+        form.append("file", file.file, file.name);
+        artifact = await api.request<Artifact>("/api/files", form);
+      } else {
+        const uploaded = await FileSystem.uploadAsync(`${API_URL}/api/files`, file.uri, {
+          httpMethod: "POST",
+          uploadType: FileSystem.FileSystemUploadType.MULTIPART,
+          fieldName: "file",
+          mimeType: file.mimeType || "application/octet-stream",
+          headers: { Authorization: `Bearer ${api.token}` },
+        });
+        const payload = JSON.parse(uploaded.body);
+        if (uploaded.status < 200 || uploaded.status >= 300)
+          throw new Error(payload.error || "Could not import this file.");
+        artifact = payload;
+      }
+      setCustomAvatar({ source: "file", id: artifact.id });
+      setPreviewUrl(artifact.url || undefined);
+      setAvatar("custom");
+    } catch (e) {
+      setPickerError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPickerBusy(false);
+    }
+  }
   async function save(path: string, body: unknown) {
     setBusy(true);
     setError("");
@@ -1837,7 +1924,129 @@ export function AppsScreen() {
                   <Mascot size={62} variant={item} />
                 </Pressable>
               ))}
+              <Pressable
+                key="custom"
+                accessibilityRole="radio"
+                accessibilityLabel="Custom avatar"
+                accessibilityState={{ checked: avatar === "custom" }}
+                onPress={() => setAvatar("custom")}
+                style={{
+                  padding: 7,
+                  borderRadius: 24,
+                  backgroundColor: avatar === "custom" ? colors.sky : colors.canvas,
+                }}
+              >
+                {previewUrl ? (
+                  <Image
+                    source={{ uri: previewUrl }}
+                    resizeMode="cover"
+                    style={{ width: 62, height: 62, borderRadius: 31 }}
+                    onError={() => setPreviewUrl(undefined)}
+                  />
+                ) : data?.identity.avatar === "custom" && data.identity.customAvatar ? (
+                  <AgentAvatar identity={data.identity} size={62} />
+                ) : (
+                  <View
+                    style={{
+                      width: 62,
+                      height: 62,
+                      borderRadius: 31,
+                      borderWidth: 1,
+                      borderColor: colors.muted,
+                      justifyContent: "center",
+                      alignItems: "center",
+                    }}
+                  >
+                    <Text style={s.small}>Custom</Text>
+                  </View>
+                )}
+              </Pressable>
             </View>
+            {avatar === "custom" && (
+              <View style={{ gap: 10, marginBottom: 12 }}>
+                <Text style={s.small}>
+                  Pick a generated image or one of your files, or upload an image. It is served
+                  through a short-lived signed link, never bundled into the app.
+                </Text>
+                <View style={[s.row, { gap: 8 }]}>
+                  <Button
+                    small
+                    primary={customSection === "generated"}
+                    onPress={() => void loadCustomSection("generated")}
+                  >
+                    Generated images
+                  </Button>
+                  <Button
+                    small
+                    primary={customSection === "files"}
+                    onPress={() => void loadCustomSection("files")}
+                  >
+                    Your files
+                  </Button>
+                  <Button small busy={pickerBusy} onPress={() => void uploadCustomImage()}>
+                    Upload image
+                  </Button>
+                </View>
+                <ErrorNotice error={pickerError} />
+                {customSection === "generated" && (
+                  <View style={[s.row, { gap: 10, flexWrap: "wrap" }]}>
+                    {generatedImages.map((item) => (
+                      <Pressable
+                        key={item.name}
+                        onPress={() => {
+                          setCustomAvatar({ source: "generated", id: item.name });
+                          setPreviewUrl(item.url);
+                        }}
+                        style={{ width: 90, gap: 4, alignItems: "center" }}
+                      >
+                        <Image
+                          source={{ uri: item.url }}
+                          style={{ width: 62, height: 62, borderRadius: 8 }}
+                        />
+                        <Text numberOfLines={1} style={s.small}>
+                          {item.name}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    {!generatedImages.length && !pickerBusy && (
+                      <Text style={s.small}>No generated images yet.</Text>
+                    )}
+                  </View>
+                )}
+                {customSection === "files" && (
+                  <View style={[s.row, { gap: 10, flexWrap: "wrap" }]}>
+                    {imageFiles.map((item) => (
+                      <Pressable
+                        key={item.id}
+                        onPress={() => {
+                          setCustomAvatar({ source: "file", id: item.id });
+                          setPreviewUrl(item.url);
+                        }}
+                        style={{ width: 90, gap: 4, alignItems: "center" }}
+                      >
+                        <Image
+                          source={{ uri: item.url }}
+                          style={{ width: 62, height: 62, borderRadius: 8 }}
+                        />
+                        <Text numberOfLines={1} style={s.small}>
+                          {item.name}
+                        </Text>
+                      </Pressable>
+                    ))}
+                    {!imageFiles.length && !pickerBusy && (
+                      <Text style={s.small}>No image files yet.</Text>
+                    )}
+                  </View>
+                )}
+                {customAvatar && (
+                  <Text style={s.small}>
+                    Selected:{" "}
+                    {customAvatar.source === "generated" ? customAvatar.id : "uploaded file"}
+                    {" — "}save preferences to apply it.
+                  </Text>
+                )}
+              </View>
+            )}
             <Field label="Name" value={name} onChangeText={setName} />
             <View style={[s.row, { gap: 8 }]}>
               {(["warm", "concise", "thoughtful"] as const).map((item) => (
@@ -1859,7 +2068,13 @@ export function AppsScreen() {
               busy={busy}
               disabled={!name.trim()}
               onPress={() =>
-                void save("/identity", { name: name.trim(), tone, avatar, showChatUpdates })
+                void save("/identity", {
+                  name: name.trim(),
+                  tone,
+                  avatar,
+                  customAvatar: avatar === "custom" ? customAvatar : undefined,
+                  showChatUpdates,
+                })
               }
             >
               Save preferences

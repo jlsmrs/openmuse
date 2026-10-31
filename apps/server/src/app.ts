@@ -6,6 +6,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { z } from "zod";
+import type { AgentIdentity } from "../../../packages/domain/src/agent.ts";
 import {
   calendarRangeSchema,
   emailDraftSchema,
@@ -23,6 +24,7 @@ import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
+import { GeneratedImages } from "./generated-images.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
@@ -36,6 +38,7 @@ export async function createApp(
   await resolveComputerDeployment(config);
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
+    generatedImages = new GeneratedImages(config, auth),
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
   const actions = new ActionService(db, {
@@ -137,7 +140,7 @@ export async function createApp(
     const method = c.req.method === "HEAD" ? "GET" : c.req.method;
     const signedRoute =
       (method === "GET" &&
-        /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
+        /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$|^\/api\/generated-images\/[^/]+\/content$/.test(
           c.req.path,
         )) ||
       (method === "POST" && /^\/api\/browsers\/[^/]+\/console$/.test(c.req.path));
@@ -247,6 +250,36 @@ export async function createApp(
     for (const message of messages) MessageSchema.parse(message);
     await db.put(c.get("owner"), "conversations", { id: "default", messages });
     return c.json({ ok: true });
+  });
+  app.get("/api/files", async (c) => c.json(await files.list(c.get("owner"))));
+  app.get("/api/generated-images", async (c) => c.json(await generatedImages.list(c.get("owner"))));
+  app.get("/api/generated-images/:name/content", async (c) => {
+    const { bytes, mimeType } = await generatedImages.bytes(c.req.param("name"));
+    c.header("Content-Type", mimeType);
+    c.header(
+      "Content-Disposition",
+      `inline; filename*=UTF-8''${encodeURIComponent(c.req.param("name"))}`,
+    );
+    return c.body(bytes);
+  });
+  // Fresh signed URL for the stored custom avatar, if one is set. A stale
+  // reference (file deleted, image missing) yields null, never an error:
+  // the client falls back to the stock mascot.
+  app.get("/api/identity/avatar", async (c) => {
+    const owner = c.get("owner");
+    const identity = await db.get<AgentIdentity>(owner, "agent-settings", "identity");
+    if (identity?.avatar !== "custom" || !identity.customAvatar) return c.json({ url: null });
+    try {
+      if (identity.customAvatar.source === "file") {
+        const file = await files.get(owner, identity.customAvatar.id);
+        return c.json({ url: auth.sign(owner, `/api/files/${file.id}/content`) });
+      }
+      if (!(await generatedImages.exists(identity.customAvatar.id))) return c.json({ url: null });
+      return c.json({ url: generatedImages.sign(owner, identity.customAvatar.id) });
+    } catch (error) {
+      if (error instanceof AppError) return c.json({ url: null });
+      throw error;
+    }
   });
   app.post("/api/files", async (c) => {
     const data = await c.req.parseBody();
