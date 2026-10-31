@@ -435,6 +435,7 @@ test("a command re-prepares and retries once when its workspace is missing", asy
         );
     assert.equal(f.calls.pause.length, 0);
 });
+
 test("prepare fails loudly when the workspace is still missing after setup", async () => {
     const f = fake({
           boxes: [{}],
@@ -444,11 +445,13 @@ test("prepare fails loudly when the workspace is still missing after setup", asy
     const result = await computer.execute(owner, { command: "pwd" });
     assert.equal(result.status, "failed");
     assert.match(result.stderr, /Computer workspace could not be prepared/);
+  
     assert.equal(f.calls.run.length, 0, "no command starts on an unverified workspace");
 });
 test("a desktop stream failure keeps its own message instead of the key/template hint", async () => {
     const f = fake({ boxes: [{}], streamError: new Error("Stream is already running") });
     const { computer, owner } = service(f);
+  
     await assert.rejects(computer.desktopUrl(owner), /Stream is already running/);
 });
 
