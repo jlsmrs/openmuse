@@ -450,7 +450,7 @@ export class E2BDesktopComputer {
    * directory does not exist") and file operations fail too. Preparing on
    * attach, not only on start, closes that gap; the steps are idempotent, so
    * re-running them on an already-prepared box is harmless. */
-private async prepare(box: DesktopBox) {
+  private async prepare(box: DesktopBox) {
     const script = await loadFilesScript();
     await this.control(async () => {
       if (
@@ -651,7 +651,7 @@ private async prepare(box: DesktopBox) {
           result.exitCode = 126;
           // Keep the SDK's message: it names the rejected argument, so a future
           // failure is diagnosed from the receipt instead of guessed at.
-output.stderr(
+          output.stderr(
             `The working directory does not exist.${error.message ? ` (${error.message})` : ""}`,
           );
           return finish();
