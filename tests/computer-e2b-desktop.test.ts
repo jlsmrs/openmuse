@@ -300,7 +300,7 @@ test("attaching fails closed on duplicates, foreign metadata, template or lifecy
     [{ lifecycle: { onTimeout: "pause", autoResume: true } }],
   ] as Partial<DesktopInfo & { metadataExtra: boolean }>[][]) {
     const f = fake({ boxes });
-  const { computer, owner } = service(f);
+    const { computer, owner } = service(f);
     for (const info of f.boxes.values())
       if ((info as { metadataExtra?: boolean }).metadataExtra)
         info.metadata = { ...info.metadata, extra: "x" };
