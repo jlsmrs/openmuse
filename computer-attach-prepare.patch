@@ -1,0 +1,90 @@
+diff --git a/apps/server/src/computer-e2b-desktop.ts b/apps/server/src/computer-e2b-desktop.ts
+index 624dafe..15a79ce 100644
+--- a/apps/server/src/computer-e2b-desktop.ts
++++ b/apps/server/src/computer-e2b-desktop.ts
+@@ -437,6 +437,20 @@ export class E2BDesktopComputer {
+       cached?.box ?? (await this.control(() => this.driver.connect(id, this.awake(info, idleMs))));
+     if (cached) await this.control(() => box.keepAlive(this.awake(info, idleMs)));
+     if (!cached) this.handles.set(id, { box });
++    await this.prepare(box);
++    await this.control(async () => {
++      if ((await box.setup(sessionScript, user)) !== 0)
++        throw new AppError("Computer desktop session did not start", 503);
++    });
++  }
++  /** Make sure a running box has the workspace directory and the file helper.
++   * Start is not the only way a box reaches this process: a fresh process can
++   * attach to a box it never started, and that box may never have been
++   * prepared, in which case terminal commands fail with exit 126 ("the working
++   * directory does not exist") and file operations fail too. Preparing on
++   * attach, not only on start, closes that gap; the steps are idempotent, so
++   * re-running them on an already-prepared box is harmless. */
++  private async prepare(box: DesktopBox) {
+     const script = await loadFilesScript();
+     await this.control(async () => {
+       if (
+@@ -447,8 +461,6 @@ export class E2BDesktopComputer {
+       )
+         throw new AppError("Computer workspace could not be prepared", 503);
+       await box.writeRootFile("/opt/openmuse/files.py", script);
+-      if ((await box.setup(sessionScript, user)) !== 0)
+-        throw new AppError("Computer desktop session did not start", 503);
+     });
+   }
+   async stop(labels: Record<string, string>) {
+@@ -506,6 +518,7 @@ export class E2BDesktopComputer {
+         409,
+       );
+     }
++    await this.prepare(box);
+     const handle: Handle = { box };
+     this.handles.set(id, handle);
+     return handle;
+@@ -635,8 +648,12 @@ export class E2BDesktopComputer {
+       } catch (error) {
+         if (error instanceof InvalidArgumentError) {
+           // A missing working directory is rejected before the command starts.
++          // Keep the SDK's message: it names the rejected argument, so a future
++          // failure is diagnosed from the receipt instead of guessed at.
+           result.exitCode = 126;
+-          output.stderr("The working directory does not exist.");
++          output.stderr(
++            `The working directory does not exist.${error.message ? ` (${error.message})` : ""}`,
++          );
+           return finish();
+         }
+         throw error;
+diff --git a/tests/computer-e2b-desktop.test.ts b/tests/computer-e2b-desktop.test.ts
+index bf0f896..fa60122 100644
+--- a/tests/computer-e2b-desktop.test.ts
++++ b/tests/computer-e2b-desktop.test.ts
+@@ -248,6 +248,20 @@ test("start creates one desktop per owner with pause-on-idle and prepares /works
+   assert.ok(!JSON.stringify(f.calls).includes(apiKey), "the API key never enters the sandbox");
+ });
+ 
++test("a fresh process prepares /workspace on a box it did not start", async () => {
++  const f = fake({ boxes: [{}] });
++  const { computer, owner } = service(f);
++  // No start() call: the box already runs, but nothing prepared it in this process.
++  const result = await computer.execute(owner, { command: "pwd" });
++  assert.equal(result.status, "succeeded");
++  assert.equal(f.calls.create.length, 0);
++  assert.ok(
++    f.calls.setup.some((s) => s.user === "root" && s.command.includes("mkdir -p /workspace")),
++    "attach prepares the workspace directory",
++  );
++  assert.deepEqual(f.calls.files, ["/opt/openmuse/files.py"]);
++});
++
+ test("a paused desktop reports stopped and start resumes it without creating another", async () => {
+   const f = fake({ boxes: [{ state: "paused" }] });
+   const { computer, owner } = service(f);
+@@ -810,7 +824,7 @@ test("X11 calls set DISPLAY themselves, so actions work on a resumed box", async
+         return { exitCode: 0, stdout: "", stderr: "" };
+       },
+     };
+-    files = { read: async () => jpeg };
++    files = { read: async () => jpeg, write: async () => {} };
+     static async connect() {
+       return new Sandbox();
+     }
