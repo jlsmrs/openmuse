@@ -19,7 +19,13 @@ export type PdfTextExtraction =
 
 export async function extractPdfText(bytes: Uint8Array): Promise<PdfTextExtraction> {
   try {
-    const loading = pdfjs.getDocument({ data: bytes });
+    // pdfjs-dist 6 rejects Node Buffer input ("Please provide binary data
+    // as Uint8Array, rather than Buffer") even though Buffer extends
+    // Uint8Array, and server file bytes arrive as Buffers (fs.readFile).
+    // Copy into a plain Uint8Array so both shapes work; without this,
+    // every PDF silently falls back to the metadata reply in production.
+    const data = new Uint8Array(bytes);
+    const loading = pdfjs.getDocument({ data });
     const doc = await loading.promise;
     const pageCount = doc.numPages;
     const pagesToRead = Math.min(pageCount, PDF_MAX_PAGES);
