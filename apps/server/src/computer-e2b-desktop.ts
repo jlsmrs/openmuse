@@ -673,7 +673,7 @@ export class E2BDesktopComputer {
       };
       try {
         handle = await attempt();
-      } catch (error) { {
+      } catch (error) {
         if (!(error instanceof InvalidArgumentError)) throw error;
         if (cwd !== "/workspace" && !cwd.startsWith("/workspace/"))
           return missingWorkspace(error.message);
@@ -683,7 +683,7 @@ export class E2BDesktopComputer {
         // subdirectory still ends here with exit 126.
         try {
           await this.prepare(box);
-        } catch (prepareError) { {
+        } catch (prepareError) {
           result.stderr =
             prepareError instanceof AppError
               ? prepareError.message
@@ -692,7 +692,7 @@ export class E2BDesktopComputer {
         }
         try {
           handle = await attempt();
-        } catch (retryError) { {
+        } catch (retryError) {
           if (retryError instanceof InvalidArgumentError)
             return missingWorkspace(retryError.message);
           throw retryError;
