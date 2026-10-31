@@ -217,18 +217,18 @@ test("PDF full text is extracted in-process", async () => {
 });
 
 test("PDF text extraction accepts a Node Buffer, not just a plain Uint8Array", async () => {
-    // Regression: production file bytes arrive as Buffers (fs.readFile),
-    // and pdfjs-dist 6 rejects Buffer input. Passing a Buffer here must
-    // extract, not fall back to the metadata reply.
-    const doc = await PDFDocument.create();
-    const font = await doc.embedFont(StandardFonts.Helvetica);
-    const page = doc.addPage();
-    page.drawText("Buffer input PDF test", { x: 50, y: 700, font, size: 24 });
-    const saved = await doc.save();
-    const extracted = await extractPdfText(Buffer.from(saved));
-    assert.ok(extracted.ok);
-    assert.equal(extracted.pageCount, 1);
-    assert.match(extracted.text, /Buffer input PDF test/);
+  // Regression: production file bytes arrive as Buffers (fs.readFile),
+  // and pdfjs-dist 6 rejects Buffer input. Passing a Buffer here must
+  // extract, not fall back to the metadata reply.
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const page = doc.addPage();
+  page.drawText("Buffer input PDF test", { x: 50, y: 700, font, size: 24 });
+  const saved = await doc.save();
+  const extracted = await extractPdfText(Buffer.from(saved));
+  assert.ok(extracted.ok);
+  assert.equal(extracted.pageCount, 1);
+  assert.match(extracted.text, /Buffer input PDF test/);
 });
 
 test("ZIP members run through the same pipeline, including nested zips", async () => {
