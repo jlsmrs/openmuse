@@ -1,0 +1,959 @@
+diff --git a/apps/mobile/App.tsx b/apps/mobile/App.tsx
+index 41152e1..95c4228 100644
+--- a/apps/mobile/App.tsx
++++ b/apps/mobile/App.tsx
+@@ -36,6 +36,7 @@ import { API_URL, createSession, MuseApi } from "./src/api";
+ import { ChatScreen, WorkspaceTools } from "./src/chat";
+ import { ComputerEntry } from "./src/computer";
+ import { ComputerDraftProvider } from "./src/computer-drafts";
++import { AgentAvatar } from "./src/custom-avatar";
+ import { Details } from "./src/details";
+ import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
+ import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
+@@ -319,7 +320,7 @@ function WorkspaceShell({
+                   opacity: pressed ? 0.65 : 1,
+                 })}
+               >
+-                <Mascot size={desktop ? 58 : 49} variant={data?.identity.avatar} />
++                <AgentAvatar identity={data?.identity} size={desktop ? 58 : 49} />
+                 <Text
+                   style={{
+                     fontSize: 16,
+diff --git a/apps/mobile/src/agent-ui.tsx b/apps/mobile/src/agent-ui.tsx
+index 66c29f1..06d0b94 100644
+--- a/apps/mobile/src/agent-ui.tsx
++++ b/apps/mobile/src/agent-ui.tsx
+@@ -1,3 +1,5 @@
++import * as DocumentPicker from "expo-document-picker";
++import * as FileSystem from "expo-file-system/legacy";
+ import {
+   ArrowRight,
+   Bell,
+@@ -20,11 +22,12 @@ import {
+   X,
+ } from "lucide-react-native";
+ import { useEffect, useRef, useState } from "react";
+-import { ActivityIndicator, Image, Linking, Pressable, Text, View } from "react-native";
++import { ActivityIndicator, Image, Linking, Platform, Pressable, Text, View } from "react-native";
+ import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
+ import type { Artifact, BrowserSession } from "../../../packages/domain/src";
+ import type {
+   AgentArtifact,
++  AgentIdentity,
+   AgentMemory,
+   AgentTask,
+   Evidence,
+@@ -34,6 +37,8 @@ import type {
+   RunEvent,
+ } from "../../../packages/domain/src/agent";
+ import { useAgentWorkspace } from "./agent-workspace";
++import { API_URL } from "./api";
++import { AgentAvatar } from "./custom-avatar";
+ import { ActivityScreen, ConnectionsScreen } from "./screens";
+ import {
+   Button,
+@@ -1723,13 +1728,28 @@ export function NotificationsSheet() {
+   );
+ }
+ export function AppsScreen() {
+-  const { navigate, open } = useWorkspace();
++  const { api, navigate, open } = useWorkspace();
+   const { data, mutate } = useAgentWorkspace();
+   const [query, setQuery] = useState("");
+   const [settings, setSettings] = useState(false);
+   const [name, setName] = useState(data?.identity.name || "OpenMuse");
+   const [tone, setTone] = useState(data?.identity.tone || "warm");
+-  const [avatar, setAvatar] = useState(data?.identity.avatar || "sky");
++  const [avatar, setAvatar] = useState<"sky" | "sand" | "lilac" | "custom">(
++    data?.identity.avatar || "sky",
++  );
++  const [customAvatar, setCustomAvatar] = useState<AgentIdentity["customAvatar"]>(
++    data?.identity.customAvatar,
++  );
++  const [customSection, setCustomSection] = useState<"generated" | "files" | null>(null);
++  const [generatedImages, setGeneratedImages] = useState<
++    Array<{ name: string; size: number; mimeType: string; url: string }>
++  >([]);
++  const [imageFiles, setImageFiles] = useState<
++    Array<{ id: string; name: string; mimeType: string; url: string }>
++  >([]);
++  const [previewUrl, setPreviewUrl] = useState<string | undefined>();
++  const [pickerBusy, setPickerBusy] = useState(false);
++  const [pickerError, setPickerError] = useState("");
+   const [showChatUpdates, setShowChatUpdates] = useState(data?.identity.showChatUpdates !== false);
+   const [memory, setMemory] = useState("");
+   const [error, setError] = useState("");
+@@ -1739,14 +1759,81 @@ export function AppsScreen() {
+       setName(data.identity.name);
+       setTone(data.identity.tone);
+       setAvatar(data.identity.avatar || "sky");
++      setCustomAvatar(data.identity.customAvatar);
++      setPreviewUrl(undefined);
+       setShowChatUpdates(data.identity.showChatUpdates !== false);
+     }
+   }, [
+     data?.identity.name,
+     data?.identity.tone,
+     data?.identity.avatar,
++    data?.identity.customAvatar?.source,
++    data?.identity.customAvatar?.id,
+     data?.identity.showChatUpdates,
+   ]);
++  async function loadCustomSection(section: "generated" | "files") {
++    setCustomSection(section);
++    setPickerError("");
++    setPickerBusy(true);
++    try {
++      if (section === "generated") {
++        setGeneratedImages(
++          await api.request<Array<{ name: string; size: number; mimeType: string; url: string }>>(
++            "/api/generated-images",
++          ),
++        );
++      } else {
++        const files =
++          await api.request<Array<{ id: string; name: string; mimeType: string; url: string }>>(
++            "/api/files",
++          );
++        setImageFiles(files.filter((f) => f.mimeType.startsWith("image/")));
++      }
++    } catch (e) {
++      setPickerError(e instanceof Error ? e.message : String(e));
++    } finally {
++      setPickerBusy(false);
++    }
++  }
++  async function uploadCustomImage() {
++    setPickerError("");
++    setPickerBusy(true);
++    try {
++      const result = await DocumentPicker.getDocumentAsync({
++        type: "image/*",
++        copyToCacheDirectory: true,
++      });
++      if (result.canceled) return;
++      const file = result.assets[0];
++      let artifact: Artifact;
++      if (Platform.OS === "web") {
++        const form = new FormData();
++        if (!file.file)
++          throw new Error("The selected file could not be read. Please choose it again.");
++        form.append("file", file.file, file.name);
++        artifact = await api.request<Artifact>("/api/files", form);
++      } else {
++        const uploaded = await FileSystem.uploadAsync(`${API_URL}/api/files`, file.uri, {
++          httpMethod: "POST",
++          uploadType: FileSystem.FileSystemUploadType.MULTIPART,
++          fieldName: "file",
++          mimeType: file.mimeType || "application/octet-stream",
++          headers: { Authorization: `Bearer ${api.token}` },
++        });
++        const payload = JSON.parse(uploaded.body);
++        if (uploaded.status < 200 || uploaded.status >= 300)
++          throw new Error(payload.error || "Could not import this file.");
++        artifact = payload;
++      }
++      setCustomAvatar({ source: "file", id: artifact.id });
++      setPreviewUrl(artifact.url || undefined);
++      setAvatar("custom");
++    } catch (e) {
++      setPickerError(e instanceof Error ? e.message : String(e));
++    } finally {
++      setPickerBusy(false);
++    }
++  }
+   async function save(path: string, body: unknown) {
+     setBusy(true);
+     setError("");
+@@ -1837,7 +1924,129 @@ export function AppsScreen() {
+                   <Mascot size={62} variant={item} />
+                 </Pressable>
+               ))}
++              <Pressable
++                key="custom"
++                accessibilityRole="radio"
++                accessibilityLabel="Custom avatar"
++                accessibilityState={{ checked: avatar === "custom" }}
++                onPress={() => setAvatar("custom")}
++                style={{
++                  padding: 7,
++                  borderRadius: 24,
++                  backgroundColor: avatar === "custom" ? colors.sky : colors.canvas,
++                }}
++              >
++                {previewUrl ? (
++                  <Image
++                    source={{ uri: previewUrl }}
++                    resizeMode="cover"
++                    style={{ width: 62, height: 62, borderRadius: 31 }}
++                    onError={() => setPreviewUrl(undefined)}
++                  />
++                ) : data?.identity.avatar === "custom" && data.identity.customAvatar ? (
++                  <AgentAvatar identity={data.identity} size={62} />
++                ) : (
++                  <View
++                    style={{
++                      width: 62,
++                      height: 62,
++                      borderRadius: 31,
++                      borderWidth: 1,
++                      borderColor: colors.muted,
++                      justifyContent: "center",
++                      alignItems: "center",
++                    }}
++                  >
++                    <Text style={s.small}>Custom</Text>
++                  </View>
++                )}
++              </Pressable>
+             </View>
++            {avatar === "custom" && (
++              <View style={{ gap: 10, marginBottom: 12 }}>
++                <Text style={s.small}>
++                  Pick a generated image or one of your files, or upload an image. It is served
++                  through a short-lived signed link, never bundled into the app.
++                </Text>
++                <View style={[s.row, { gap: 8 }]}>
++                  <Button
++                    small
++                    primary={customSection === "generated"}
++                    onPress={() => void loadCustomSection("generated")}
++                  >
++                    Generated images
++                  </Button>
++                  <Button
++                    small
++                    primary={customSection === "files"}
++                    onPress={() => void loadCustomSection("files")}
++                  >
++                    Your files
++                  </Button>
++                  <Button small busy={pickerBusy} onPress={() => void uploadCustomImage()}>
++                    Upload image
++                  </Button>
++                </View>
++                <ErrorNotice error={pickerError} />
++                {customSection === "generated" && (
++                  <View style={[s.row, { gap: 10, flexWrap: "wrap" }]}>
++                    {generatedImages.map((item) => (
++                      <Pressable
++                        key={item.name}
++                        onPress={() => {
++                          setCustomAvatar({ source: "generated", id: item.name });
++                          setPreviewUrl(item.url);
++                        }}
++                        style={{ width: 90, gap: 4, alignItems: "center" }}
++                      >
++                        <Image
++                          source={{ uri: item.url }}
++                          style={{ width: 62, height: 62, borderRadius: 8 }}
++                        />
++                        <Text numberOfLines={1} style={s.small}>
++                          {item.name}
++                        </Text>
++                      </Pressable>
++                    ))}
++                    {!generatedImages.length && !pickerBusy && (
++                      <Text style={s.small}>No generated images yet.</Text>
++                    )}
++                  </View>
++                )}
++                {customSection === "files" && (
++                  <View style={[s.row, { gap: 10, flexWrap: "wrap" }]}>
++                    {imageFiles.map((item) => (
++                      <Pressable
++                        key={item.id}
++                        onPress={() => {
++                          setCustomAvatar({ source: "file", id: item.id });
++                          setPreviewUrl(item.url);
++                        }}
++                        style={{ width: 90, gap: 4, alignItems: "center" }}
++                      >
++                        <Image
++                          source={{ uri: item.url }}
++                          style={{ width: 62, height: 62, borderRadius: 8 }}
++                        />
++                        <Text numberOfLines={1} style={s.small}>
++                          {item.name}
++                        </Text>
++                      </Pressable>
++                    ))}
++                    {!imageFiles.length && !pickerBusy && (
++                      <Text style={s.small}>No image files yet.</Text>
++                    )}
++                  </View>
++                )}
++                {customAvatar && (
++                  <Text style={s.small}>
++                    Selected:{" "}
++                    {customAvatar.source === "generated" ? customAvatar.id : "uploaded file"}
++                    {" — "}save preferences to apply it.
++                  </Text>
++                )}
++              </View>
++            )}
+             <Field label="Name" value={name} onChangeText={setName} />
+             <View style={[s.row, { gap: 8 }]}>
+               {(["warm", "concise", "thoughtful"] as const).map((item) => (
+@@ -1859,7 +2068,13 @@ export function AppsScreen() {
+               busy={busy}
+               disabled={!name.trim()}
+               onPress={() =>
+-                void save("/identity", { name: name.trim(), tone, avatar, showChatUpdates })
++                void save("/identity", {
++                  name: name.trim(),
++                  tone,
++                  avatar,
++                  customAvatar: avatar === "custom" ? customAvatar : undefined,
++                  showChatUpdates,
++                })
+               }
+             >
+               Save preferences
+diff --git a/apps/mobile/src/custom-avatar.tsx b/apps/mobile/src/custom-avatar.tsx
+new file mode 100644
+index 0000000..04d9b36
+--- /dev/null
++++ b/apps/mobile/src/custom-avatar.tsx
+@@ -0,0 +1,62 @@
++// Renders the agent's avatar: the stock capybara variant, or the stored
++// custom avatar image when one is set. A custom avatar is never bundled
++// and never fetched by a bare path: the component asks the server for a
++// fresh 15-minute signed URL (/api/identity/avatar). If that image fails
++// to load (for example the URL expired), it refetches once, then falls
++// back to the stock mascot rather than showing a broken image.
++import { useCallback, useEffect, useState } from "react";
++import { Image, View } from "react-native";
++import type { AgentIdentity } from "../../../packages/domain/src/agent";
++import { Mascot } from "./ui";
++import { useWorkspace } from "./workspace";
++
++export function AgentAvatar({ identity, size = 42 }: { identity?: AgentIdentity; size?: number }) {
++  const { api } = useWorkspace();
++  const [url, setUrl] = useState<string | undefined>();
++  const [failed, setFailed] = useState(false);
++  const [retried, setRetried] = useState(false);
++  const custom = identity?.avatar === "custom" ? identity.customAvatar : undefined;
++  const fetchUrl = useCallback(() => {
++    api
++      .request<{ url: string | null }>("/api/identity/avatar")
++      .then((res) => setUrl(res.url ?? undefined))
++      .catch(() => setFailed(true));
++  }, [api]);
++  useEffect(() => {
++    if (!custom) {
++      setUrl(undefined);
++      setFailed(false);
++      setRetried(false);
++      return;
++    }
++    fetchUrl();
++  }, [custom?.source, custom?.id, fetchUrl]);
++  if (!custom || failed || !url)
++    return (
++      <Mascot
++        size={size}
++        variant={identity?.avatar === "custom" ? "sky" : (identity?.avatar ?? "sky")}
++      />
++    );
++  return (
++    <View
++      accessibilityLabel="Custom avatar"
++      style={{ width: size, height: size, borderRadius: size / 2, overflow: "hidden" }}
++    >
++      <Image
++        source={{ uri: url }}
++        resizeMode="cover"
++        style={{ width: size, height: size }}
++        accessible={false}
++        onError={() => {
++          if (!retried) {
++            setRetried(true);
++            fetchUrl();
++          } else {
++            setFailed(true);
++          }
++        }}
++      />
++    </View>
++  );
++}
+diff --git a/apps/mobile/src/screens.tsx b/apps/mobile/src/screens.tsx
+index 1255f9f..0328145 100644
+--- a/apps/mobile/src/screens.tsx
++++ b/apps/mobile/src/screens.tsx
+@@ -38,8 +38,10 @@ import type {
+   CalendarEvent,
+   EmailDraft,
+ } from "../../../packages/domain/src";
++import { useAgentWorkspace } from "./agent-workspace";
+ import { API_URL } from "./api";
+ import { browserAddress } from "./browser-address";
++import { AgentAvatar } from "./custom-avatar";
+ import { localDateTime, startOfZonedDay, zonedInstant } from "./date-time";
+ import {
+   Button,
+@@ -51,7 +53,6 @@ import {
+   ErrorNotice,
+   IconButton,
+   LinkRow,
+-  Mascot,
+   relativeDate,
+   resultSummary,
+   SectionHeading,
+@@ -70,6 +71,7 @@ function eventDate(event: CalendarEvent) {
+ }
+ export function TodayScreen() {
+   const { workspace: w, navigate, open, ask } = useWorkspace();
++  const { data: agentData } = useAgentWorkspace();
+   const wide = useWindowDimensions().width > 1180;
+   const pending = w.actions.filter((a) => a.status === "awaiting_review");
+   const unread = w.mail.filter((m) => m.unread);
+@@ -142,7 +144,7 @@ export function TodayScreen() {
+                 borderColor: "#C8DBE6",
+               }}
+             />
+-            <Mascot size={94} />
++            <AgentAvatar identity={agentData?.identity} size={94} />
+             <View
+               style={[
+                 s.row,
+diff --git a/apps/mobile/src/ui.tsx b/apps/mobile/src/ui.tsx
+index 0346f64..64b00c7 100644
+--- a/apps/mobile/src/ui.tsx
++++ b/apps/mobile/src/ui.tsx
+@@ -399,13 +399,17 @@ export function LinkRow({
+     </Pressable>
+   );
+ }
+-/** OpenMuse's original capybara, shared by every assistant surface. */
++/** OpenMuse's original capybara, shared by every assistant surface.
++ * When imageUrl is set (a signed URL for a custom avatar), the custom
++ * image renders in the same round frame instead of the capybara. */
+ export function Mascot({
+   size = 42,
+   variant = "sky",
++  imageUrl,
+ }: {
+   size?: number;
+   variant?: "sky" | "sand" | "lilac";
++  imageUrl?: string;
+ }) {
+   const palette = {
+     sky: "#ECF5FA",
+@@ -413,7 +417,10 @@ export function Mascot({
+     lilac: "#F1ECF9",
+   }[variant];
+   return (
+-    <View accessibilityLabel="OpenMuse capybara" style={{ width: size, height: size }}>
++    <View
++      accessibilityLabel={imageUrl ? "Custom avatar" : "OpenMuse capybara"}
++      style={{ width: size, height: size }}
++    >
+       <View
+         style={{
+           position: "absolute",
+@@ -425,12 +432,30 @@ export function Mascot({
+           backgroundColor: palette,
+         }}
+       />
+-      <Image
+-        source={require("../assets/capybara.png")}
+-        resizeMode="contain"
+-        style={{ width: size, height: size }}
+-        accessible={false}
+-      />
++      {imageUrl ? (
++        <View
++          style={{
++            width: size,
++            height: size,
++            borderRadius: size / 2,
++            overflow: "hidden",
++          }}
++        >
++          <Image
++            source={{ uri: imageUrl }}
++            resizeMode="cover"
++            style={{ width: size, height: size }}
++            accessible={false}
++          />
++        </View>
++      ) : (
++        <Image
++          source={require("../assets/capybara.png")}
++          resizeMode="contain"
++          style={{ width: size, height: size }}
++          accessible={false}
++        />
++      )}
+     </View>
+   );
+ }
+diff --git a/apps/server/src/app.ts b/apps/server/src/app.ts
+index d52ff06..86b9827 100644
+--- a/apps/server/src/app.ts
++++ b/apps/server/src/app.ts
+@@ -6,6 +6,7 @@ import { Hono } from "hono";
+ import { bodyLimit } from "hono/body-limit";
+ import { cors } from "hono/cors";
+ import { z } from "zod";
++import type { AgentIdentity } from "../../../packages/domain/src/agent.ts";
+ import {
+   calendarRangeSchema,
+   emailDraftSchema,
+@@ -23,6 +24,7 @@ import { agentRoutes } from "./engine/routes.ts";
+ import { AgentService } from "./engine/service.ts";
+ import { AppError } from "./errors.ts";
+ import { Files } from "./files.ts";
++import { GeneratedImages } from "./generated-images.ts";
+ import { GoogleAuth } from "./google-auth.ts";
+ import { rateLimit } from "./rate-limit.ts";
+ import { WorkspaceService } from "./workspace.ts";
+@@ -36,6 +38,7 @@ export async function createApp(
+   await resolveComputerDeployment(config);
+   const auth = await createAuth(db, config),
+     files = new Files(db, config, auth),
++    generatedImages = new GeneratedImages(config, auth),
+     google = new GoogleAuth(db, config),
+     workspace = new WorkspaceService(db, config, files, google);
+   const actions = new ActionService(db, {
+@@ -137,7 +140,7 @@ export async function createApp(
+     const method = c.req.method === "HEAD" ? "GET" : c.req.method;
+     const signedRoute =
+       (method === "GET" &&
+-        /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$/.test(
++        /^\/api\/files\/[^/]+\/content$|^\/api\/browsers\/[^/]+\/(?:preview|console)$|^\/api\/generated-images\/[^/]+\/content$/.test(
+           c.req.path,
+         )) ||
+       (method === "POST" && /^\/api\/browsers\/[^/]+\/console$/.test(c.req.path));
+@@ -248,6 +251,36 @@ export async function createApp(
+     await db.put(c.get("owner"), "conversations", { id: "default", messages });
+     return c.json({ ok: true });
+   });
++  app.get("/api/files", async (c) => c.json(await files.list(c.get("owner"))));
++  app.get("/api/generated-images", async (c) => c.json(await generatedImages.list(c.get("owner"))));
++  app.get("/api/generated-images/:name/content", async (c) => {
++    const { bytes, mimeType } = await generatedImages.bytes(c.req.param("name"));
++    c.header("Content-Type", mimeType);
++    c.header(
++      "Content-Disposition",
++      `inline; filename*=UTF-8''${encodeURIComponent(c.req.param("name"))}`,
++    );
++    return c.body(bytes);
++  });
++  // Fresh signed URL for the stored custom avatar, if one is set. A stale
++  // reference (file deleted, image missing) yields null, never an error:
++  // the client falls back to the stock mascot.
++  app.get("/api/identity/avatar", async (c) => {
++    const owner = c.get("owner");
++    const identity = await db.get<AgentIdentity>(owner, "agent-settings", "identity");
++    if (identity?.avatar !== "custom" || !identity.customAvatar) return c.json({ url: null });
++    try {
++      if (identity.customAvatar.source === "file") {
++        const file = await files.get(owner, identity.customAvatar.id);
++        return c.json({ url: auth.sign(owner, `/api/files/${file.id}/content`) });
++      }
++      if (!(await generatedImages.exists(identity.customAvatar.id))) return c.json({ url: null });
++      return c.json({ url: generatedImages.sign(owner, identity.customAvatar.id) });
++    } catch (error) {
++      if (error instanceof AppError) return c.json({ url: null });
++      throw error;
++    }
++  });
+   app.post("/api/files", async (c) => {
+     const data = await c.req.parseBody();
+     const file = data.file;
+diff --git a/apps/server/src/engine/routes.ts b/apps/server/src/engine/routes.ts
+index 0d616aa..a7c33ec 100644
+--- a/apps/server/src/engine/routes.ts
++++ b/apps/server/src/engine/routes.ts
+@@ -128,7 +128,13 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
+       .object({
+         name: z.string().trim().min(1).max(80),
+         tone: z.enum(["warm", "concise", "thoughtful"]),
+-        avatar: z.enum(["sky", "sand", "lilac"]).optional(),
++        avatar: z.enum(["sky", "sand", "lilac", "custom"]).optional(),
++        customAvatar: z
++          .object({
++            source: z.enum(["file", "generated"]),
++            id: z.string().trim().min(1).max(260),
++          })
++          .optional(),
+         showChatUpdates: z.boolean().optional(),
+       })
+       .parse(await c.req.json());
+diff --git a/apps/server/src/generated-images.ts b/apps/server/src/generated-images.ts
+new file mode 100644
+index 0000000..9f5ee33
+--- /dev/null
++++ b/apps/server/src/generated-images.ts
+@@ -0,0 +1,116 @@
++// Generated images live under DATA_DIR/generated-images/ (see
++// engine/foundry-image.ts). They are NOT workspace files: they have no
++// Files row, so they cannot be served through /api/files/:id/content.
++// This module serves them the same way files are served — through a
++// 15-minute owner-scoped signed URL minted by Auth.sign, verified by the
++// same middleware as file content. No public unauthenticated access, and
++// a signed URL is bound to one owner and one path.
++
++import type { Dirent } from "node:fs";
++import { readdir, readFile, stat } from "node:fs/promises";
++import { basename, join, resolve, sep } from "node:path";
++import type { Auth } from "./auth.ts";
++import type { Config } from "./config.ts";
++import { AppError } from "./errors.ts";
++
++const IMAGE_MIME: Record<string, string> = {
++  png: "image/png",
++  jpg: "image/jpeg",
++  jpeg: "image/jpeg",
++  gif: "image/gif",
++  webp: "image/webp",
++};
++
++export interface GeneratedImage {
++  name: string;
++  size: number;
++  mimeType: string;
++  url: string;
++}
++
++export class GeneratedImages {
++  constructor(
++    private readonly config: Config,
++    private readonly auth: Auth,
++  ) {}
++
++  private dir() {
++    return resolve(this.config.dataDir, "generated-images");
++  }
++
++  /** Resolve a stored name to a path inside generated-images/, or throw. */
++  resolvePath(name: string): { path: string; mimeType: string } {
++    if (basename(name) !== name || name.includes("\\"))
++      throw new AppError("Generated image not found", 404);
++    const ext = name.split(".").pop()?.toLowerCase() ?? "";
++    const mimeType = IMAGE_MIME[ext];
++    if (!mimeType) throw new AppError("Generated image not found", 404);
++    const resolved = resolve(this.dir(), name);
++    if (!resolved.startsWith(`${this.dir()}${sep}`))
++      throw new AppError("Generated image not found", 404);
++    return { path: resolved, mimeType };
++  }
++
++  async list(owner: string): Promise<GeneratedImage[]> {
++    let entries: Dirent[];
++    try {
++      entries = await readdir(this.dir(), { withFileTypes: true });
++    } catch (error) {
++      if (error instanceof Error && "code" in error && error.code === "ENOENT") return [];
++      throw error;
++    }
++    const images: Array<GeneratedImage & { mtime: number }> = [];
++    for (const entry of entries) {
++      if (!entry.isFile()) continue;
++      const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";
++      const mimeType = IMAGE_MIME[ext];
++      if (!mimeType) continue;
++      const info = await stat(join(this.dir(), entry.name));
++      images.push({
++        name: entry.name,
++        size: info.size,
++        mimeType,
++        url: this.auth.sign(
++          owner,
++          `/api/generated-images/${encodeURIComponent(entry.name)}/content`,
++        ),
++        mtime: info.mtimeMs,
++      });
++    }
++    return images.sort((a, b) => b.mtime - a.mtime).map(({ mtime: _mtime, ...rest }) => rest);
++  }
++
++  async bytes(name: string) {
++    const { path, mimeType } = this.resolvePath(name);
++    try {
++      return { bytes: await readFile(path), mimeType };
++    } catch (error) {
++      if (error instanceof Error && "code" in error && error.code === "ENOENT")
++        throw new AppError("Generated image not found", 404);
++      throw error;
++    }
++  }
++
++  /** True when a well-formed name actually exists on disk. Signing alone
++   * does not prove existence, so the avatar endpoint checks this first
++   * rather than minting a URL that would 404 when rendered. */
++  async exists(name: string): Promise<boolean> {
++    let path: string;
++    try {
++      path = this.resolvePath(name).path;
++    } catch {
++      return false;
++    }
++    try {
++      await stat(path);
++      return true;
++    } catch {
++      return false;
++    }
++  }
++
++  sign(owner: string, name: string): string {
++    this.resolvePath(name);
++    return this.auth.sign(owner, `/api/generated-images/${encodeURIComponent(name)}/content`);
++  }
++}
+diff --git a/packages/domain/src/agent.ts b/packages/domain/src/agent.ts
+index c2d869b..1c3e889 100644
+--- a/packages/domain/src/agent.ts
++++ b/packages/domain/src/agent.ts
+@@ -118,7 +118,10 @@ export interface AgentNotification {
+ export interface AgentIdentity {
+   name: string;
+   tone: "warm" | "concise" | "thoughtful";
+-  avatar?: "sky" | "sand" | "lilac";
++  avatar?: "sky" | "sand" | "lilac" | "custom";
++  /** Image used when avatar is "custom". Not bundled: it is served through
++   * a short-lived signed URL (see /api/identity/avatar). */
++  customAvatar?: { source: "file" | "generated"; id: string };
+   showChatUpdates?: boolean;
+ }
+ export interface AgentWorkspace {
+diff --git a/tests/avatar-signed-url.test.ts b/tests/avatar-signed-url.test.ts
+new file mode 100644
+index 0000000..ce71146
+--- /dev/null
++++ b/tests/avatar-signed-url.test.ts
+@@ -0,0 +1,230 @@
++// Custom avatars: generated images are served only through short-lived
++// owner-scoped signed URLs, and the stored custom avatar resolves to a
++// fresh signed URL (or null). Expiry, tampering, cross-path reuse, and
++// path traversal are rejected; stock avatars are untouched.
++import assert from "node:assert/strict";
++import { createHmac } from "node:crypto";
++import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import test, { after, before } from "node:test";
++import { createApp } from "../apps/server/src/app.ts";
++import type { Auth } from "../apps/server/src/auth.ts";
++import type { Config } from "../apps/server/src/config.ts";
++import { createStore, type Store } from "../apps/server/src/db.ts";
++import { Files } from "../apps/server/src/files.ts";
++import { GeneratedImages } from "../apps/server/src/generated-images.ts";
++
++// 1x1 red PNG.
++const PNG = Buffer.from(
++  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
++  "base64",
++);
++
++let db: Store;
++let app: Awaited<ReturnType<typeof createApp>>["app"];
++let auth: Auth;
++let files: Files;
++let directory: string;
++let token: string;
++
++before(async () => {
++  directory = await mkdtemp(join(tmpdir(), "openmuse-avatar-"));
++  db = await createStore();
++  const config: Config = {
++    mode: "sample",
++    port: 8787,
++    host: "127.0.0.1",
++    publicUrl: "http://localhost:8787",
++    dataDir: directory,
++    agentBackend: "sample",
++    intelligenceApiKey: "test-project-key-never-sent",
++    googleRedirectUri: "http://localhost:8787/api/google/callback",
++    allowedOrigins: ["http://localhost:8081"],
++  };
++  ({ app, auth } = await createApp(db, config));
++  files = new Files(db, config, auth);
++  const response = await app.request("/api/session", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: "{}",
++  });
++  assert.equal(response.status, 200);
++  token = (await response.json()).token;
++  await mkdir(join(directory, "generated-images"), { recursive: true });
++  await writeFile(join(directory, "generated-images", "test-avatar.png"), PNG);
++  await writeFile(join(directory, "generated-images", "other.png"), PNG);
++  await writeFile(join(directory, "generated-images", "notes.txt"), "not an image");
++});
++
++after(async () => {
++  await db.close();
++  await rm(directory, { recursive: true, force: true });
++});
++
++const authed = (path: string, init?: RequestInit) =>
++  app.request(path, {
++    ...init,
++    headers: { Authorization: `Bearer ${token}`, ...(init?.headers ?? {}) },
++  });
++
++const json = async (path: string, body: unknown) =>
++  authed(path, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify(body),
++  });
++
++test("generated images list only image files and carry signed urls", async () => {
++  const response = await authed("/api/generated-images");
++  assert.equal(response.status, 200);
++  const list = (await response.json()) as Array<{
++    name: string;
++    mimeType: string;
++    url: string;
++  }>;
++  const names = list.map((item) => item.name).sort();
++  assert.deepEqual(names, ["other.png", "test-avatar.png"]);
++  const item = list.find((entry) => entry.name === "test-avatar.png");
++  assert.ok(item);
++  assert.equal(item.mimeType, "image/png");
++  assert.match(item.url, /\/api\/generated-images\/test-avatar\.png\/content\?/);
++  assert.match(item.url, /owner=/);
++  assert.match(item.url, /expires=/);
++  assert.match(item.url, /signature=[0-9a-f]{64}/);
++});
++
++test("a signed content url serves bytes with no bearer token", async () => {
++  const list = (await (await authed("/api/generated-images")).json()) as Array<{
++    name: string;
++    url: string;
++  }>;
++  const url = list.find((item) => item.name === "test-avatar.png")?.url;
++  assert.ok(url);
++  const response = await app.request(url);
++  assert.equal(response.status, 200);
++  assert.equal(response.headers.get("content-type"), "image/png");
++  assert.deepEqual(Buffer.from(await response.arrayBuffer()), PNG);
++});
++
++test("no signature and no bearer is rejected", async () => {
++  const response = await app.request("/api/generated-images/test-avatar.png/content");
++  assert.equal(response.status, 401);
++});
++
++test("a tampered signature is rejected", async () => {
++  const list = (await (await authed("/api/generated-images")).json()) as Array<{
++    name: string;
++    url: string;
++  }>;
++  const url = list.find((item) => item.name === "test-avatar.png")?.url;
++  assert.ok(url);
++  const tampered = url.replace(
++    /signature=([0-9a-f])/,
++    (_m, c) => `signature=${c === "a" ? "b" : "a"}`,
++  );
++  assert.notEqual(tampered, url);
++  assert.equal((await app.request(tampered)).status, 403);
++});
++
++test("a signature for one path does not open another path", async () => {
++  const list = (await (await authed("/api/generated-images")).json()) as Array<{
++    name: string;
++    url: string;
++  }>;
++  const url = list.find((item) => item.name === "test-avatar.png")?.url;
++  assert.ok(url);
++  const reused = url.replace("test-avatar.png", "other.png");
++  assert.equal((await app.request(reused)).status, 403);
++});
++
++test("an expired signature is rejected", async () => {
++  const key = await readFile(join(directory, "session-signing-key"), "utf8");
++  const path = "/api/generated-images/test-avatar.png/content";
++  const expires = String(Date.now() - 1000);
++  const signature = createHmac("sha256", key)
++    .update(`local-user\n${path}\n${expires}`)
++    .digest("hex");
++  const url = `http://localhost:8787${path}?owner=local-user&expires=${expires}&signature=${signature}`;
++  assert.equal((await app.request(url)).status, 401);
++});
++
++test("path traversal is rejected at resolve time and over http", async () => {
++  const generated = new GeneratedImages({ dataDir: directory } as Config, auth);
++  assert.throws(() => generated.resolvePath("../secret.png"), /not found/);
++  assert.throws(() => generated.resolvePath("a/b.png"), /not found/);
++  assert.throws(() => generated.resolvePath("notes.txt"), /not found/);
++  assert.throws(() => generated.resolvePath("..\\secret.png"), /not found/);
++  assert.equal(generated.resolvePath("test-avatar.png").mimeType, "image/png");
++  const traversal = await app.request("/api/generated-images/..%2F..%2Fsecret/content");
++  assert.notEqual(traversal.status, 200);
++});
++
++test("identity avatar endpoint resolves a custom generated avatar", async () => {
++  const saved = await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "custom",
++    customAvatar: { source: "generated", id: "test-avatar.png" },
++  });
++  assert.equal(saved.status, 200);
++  const avatar = await authed("/api/identity/avatar");
++  assert.equal(avatar.status, 200);
++  const { url } = (await avatar.json()) as { url: string | null };
++  assert.ok(url);
++  assert.match(url, /\/api\/generated-images\/test-avatar\.png\/content\?/);
++  const content = await app.request(url);
++  assert.equal(content.status, 200);
++  assert.deepEqual(Buffer.from(await content.arrayBuffer()), PNG);
++});
++
++test("identity avatar endpoint resolves a custom file avatar", async () => {
++  const uploaded = await files.import("local-user", "avatar.png", new Uint8Array(PNG), "test");
++  const saved = await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "custom",
++    customAvatar: { source: "file", id: uploaded.id },
++  });
++  assert.equal(saved.status, 200);
++  const avatar = await authed("/api/identity/avatar");
++  const { url } = (await avatar.json()) as { url: string | null };
++  assert.ok(url);
++  assert.match(url, new RegExp(`/api/files/${uploaded.id}/content\\?`));
++  assert.equal((await app.request(url)).status, 200);
++});
++
++test("identity avatar endpoint returns null for stock avatars and stale references", async () => {
++  await json("/api/agent/identity", { name: "Charlie", tone: "warm", avatar: "sky" });
++  assert.deepEqual(await (await authed("/api/identity/avatar")).json(), { url: null });
++  await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "custom",
++    customAvatar: { source: "generated", id: "missing.png" },
++  });
++  assert.deepEqual(await (await authed("/api/identity/avatar")).json(), { url: null });
++  await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "custom",
++    customAvatar: { source: "file", id: "00000000-0000-4000-8000-000000000000" },
++  });
++  assert.deepEqual(await (await authed("/api/identity/avatar")).json(), { url: null });
++});
++
++test("identity validation rejects bad avatar values", async () => {
++  const badAvatar = await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "rainbow",
++  });
++  assert.equal(badAvatar.status, 422);
++  const badSource = await json("/api/agent/identity", {
++    name: "Charlie",
++    tone: "warm",
++    avatar: "custom",
++    customAvatar: { source: "bogus", id: "x.png" },
++  });
++  assert.equal(badSource.status, 422);
++});
