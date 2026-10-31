@@ -260,6 +260,7 @@ test("a fresh process prepares /workspace on a box it did not start", async () =
     "attach prepares the workspace directory",
   );
   assert.deepEqual(f.calls.files, ["/opt/openmuse/files.py"]);
+});
 
 test("a paused desktop reports stopped and start resumes it without creating another", async () => {
   const f = fake({ boxes: [{ state: "paused" }] });
