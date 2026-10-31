@@ -560,7 +560,7 @@ export class E2BDesktopComputer {
     action: DesktopAction,
     beforeInput?: () => Promise<void>,
   ) {
-    const { box } = await this.attach(labels);
+Z      const { box } = await this.attach(labels);
     const input = desktopInput(action);
     let uncertain = false;
     if (input) {
