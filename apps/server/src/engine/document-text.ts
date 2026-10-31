@@ -1,10 +1,13 @@
 // Text extraction for office documents, used by read_workspace_file so Charlie
 // can read attached documents in chat. Extraction is best-effort and honest:
 // when a format cannot be extracted, the caller reports that plainly instead
-// of inventing contents. Binary legacy Office formats (.doc, .xls, .ppt) are
-// not extracted — only the modern XML formats below.
+// of inventing contents. Modern XML formats use mammoth / the xlsx package /
+// jszip; legacy .doc uses word-extractor (pure JS, no native code) and
+// legacy .xls uses the same xlsx package (it reads BIFF). Legacy .ppt has
+// no sound pure-JS extractor and is still refused plainly.
 import JSZip from "jszip";
 import mammoth from "mammoth";
+import WordExtractor from "word-extractor";
 import * as XLSX from "xlsx";
 
 export type DocumentExtraction = { ok: true; text: string } | { ok: false; error: string };
@@ -12,19 +15,24 @@ export type DocumentExtraction = { ok: true; text: string } | { ok: false; error
 const DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 const PPTX_MIME = "application/vnd.openxmlformats-officedocument.presentationml.presentation";
+const DOC_MIME = "application/msword";
+const XLS_MIME = "application/vnd.ms-excel";
+const PPT_MIME = "application/vnd.ms-powerpoint";
 
 export function isExtractableDocumentMime(mime: string): boolean {
-  return mime === DOCX_MIME || mime === XLSX_MIME || mime === PPTX_MIME;
+  return (
+    mime === DOCX_MIME ||
+    mime === XLSX_MIME ||
+    mime === PPTX_MIME ||
+    mime === DOC_MIME ||
+    mime === XLS_MIME
+  );
 }
 
 /** Plain-language note for a document format extraction cannot read. */
 export function documentExtractionNote(mime: string): string {
-  if (
-    mime === "application/msword" ||
-    mime === "application/vnd.ms-excel" ||
-    mime === "application/vnd.ms-powerpoint"
-  )
-    return "legacy binary Office format — text extraction is not available in chat";
+  if (mime === PPT_MIME)
+    return "legacy binary PowerPoint format — text extraction is not available in chat";
   return "stored but not readable as text in chat";
 }
 
@@ -57,6 +65,16 @@ async function extractXlsx(bytes: Uint8Array): Promise<DocumentExtraction> {
   }
 }
 
+async function extractDoc(bytes: Uint8Array): Promise<DocumentExtraction> {
+  try {
+    const extractor = new WordExtractor();
+    const document = await extractor.extract(toBuffer(bytes));
+    return { ok: true, text: document.getBody() };
+  } catch {
+    return { ok: false, error: "This Word document could not be read as text." };
+  }
+}
+
 async function extractPptx(bytes: Uint8Array): Promise<DocumentExtraction> {
   try {
     const zip = await JSZip.loadAsync(toBuffer(bytes));
@@ -86,7 +104,8 @@ export async function extractDocumentText(
   mimeType: string,
 ): Promise<DocumentExtraction> {
   if (mimeType === DOCX_MIME) return extractDocx(bytes);
-  if (mimeType === XLSX_MIME) return extractXlsx(bytes);
+  if (mimeType === XLSX_MIME || mimeType === XLS_MIME) return extractXlsx(bytes);
   if (mimeType === PPTX_MIME) return extractPptx(bytes);
+  if (mimeType === DOC_MIME) return extractDoc(bytes);
   return { ok: false, error: documentExtractionNote(mimeType) };
 }
