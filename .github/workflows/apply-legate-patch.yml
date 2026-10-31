@@ -1,6 +1,8 @@
 name: Apply legate patch
 on:
   workflow_dispatch:
+  push:
+    branches: [feat/legate-avatar]
 permissions:
   contents: write
 jobs:
