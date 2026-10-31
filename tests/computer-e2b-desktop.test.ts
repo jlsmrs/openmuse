@@ -248,6 +248,20 @@ test("start creates one desktop per owner with pause-on-idle and prepares /works
   assert.ok(!JSON.stringify(f.calls).includes(apiKey), "the API key never enters the sandbox");
 });
 
+test("a fresh process prepares /workspace on a box it did not start", async () => {
+  const f = fake({ boxes: [{}] });
+  const { computer, owner } = service(f);
+  // No start() call: the box already runs, but nothing prepared it in this process.
+  const result = await computer.execute(owner, { command: "pwd" });
+  assert.equal(result.status, "succeeded");
+  assert.equal(f.calls.create.length, 0);
+  assert.ok(
+    f.calls.setup.some((s) => s.user === "root" && s.command.includes("mkdir -p /workspace")),
+    "attach prepares the workspace directory",
+  );
+  assert.deepEqual(f.calls.files, ["/opt/openmuse/files.py"]);
+});
+
 test("a paused desktop reports stopped and start resumes it without creating another", async () => {
   const f = fake({ boxes: [{ state: "paused" }] });
   const { computer, owner } = service(f);
@@ -810,7 +824,7 @@ test("X11 calls set DISPLAY themselves, so actions work on a resumed box", async
         return { exitCode: 0, stdout: "", stderr: "" };
       },
     };
-    files = { read: async () => jpeg };
+    files = { read: async () => jpeg, write: async () => {} };
     static async connect() {
       return new Sandbox();
     }

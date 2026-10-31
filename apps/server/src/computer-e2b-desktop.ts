@@ -437,6 +437,20 @@ export class E2BDesktopComputer {
       cached?.box ?? (await this.control(() => this.driver.connect(id, this.awake(info, idleMs))));
     if (cached) await this.control(() => box.keepAlive(this.awake(info, idleMs)));
     if (!cached) this.handles.set(id, { box });
+    await this.prepare(box);
+    await this.control(async () => {
+      if ((await box.setup(sessionScript, user)) !== 0)
+        throw new AppError("Computer desktop session did not start", 503);
+    });
+  }
+  /** Make sure a running box has the workspace directory and the file helper.
+   * Start is not the only way a box reaches this process: a fresh process can
+   * attach to a box it never started, and that box may never have been
+   * prepared, in which case terminal commands fail with exit 126 ("the working
+   * directory does not exist") and file operations fail too. Preparing on
+   * attach, not only on start, closes that gap; the steps are idempotent, so
+   * re-running them on an already-prepared box is harmless. */
+  private async prepare(box: DesktopBox) {
     const script = await loadFilesScript();
     await this.control(async () => {
       if (
@@ -447,8 +461,6 @@ export class E2BDesktopComputer {
       )
         throw new AppError("Computer workspace could not be prepared", 503);
       await box.writeRootFile("/opt/openmuse/files.py", script);
-      if ((await box.setup(sessionScript, user)) !== 0)
-        throw new AppError("Computer desktop session did not start", 503);
     });
   }
   async stop(labels: Record<string, string>) {
@@ -506,6 +518,7 @@ export class E2BDesktopComputer {
         409,
       );
     }
+    await this.prepare(box);
     const handle: Handle = { box };
     this.handles.set(id, handle);
     return handle;
@@ -636,7 +649,11 @@ export class E2BDesktopComputer {
         if (error instanceof InvalidArgumentError) {
           // A missing working directory is rejected before the command starts.
           result.exitCode = 126;
-          output.stderr("The working directory does not exist.");
+          // Keep the SDK's message: it names the rejected argument, so a future
+          // failure is diagnosed from the receipt instead of guessed at.
+          output.stderr(
+            `The working directory does not exist.${error.message ? ` (${error.message})` : ""}`,
+          );
           return finish();
         }
         throw error;
