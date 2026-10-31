@@ -256,7 +256,7 @@ test("a fresh process prepares /workspace on a box it did not start", async () =
   assert.equal(result.status, "succeeded");
   assert.equal(f.calls.create.length, 0);
   assert.ok(
-        f.calls.setup.some((s) => s.user === "root" && s.command.includes("mkdir -p /workspace")),
+    f.calls.setup.some((s) => s.user === "root" && s.command.includes("mkdir -p /workspace")),
     "attach prepares the workspace directory",
   );
   assert.deepEqual(f.calls.files, ["/opt/openmuse/files.py"]);
