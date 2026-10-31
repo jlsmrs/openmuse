@@ -118,7 +118,10 @@ export interface AgentNotification {
 export interface AgentIdentity {
   name: string;
   tone: "warm" | "concise" | "thoughtful";
-  avatar?: "sky" | "sand" | "lilac";
+  avatar?: "sky" | "sand" | "lilac" | "custom";
+  /** Image used when avatar is "custom". Not bundled: it is served through
+   * a short-lived signed URL (see /api/identity/avatar). */
+  customAvatar?: { source: "file" | "generated"; id: string };
   showChatUpdates?: boolean;
 }
 export interface AgentWorkspace {

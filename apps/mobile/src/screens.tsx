@@ -38,8 +38,10 @@ import type {
   CalendarEvent,
   EmailDraft,
 } from "../../../packages/domain/src";
+import { useAgentWorkspace } from "./agent-workspace";
 import { API_URL } from "./api";
 import { browserAddress } from "./browser-address";
+import { AgentAvatar } from "./custom-avatar";
 import { localDateTime, startOfZonedDay, zonedInstant } from "./date-time";
 import {
   Button,
@@ -51,7 +53,6 @@ import {
   ErrorNotice,
   IconButton,
   LinkRow,
-  Mascot,
   relativeDate,
   resultSummary,
   SectionHeading,
@@ -70,6 +71,7 @@ function eventDate(event: CalendarEvent) {
 }
 export function TodayScreen() {
   const { workspace: w, navigate, open, ask } = useWorkspace();
+  const { data: agentData } = useAgentWorkspace();
   const wide = useWindowDimensions().width > 1180;
   const pending = w.actions.filter((a) => a.status === "awaiting_review");
   const unread = w.mail.filter((m) => m.unread);
@@ -142,7 +144,7 @@ export function TodayScreen() {
                 borderColor: "#C8DBE6",
               }}
             />
-            <Mascot size={94} />
+            <AgentAvatar identity={agentData?.identity} size={94} />
             <View
               style={[
                 s.row,

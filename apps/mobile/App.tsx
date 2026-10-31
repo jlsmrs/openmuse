@@ -36,6 +36,7 @@ import { API_URL, createSession, MuseApi } from "./src/api";
 import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
+import { AgentAvatar } from "./src/custom-avatar";
 import { Details } from "./src/details";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
@@ -319,7 +320,7 @@ function WorkspaceShell({
                   opacity: pressed ? 0.65 : 1,
                 })}
               >
-                <Mascot size={desktop ? 58 : 49} variant={data?.identity.avatar} />
+                <AgentAvatar identity={data?.identity} size={desktop ? 58 : 49} />
                 <Text
                   style={{
                     fontSize: 16,

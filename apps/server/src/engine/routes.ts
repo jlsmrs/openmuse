@@ -128,7 +128,13 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       .object({
         name: z.string().trim().min(1).max(80),
         tone: z.enum(["warm", "concise", "thoughtful"]),
-        avatar: z.enum(["sky", "sand", "lilac"]).optional(),
+        avatar: z.enum(["sky", "sand", "lilac", "custom"]).optional(),
+        customAvatar: z
+          .object({
+            source: z.enum(["file", "generated"]),
+            id: z.string().trim().min(1).max(260),
+          })
+          .optional(),
         showChatUpdates: z.boolean().optional(),
       })
       .parse(await c.req.json());

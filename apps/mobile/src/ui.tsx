@@ -399,13 +399,17 @@ export function LinkRow({
     </Pressable>
   );
 }
-/** OpenMuse's original capybara, shared by every assistant surface. */
+/** OpenMuse's original capybara, shared by every assistant surface.
+ * When imageUrl is set (a signed URL for a custom avatar), the custom
+ * image renders in the same round frame instead of the capybara. */
 export function Mascot({
   size = 42,
   variant = "sky",
+  imageUrl,
 }: {
   size?: number;
   variant?: "sky" | "sand" | "lilac";
+  imageUrl?: string;
 }) {
   const palette = {
     sky: "#ECF5FA",
@@ -413,7 +417,10 @@ export function Mascot({
     lilac: "#F1ECF9",
   }[variant];
   return (
-    <View accessibilityLabel="OpenMuse capybara" style={{ width: size, height: size }}>
+    <View
+      accessibilityLabel={imageUrl ? "Custom avatar" : "OpenMuse capybara"}
+      style={{ width: size, height: size }}
+    >
       <View
         style={{
           position: "absolute",
@@ -425,12 +432,30 @@ export function Mascot({
           backgroundColor: palette,
         }}
       />
-      <Image
-        source={require("../assets/capybara.png")}
-        resizeMode="contain"
-        style={{ width: size, height: size }}
-        accessible={false}
-      />
+      {imageUrl ? (
+        <View
+          style={{
+            width: size,
+            height: size,
+            borderRadius: size / 2,
+            overflow: "hidden",
+          }}
+        >
+          <Image
+            source={{ uri: imageUrl }}
+            resizeMode="cover"
+            style={{ width: size, height: size }}
+            accessible={false}
+          />
+        </View>
+      ) : (
+        <Image
+          source={require("../assets/capybara.png")}
+          resizeMode="contain"
+          style={{ width: size, height: size }}
+          accessible={false}
+        />
+      )}
     </View>
   );
 }
