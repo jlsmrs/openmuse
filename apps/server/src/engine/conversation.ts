@@ -198,7 +198,7 @@ export class ConversationAgent extends AbstractAgent {
             const range = calendarRangeSchema.parse(args);
             const page = await this.service.workspace.eventsPage(this.owner, range);
             if (!page) return { error: "Google is disconnected" };
-            const events = page.events.slice(0, 100);
+            const events = page.events.slice(0, 20);
             return {
               calendarId: "primary",
               ...range,
