@@ -461,6 +461,11 @@ export class E2BDesktopComputer {
       )
         throw new AppError("Computer workspace could not be prepared", 503);
       await box.writeRootFile("/opt/openmuse/files.py", script);
+      // Believe the directory, not the exit code: a box that reports success
+      // without the workspace (stale handle, reset filesystem) must fail here,
+      // loudly, instead of letting every later command die with exit 126.
+      if ((await box.setup("test -d /workspace && test -f /opt/openmuse/files.py", user)) !== 0)
+        throw new AppError("Computer workspace could not be prepared", 503);
     });
   }
   async stop(labels: Record<string, string>) {
@@ -530,8 +535,20 @@ export class E2BDesktopComputer {
     firstConnect?: (work: () => Promise<Handle>) => Promise<Handle>,
   ) {
     const handle = await this.attach(labels, desktopIdleMs, firstConnect);
-    handle.streaming ??= this.control(() => handle.box.stream(handle.url))
+    handle.streaming ??= handle.box
+      .stream(handle.url)
       .then((url) => (handle.url = url))
+      .catch((error: unknown) => {
+        // The stream step, not the key or template, is what failed: keep its
+        // message instead of the generic key/template hint, or the next
+        // failure is just as undiagnosable as this one.
+        throw error instanceof AppError
+          ? error
+          : new AppError(
+              `Desktop stream failed. ${error instanceof Error ? error.message : "Check E2B_API_KEY and COMPUTER_E2B_TEMPLATE."}`,
+              503,
+            );
+      })
       .finally(() => (handle.streaming = undefined));
     return handle.streaming;
   }
@@ -634,10 +651,11 @@ export class E2BDesktopComputer {
     try {
       if (options.signal?.aborted) abort();
       if (result.interrupted) return finish();
-      try {
-        handle = await box.run(command, {
+      const cwd = options.cwd ?? "/workspace";
+      const attempt = () =>
+        box.run(command, {
           user,
-          cwd: options.cwd ?? "/workspace",
+          cwd,
           envs: { DISPLAY: display },
           stdin: options.input !== undefined,
           timeoutMs: options.timeoutMs,
@@ -645,18 +663,42 @@ export class E2BDesktopComputer {
           onStdout: capture(output.stdout),
           onStderr: capture(output.stderr),
         });
+      // A missing working directory is rejected before the command starts.
+      const missingWorkspace = (message?: string) => {
+        result.exitCode = 126;
+        // Keep the SDK's message: it names the rejected argument, so a future
+        // failure is diagnosed from the receipt instead of guessed at.
+        output.stderr(`The working directory does not exist.${message ? ` (${message})` : ""}`);
+        return finish();
+      };
+      try {
+        handle = await attempt();
       } catch (error) {
-        if (error instanceof InvalidArgumentError) {
-          // A missing working directory is rejected before the command starts.
-          result.exitCode = 126;
-          // Keep the SDK's message: it names the rejected argument, so a future
-          // failure is diagnosed from the receipt instead of guessed at.
-          output.stderr(
-            `The working directory does not exist.${error.message ? ` (${error.message})` : ""}`,
-          );
+        if (!(error instanceof InvalidArgumentError)) throw error;
+        if (cwd !== "/workspace" && !cwd.startsWith("/workspace/"))
+          return missingWorkspace(error.message);
+        // The workspace the attach prepared is gone (stale handle, reset
+        // filesystem): re-prepare — verified, so a silent failure surfaces
+        // as 503 — and retry the start once. A genuinely missing
+        // subdirectory still ends here with exit 126.
+        try {
+          await this.prepare(box);
+        } catch (prepareError) {
+          result.stderr =
+            prepareError instanceof AppError
+              ? prepareError.message
+              : "The computer could not be reached.";
           return finish();
         }
-        throw error;
+        try {
+          handle = await attempt();
+        } catch (retryError) {
+          if (retryError instanceof InvalidArgumentError)
+            return missingWorkspace(retryError.message);
+          throw retryError;
+        }
+        // The retry started: fall through to the wait below, not to the
+        // 126 receipt for the first attempt's error.
       }
       if (options.signal?.aborted) abort();
       if (options.input !== undefined && !result.interrupted) {

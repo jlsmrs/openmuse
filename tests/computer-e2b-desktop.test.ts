@@ -47,7 +47,11 @@ function fake(
     run?: Run;
     boxes?: Partial<DesktopInfo>[];
     listFails?: boolean;
-    startError?: Error;
+    /** Fails command starts, e.g. an InvalidArgumentError for a missing cwd. A
+     * function fails only the numbered attempt, so a test can heal on retry. */
+    startError?: Error | ((attempt: number) => Error | undefined);
+    /** Fails desktop stream starts, e.g. a stream that is already running. */
+    streamError?: Error;
     keepAliveError?: Error;
     /** Runs after every getInfo, e.g. to land a Stop between find() and use. */
     afterInfo?: (id: string) => void;
@@ -97,7 +101,11 @@ function fake(
   const boxFor = (id: string): DesktopBox => ({
     async run(command, runOptions) {
       calls.run.push({ command, options: runOptions });
-      if (options.startError) throw options.startError;
+      const startError =
+        typeof options.startError === "function"
+          ? options.startError(calls.run.length)
+          : options.startError;
+      if (startError) throw startError;
       const state = { kills: 0 };
       let killed: (() => void) | undefined;
       const killedPromise = new Promise<never>((_, reject) => {
@@ -155,6 +163,7 @@ function fake(
     },
     async stream(known) {
       calls.streams.push(known);
+      if (options.streamError) throw options.streamError;
       await options.streamGate?.();
       return known ?? `https://6080-sbx.e2b.app/vnc.html?password=p${calls.streams.length}`;
     },
@@ -406,6 +415,43 @@ test("a missing working directory fails the command without stopping the compute
   assert.equal(result.exitCode, 126);
   assert.match(result.stderr, /working directory/);
   assert.equal(f.calls.pause.length, 0);
+});
+test("a command re-prepares and retries once when its workspace is missing", async () => {
+  const f = fake({
+    boxes: [{}],
+    startError: (attempt) =>
+      attempt === 1
+        ? new InvalidArgumentError("[invalid_argument] cwd '/workspace' does not exist")
+        : undefined,
+  });
+  const { computer, owner } = service(f);
+  const result = await computer.execute(owner, { command: "pwd" });
+  assert.equal(result.status, "succeeded");
+  assert.equal(result.exitCode, 0);
+  assert.equal(f.calls.run.length, 2);
+  assert.ok(
+    f.calls.setup.filter((s) => s.command.includes("mkdir -p /workspace")).length >= 2,
+    "the retry re-prepares before running again",
+  );
+  assert.equal(f.calls.pause.length, 0);
+});
+
+test("prepare fails loudly when the workspace is still missing after setup", async () => {
+  const f = fake({
+    boxes: [{}],
+    setupExit: (command) => (command.includes("test -d /workspace") ? 1 : undefined),
+  });
+  const { computer, owner } = service(f);
+  const result = await computer.execute(owner, { command: "pwd" });
+  assert.equal(result.status, "failed");
+  assert.match(result.stderr, /Computer workspace could not be prepared/);
+  assert.equal(f.calls.run.length, 0, "no command starts on an unverified workspace");
+});
+
+test("a desktop stream failure keeps its own message instead of the key/template hint", async () => {
+  const f = fake({ boxes: [{}], streamError: new Error("Stream is already running") });
+  const { computer, owner } = service(f);
+  await assert.rejects(computer.desktopUrl(owner), /Stream is already running/);
 });
 
 test("output is capped like Docker and a runaway writer is killed past the hard ceiling", async () => {
