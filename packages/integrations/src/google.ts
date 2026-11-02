@@ -684,15 +684,15 @@ export class GoogleClient {
     }
   }
 
-  /** The latest 30 matching messages. Permission/read failures propagate visibly. */
+  /** The latest 100 matching messages. Permission/read failures propagate visibly. */
   async listMail(query = "in:inbox"): Promise<Mail[]> {
-    const params = new URLSearchParams({ maxResults: "30", q: query });
+    const params = new URLSearchParams({ maxResults: "100", q: query });
     const list = z
       .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
       .parse(await this.request(`${GMAIL}/messages?${params}`));
     return Promise.all(
       list.messages
-        .slice(0, 30)
+        .slice(0, 100)
         .map(async ({ id }) =>
           this.mapMessage(
             messageSchema.parse(await this.request(`${GMAIL}/messages/${idPath(id)}?format=full`)),
