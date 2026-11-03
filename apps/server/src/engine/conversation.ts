@@ -350,14 +350,14 @@ export class ConversationAgent extends AbstractAgent {
           try {
             const mail = await this.service.workspace.searchMailMetadata(this.owner, query);
             return {
-                            matches: mail.slice(0, 100).map(({ id, threadId, sender, from, subject, date }) => ({
-                                              id,
-                                              threadId,
-                                              sender,
-                                              from,
-                                              subject,
-                                              date,
-                            })),
+              matches: mail.slice(0, 100).map(({ id, threadId, sender, from, subject, date }) => ({
+                id,
+                threadId,
+                sender,
+                from,
+                subject,
+                date,
+              })),
               truncated: mail.length > 100,
             };
           } catch (error) {
