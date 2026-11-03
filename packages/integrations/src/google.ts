@@ -702,29 +702,29 @@ export class GoogleClient {
   }
 
   /**
-     * The latest 100 matching messages, headers only — no body text is fetched.
-        * Full bodies are slow (100 large fetches exceed the agent runtime's window)
-           * and too large for one reply, so lists, counts and tables use this path
-              * and full bodies come from getThread for a selected message instead.
-                 * Permission/read failures propagate visibly.
-                    */
-    async listMailMetadata(query = "in:inbox"): Promise<Mail[]> {
-          const params = new URLSearchParams({ maxResults: "100", q: query });
-          const list = z
-            .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
-            .parse(await this.request(`${GMAIL}/messages?${params}`));
-          const meta = new URLSearchParams({ format: "metadata" });
-          for (const header of ["From", "Subject", "Date", "To"]) meta.append("metadataHeaders", header);
-          return Promise.all(
-                  list.messages
-                    .slice(0, 100)
-                    .map(async ({ id }) =>
-                                this.mapMessage(
-                                              messageSchema.parse(await this.request(`${GMAIL}/messages/${idPath(id)}?${meta}`)),
-                                            ),
-                                 ),
-                );
-    }
+   * The latest 100 matching messages, headers only — no body text is fetched.
+   * Full bodies are slow (100 large fetches exceed the agent runtime's window)
+   * and too large for one reply, so lists, counts and tables use this path
+   * and full bodies come from getThread for a selected message instead.
+   * Permission/read failures propagate visibly.
+   */
+  async listMailMetadata(query = "in:inbox"): Promise<Mail[]> {
+    const params = new URLSearchParams({ maxResults: "100", q: query });
+    const list = z
+      .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
+      .parse(await this.request(`${GMAIL}/messages?${params}`));
+    const meta = new URLSearchParams({ format: "metadata" });
+    for (const header of ["From", "Subject", "Date", "To"]) meta.append("metadataHeaders", header);
+    return Promise.all(
+      list.messages
+        .slice(0, 100)
+        .map(async ({ id }) =>
+          this.mapMessage(
+            messageSchema.parse(await this.request(`${GMAIL}/messages/${idPath(id)}?${meta}`)),
+          ),
+        ),
+    );
+  }
   
   /** At most 100 occurrences in a bounded window, beginning at local midnight by default. */
   async listEvents(options: ListEventsOptions = {}): Promise<CalendarEvent[]> {
