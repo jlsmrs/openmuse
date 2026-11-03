@@ -159,28 +159,28 @@ export class WorkspaceService {
       .sort((a, b) => b.date.localeCompare(a.date));
   }
   /**
-     * Headers-only search for 100-scale lists, counts and tables. Live mode
-        * deliberately skips cacheMail so snippet bodies never overwrite full
-           * message bodies stored from thread reads. Full bodies come from thread().
-              */
-    async searchMailMetadata(owner: string, query: string) {
-          const connection = await this.connection(owner);
-          if (!connection) throw new AppError("Google is disconnected", 409);
-          if (this.config.mode === "live")
-                  return this.google(owner, connection.id).listMailMetadata(query || "in:inbox");
-          const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-          return (await this.db.list<Mail>(owner, "mail"))
-                  .filter(
-                            (message) =>
-                                        !/^Sent\b/i.test(message.label) &&
-                                        words.every((word) =>
-                                                      `${message.sender} ${message.from} ${message.subject} ${message.body}`
-                                                        .toLowerCase()
-                                                        .includes(word),
-                                                              ),
-                          )
-                  .sort((a, b) => b.date.localeCompare(a.date));
-    }
+   * Headers-only search for 100-scale lists, counts and tables. Live mode
+   * deliberately skips cacheMail so snippet bodies never overwrite full
+   * message bodies stored from thread reads. Full bodies come from thread().
+   */
+  async searchMailMetadata(owner: string, query: string) {
+    const connection = await this.connection(owner);
+    if (!connection) throw new AppError("Google is disconnected", 409);
+    if (this.config.mode === "live")
+      return this.google(owner, connection.id).listMailMetadata(query || "in:inbox");
+    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    return (await this.db.list<Mail>(owner, "mail"))
+      .filter(
+        (message) =>
+          !/^Sent\b/i.test(message.label) &&
+          words.every((word) =>
+            `${message.sender} ${message.from} ${message.subject} ${message.body}`
+              .toLowerCase()
+              .includes(word),
+          ),
+      )
+      .sort((a, b) => b.date.localeCompare(a.date));
+  }
   async ensureSample(owner: string, actions: ActionService) {
     if (this.config.mode !== "sample") return;
     const active = this.seeding.get(owner);
