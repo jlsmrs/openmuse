@@ -725,7 +725,7 @@ export class GoogleClient {
         ),
     );
   }
-  
+
   /** At most 100 occurrences in a bounded window, beginning at local midnight by default. */
   async listEvents(options: ListEventsOptions = {}): Promise<CalendarEvent[]> {
     return (await this.listEventsPage(options)).events;
