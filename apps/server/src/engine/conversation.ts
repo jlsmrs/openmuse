@@ -158,12 +158,12 @@ export class ConversationAgent extends AbstractAgent {
     const browserConfigured = !!(this.config.workerUrl && this.config.workerToken);
     const tools = [
       generateImageTool,
-      analyzeDocumentTool,
+      analyzeDocumentTool(this.service.files, this.owner),
       searchKnowledgeDeskTool,
       todaysSigningsTool,
       searchJobsTool,
       getJobTool,
-      captureReceiptTool,
+      captureReceiptTool(this.service.files, this.owner),
       ...computerTools(
         this.service.computer,
         this.service.files,
