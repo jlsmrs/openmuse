@@ -49,15 +49,20 @@ test("createRateLimitStore enforces the request limit and resets after the windo
   assert.equal(store.take("a", 1001), true, "a new window should reset the counter");
 });
 
-test("createRateLimitStore caps total entries and evicts expired ones to make room", () => {
+test("createRateLimitStore caps total entries and evicts the stalest bucket to make room", () => {
   const store = createRateLimitStore({ windowMs: 1000, maxRequests: 5, maxEntries: 2 });
   assert.equal(store.take("a", 0), true);
   assert.equal(store.take("b", 0), true);
   assert.equal(store.size(), 2);
-  assert.equal(store.take("c", 500), false, "a brand-new key must be rejected once at capacity");
+  // At capacity with nothing expired, a brand-new key evicts the stalest
+  // bucket instead of locking new clients out until entries expire.
+  assert.equal(store.take("c", 500), true);
   assert.equal(store.size(), 2, "the map must never exceed maxEntries");
+  // The evicted key ("a") starts a fresh bucket on its next request.
+  assert.equal(store.take("a", 600), true);
+  assert.equal(store.size(), 2);
 
-  // Once "a" and "b" expire, capacity should be reclaimed for a new key.
+  // Once entries expire, capacity is reclaimed for a new key.
   assert.equal(store.take("c", 2000), true);
   assert.equal(store.size(), 1);
 });
@@ -140,7 +145,7 @@ test("spoofed bearer tokens from one connection share a single bucket", async ()
   assert.equal(other.status, 200);
 });
 
-test("capacity exhaustion fails closed and recovers once entries expire", async () => {
+test("capacity exhaustion evicts the stalest bucket instead of locking new clients out", async () => {
   const addresses = ["10.0.0.1", "10.0.0.2", "10.0.0.3", "10.0.0.4"];
   let current = 0;
   const app = limitedApp({ maxEntries: 3, windowMs: 60_000, getAddress: () => addresses[current] });
@@ -148,15 +153,46 @@ test("capacity exhaustion fails closed and recovers once entries expire", async 
   for (current = 0; current < 4; current++) {
     statuses.push((await app.request("/api/ping")).status);
   }
-  assert.deepEqual(statuses, [200, 200, 200, 429], "the fourth connection is rejected");
+  assert.deepEqual(
+    statuses,
+    [200, 200, 200, 200],
+    "the fourth connection is admitted by evicting the stalest bucket",
+  );
   current = 0;
-  assert.equal((await app.request("/api/ping")).status, 200, "existing entries keep working");
+  assert.equal(
+    (await app.request("/api/ping")).status,
+    200,
+    "an evicted connection starts a fresh bucket",
+  );
 });
 
-test("capacity exhaustion reclaims expired entries", () => {
+test("capacity exhaustion evicts the stalest entry and reclaims expired entries", () => {
   const store = createRateLimitStore({ windowMs: 1000, maxEntries: 3 });
   for (const key of ["conn:a", "conn:b", "conn:c"]) assert.equal(store.take(key, 0), true);
-  assert.equal(store.take("conn:d", 500), false);
+  assert.equal(store.take("conn:d", 500), true, "a new key evicts the stalest bucket");
+  assert.equal(store.size(), 3, "the map must never exceed maxEntries");
   assert.equal(store.take("conn:d", 1500), true);
   assert.equal(store.size(), 1);
+});
+
+test("keyResolver keys buckets by owner, not by connection", async () => {
+  let owner = "alice";
+  const app = limitedApp({
+    maxRequests: 2,
+    keyResolver: () => `owner:${owner}`,
+  });
+  const statuses: number[] = [];
+  // Different addresses, same owner: one shared bucket.
+  for (const forwarded of ["1.1.1.1", "2.2.2.2", "3.3.3.3"]) {
+    statuses.push(
+      (await app.request("/api/ping", { headers: { "X-Forwarded-For": forwarded } })).status,
+    );
+  }
+  assert.deepEqual(statuses, [200, 200, 429], "one owner shares one bucket across addresses");
+  owner = "bob";
+  assert.equal(
+    (await app.request("/api/ping", { headers: { "X-Forwarded-For": "1.1.1.1" } })).status,
+    200,
+    "a different owner gets an independent bucket",
+  );
 });
