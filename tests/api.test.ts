@@ -421,3 +421,16 @@ test("signed links authorize only the requests their page makes", async () => {
   ])
     assert.equal((await app.request(path, { method })).status, 401, `${method} ${path}`);
 });
+
+test("health reports live database and worker reachability", async () => {
+  const response = await app.request("/api/health");
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.equal(body.ok, true);
+  assert.equal(body.database, "ok");
+  assert.equal(body.worker, "unconfigured");
+  assert.equal(body.browserConfigured, false);
+  // A second call inside the cache window returns the same body.
+  const cached = await (await app.request("/api/health")).json();
+  assert.deepEqual(cached, body);
+});
