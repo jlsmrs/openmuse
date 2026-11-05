@@ -610,6 +610,7 @@ test("worker protects all controls, validates before launch, and health reveals 
     assert.deepEqual(await health.json(), { status: "ok" });
     for (const path of [
       "/sessions",
+      "/diagnostics",
       "/sessions/invalid/screenshot",
       `/sessions/${savedId}/read`,
       "/anything",
@@ -627,6 +628,12 @@ test("worker protects all controls, validates before launch, and health reveals 
       "closed",
       "restart must not report a closed browser as active",
     );
+    const diagnostics = await (await fetch(`${base}/diagnostics`, { headers })).json();
+    assert.equal(diagnostics.status, "ok");
+    assert.ok(diagnostics.sessions.count >= 1, "diagnostics reports the restored session");
+    assert.equal(typeof diagnostics.memory.rss, "number");
+    assert.equal(typeof diagnostics.memory.heapUsed, "number");
+    assert.ok(diagnostics.disk === null || typeof diagnostics.disk.total === "number");
     const closedRead = await fetch(`${base}/sessions/${savedId}/read`, { headers });
     assert.equal(closedRead.status, 409);
     assert.equal((await closedRead.json()).error.code, "SESSION_CLOSED");

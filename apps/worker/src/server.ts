@@ -1,4 +1,5 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { statfs } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import { createBrowserManager, validateSessionId } from "./browser.ts";
 import { WorkerError } from "./errors.ts";
@@ -63,6 +64,37 @@ export async function createWorkerServer(
         throw new WorkerError("UNAUTHORIZED", "Worker authentication is required.", 401);
       if (pathname === "/sessions" && request.method === "GET") {
         json(200, browser.list());
+        return;
+      }
+      if (pathname === "/diagnostics" && request.method === "GET") {
+        // Authenticated diagnostics (R4): session counts, memory, and disk.
+        // Download totals are deferred — no download tracking exists yet.
+        // Disk stats are best-effort: a statfs failure reports null disk
+        // instead of failing the whole endpoint.
+        const sessions = browser.list();
+        const memory = process.memoryUsage();
+        let disk: { total: number; free: number; available: number } | null = null;
+        try {
+          const stats = await statfs(options.dataDir);
+          disk = {
+            total: stats.blocks * stats.bsize,
+            free: stats.bfree * stats.bsize,
+            available: stats.bavail * stats.bsize,
+          };
+        } catch {
+          disk = null;
+        }
+        json(200, {
+          status: "ok",
+          sessions: { count: sessions.length },
+          memory: {
+            rss: memory.rss,
+            heapUsed: memory.heapUsed,
+            heapTotal: memory.heapTotal,
+            external: memory.external,
+          },
+          disk,
+        });
         return;
       }
       if (pathname === "/sessions" && request.method === "POST") {
