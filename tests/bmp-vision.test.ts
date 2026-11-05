@@ -313,7 +313,7 @@ test("unsupported BMP variants are refused plainly", () => {
   }
 });
 
-test("vision cap is measured on the converted PNG, not the source BMP", async () => {
+test("vision cap is measured on the converted PNG, and oversize conversions are downscaled", async () => {
   // A large but solid-color BMP compresses to a tiny PNG, so it passes even
   // though the source is over 5 MB.
   const solidRow = Buffer.alloc(2000 * 3);
@@ -329,12 +329,21 @@ test("vision cap is measured on the converted PNG, not the source BMP", async ()
   assert.ok(!("error" in solid), "solid BMP should pass the cap");
 
   // A noisy BMP of similar source size converts to a PNG over 5 MB, so it
-  // is refused on the converted size.
+  // is downscaled to fit instead of refused.
   const noise = randomBytes(1500 * 1500 * 3);
   const noisyBmp = buildBmpFromRows(1500, 1500, 24, noise);
   const noisy = await visionParts("noise.bmp", "image/bmp", new Uint8Array(noisyBmp));
-  assert.ok("error" in noisy);
-  assert.match(noisy.error, /too large to view in chat/);
+  assert.ok(!("error" in noisy), "noisy BMP should be downscaled, not refused");
+  const [noisyText, noisyImage] = noisy.parts;
+  assert.equal(noisyText.type, "text");
+  if (noisyText.type === "text") assert.match(noisyText.content, /Downscaled from 1500x1500/);
+  assert.equal(noisyImage.type, "image");
+  if (noisyImage.type === "image" && noisyImage.source.type === "data") {
+    const pngBytes = Buffer.from(noisyImage.source.value, "base64");
+    assert.ok(pngBytes.length <= 5 * 1024 * 1024, "downscaled PNG fits the 5 MB cap");
+    const decoded = decodePng(pngBytes);
+    assert.ok(decoded.width < 1500 && decoded.height < 1500, "dimensions shrank");
+  }
 });
 
 /** Build a 24-bit bottom-up BMP from raw top-down BGR row bytes (stride already padded). */
