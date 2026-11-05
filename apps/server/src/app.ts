@@ -151,6 +151,14 @@ export async function createApp(
     c.set("owner", owner);
     await next();
   });
+  // Per-owner bucket (R6): after auth, so the key is the verified owner, not
+  // the connection address — clients behind one proxy (or sharing the
+  // conn:unknown fallback) are distinguished here. The cap mirrors the
+  // pre-auth 120/min default; each owner gets an independent bucket.
+  app.use(
+    "/api/*",
+    rateLimit(Boolean(config.trustProxy), { keyResolver: (c) => `owner:${c.get("owner")}` }),
+  );
   app.delete("/api/session", async (c) => {
     await auth.revoke(c.req.header("authorization"));
     return c.json({ ok: true });
