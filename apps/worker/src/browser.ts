@@ -198,6 +198,9 @@ export async function createBrowserManager(
           "--disable-quic",
           "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
           "--disable-extensions",
+          // /dev/shm is 64 MB by default on Render and Azure Container Apps
+          // with no size control; without this flag heavy pages crash tabs.
+          "--disable-dev-shm-usage",
           "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
         ],
       });
