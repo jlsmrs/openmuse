@@ -364,6 +364,28 @@ export async function executeModelTask(
   };
   let text = "";
   let runError: string | undefined;
+  // Throttled progress: the full text-so-far is written as a run-event at
+  // most every 800 ms while the model is producing, so the UI can show the
+  // reply as it streams instead of only at the end of the run. The first
+  // progress event waits 800 ms, so a fast run still records exactly one
+  // event (the final flush below). Progress writes are best-effort: a lost
+  // lease or a failed write must not fail the run.
+  let lastEmittedAt = Date.now();
+  let lastEmittedLength = 0;
+  let emitInFlight = false;
+  const emitProgress = () => {
+    const now = Date.now();
+    if (now - lastEmittedAt < 800 || emitInFlight || text.length <= lastEmittedLength) return;
+    lastEmittedAt = now;
+    lastEmittedLength = text.length;
+    emitInFlight = true;
+    void ctx
+      .event("step", "Agent update", text.slice(0, 12000))
+      .catch(() => {})
+      .finally(() => {
+        emitInFlight = false;
+      });
+  };
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
       agent.abortRun();
@@ -382,8 +404,10 @@ export async function executeModelTask(
             event.type === EventType.TEXT_MESSAGE_CONTENT) &&
           "delta" in event &&
           typeof event.delta === "string"
-        )
+        ) {
           text += event.delta;
+          emitProgress();
+        }
         if (event.type === EventType.RUN_ERROR && "message" in event)
           runError = String(event.message);
       },
@@ -400,7 +424,10 @@ export async function executeModelTask(
     });
   });
   if (runError) throw new Error(runError);
-  if (text) await ctx.event("step", "Agent update", text.slice(0, 12000));
+  // Final flush: record the full text unless the last progress event
+  // already carried it (the text has not grown since).
+  if (text && text.length > lastEmittedLength)
+    await ctx.event("step", "Agent update", text.slice(0, 12000));
   return (
     outcome ?? {
       status: "waiting_input",
