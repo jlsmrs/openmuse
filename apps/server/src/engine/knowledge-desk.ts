@@ -32,6 +32,36 @@ const params = z.object({
 
 type Entry = { id: string; source: string; title: string; text: string; embedding?: number[] };
 
+/** Validate a parsed knowledge-desk index: an array of entries with string
+ * id/source/title/text and an optional numeric embedding. Staleness is not
+ * checked — the format carries no timestamp and the indexer is not in this
+ * repo. */
+export function validateDeskEntries(
+  data: unknown,
+): { ok: true; entries: Entry[] } | { ok: false; error: string } {
+  const invalid = (detail: string) => ({
+    ok: false as const,
+    error: `Knowledge Desk index is invalid: ${detail}`,
+  });
+  if (!Array.isArray(data)) return invalid("expected an array of entries");
+  for (let i = 0; i < data.length; i++) {
+    const entry: unknown = data[i];
+    if (!entry || typeof entry !== "object" || Array.isArray(entry))
+      return invalid(`entry ${i} is not an object`);
+    for (const field of ["id", "source", "title", "text"] as const) {
+      if (typeof (entry as Record<string, unknown>)[field] !== "string")
+        return invalid(`entry ${i} is missing a string "${field}"`);
+    }
+    const embedding = (entry as Record<string, unknown>).embedding;
+    if (
+      embedding !== undefined &&
+      (!Array.isArray(embedding) || embedding.some((n) => typeof n !== "number"))
+    )
+      return invalid(`entry ${i} has a non-numeric "embedding"`);
+  }
+  return { ok: true, entries: data as Entry[] };
+}
+
 function cosine(a: number[], b: number[]): number {
   let dot = 0,
     na = 0,
@@ -63,15 +93,24 @@ export const searchKnowledgeDeskTool = defineTool({
   execute: async (args) => {
     const { query, topK = 5 } = params.parse(args);
     const dataDir = process.env.DATA_DIR ?? ".openmuse";
-    let entries: Entry[];
+    let raw: string;
     try {
-      entries = JSON.parse(await readFile(join(dataDir, "knowledge-desk", "index.json"), "utf8"));
+      raw = await readFile(join(dataDir, "knowledge-desk", "index.json"), "utf8");
     } catch {
       return {
         error:
           "Knowledge Desk index is not built yet (DATA_DIR/knowledge-desk/index.json missing).",
       };
     }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return { error: "Knowledge Desk index is invalid: not valid JSON." };
+    }
+    const checked = validateDeskEntries(parsed);
+    if (!checked.ok) return { error: checked.error };
+    const entries = checked.entries;
     const endpoint = process.env.FOUNDRY_EMBEDDINGS_ENDPOINT;
     const key = process.env.FOUNDRY_EMBEDDINGS_KEY || process.env.OPENAI_API_KEY;
     let method = "keyword";
@@ -113,6 +152,7 @@ export const searchKnowledgeDeskTool = defineTool({
     return {
       method,
       query,
+      entries: entries.length,
       hits,
       note: hits.length ? undefined : "No desk entry matched. Do not answer from memory.",
     };
