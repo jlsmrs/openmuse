@@ -12,6 +12,15 @@ interface Database {
 
 export class Store {
   constructor(private readonly db: Database) {}
+  /** Liveness probe: true when the database answers, false otherwise. Never throws. */
+  async ping(): Promise<boolean> {
+    try {
+      await this.db.query("SELECT 1");
+      return true;
+    } catch {
+      return false;
+    }
+  }
   async get<T = Record<string, unknown>>(
     owner: string,
     kind: string,
