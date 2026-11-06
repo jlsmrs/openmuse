@@ -252,6 +252,76 @@ test("the model worker keeps the text a model replies with when it calls no tool
   }
 });
 
+test("the model worker streams the reply text as run events while the run is still going", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-model-stream-"));
+  const db = await createStore();
+  // 300 ms per 14-char chunk: the ~150-char demo reply streams for ~3 s,
+  // so the 800 ms throttle fires at least once mid-run.
+  const mock = createDemoModel({ latency: 300, firstByteDelay: 0 });
+  await mock.start();
+  const previousBase = process.env.OPENAI_BASE_URL;
+  const previousKey = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_BASE_URL = `${mock.url}/v1`;
+  process.env.OPENAI_API_KEY = "demo-model-key-never-sent";
+  t.after(async () => {
+    if (previousBase === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = previousBase;
+    if (previousKey === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousKey;
+    await mock.stop();
+  });
+  const server = await createApp(db, {
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: directory,
+    agentBackend: "model",
+    intelligenceApiKey: "test-project-key-never-sent",
+    model: demoModel,
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+  });
+  try {
+    const task = await server.agent.createTask("owner", { prompt: "Plan my week" });
+    const tickPromise = server.agent.worker.tick();
+    // Poll the timeline while the run is in flight: an intermediate Agent
+    // update event must appear before the run ends.
+    let sawIntermediate = false;
+    const deadline = Date.now() + 4000;
+    while (Date.now() < deadline) {
+      const midRun = await server.agent.detail("owner", task.id);
+      if (
+        midRun.events.some(
+          (event) =>
+            event.title === "Agent update" && /Find cool stuff on Hacker News/.test(event.detail),
+        )
+      ) {
+        sawIntermediate = true;
+        assert.equal(midRun.task.status, "running");
+        break;
+      }
+      if (midRun.task.status !== "running" && midRun.task.status !== "queued") break;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    assert.ok(sawIntermediate, "an intermediate Agent update event appears before the run ends");
+    await tickPromise;
+    const finished = await server.agent.detail("owner", task.id);
+    assert.equal(finished.task.status, "waiting_input");
+    assert.ok(
+      finished.events.some(
+        (event) =>
+          event.title === "Agent update" && /Find cool stuff on Hacker News/.test(event.detail),
+      ),
+      "the final flush still records the full reply",
+    );
+  } finally {
+    await server.agent.stop();
+    await db.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("replaying a completed prepared action returns its receipt without reopening approval", async (t) => {
   const directory = await mkdtemp(join(tmpdir(), "openmuse-model-replay-"));
   const db = await createStore();

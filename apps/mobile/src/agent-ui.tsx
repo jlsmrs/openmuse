@@ -21,7 +21,7 @@ import {
   Users,
   X,
 } from "lucide-react-native";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Image, Linking, Platform, Pressable, Text, View } from "react-native";
 import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import type { Artifact, BrowserSession } from "../../../packages/domain/src";
@@ -290,29 +290,41 @@ export function TaskDetail({ taskId }: { taskId: string }) {
   const milestone = data?.goals
     .find((goal) => goal.id === task?.goalId)
     ?.milestones.find((item) => item.id === task?.milestoneId);
-  useEffect(() => {
-    let active = true;
-    void api
-      .request<{
+  const requestVersion = useRef(0);
+  const loadDetail = useCallback(async () => {
+    const version = ++requestVersion.current;
+    try {
+      const result = await api.request<{
         task: AgentTask;
         events: RunEvent[];
         artifacts: AgentArtifact[];
         files: Artifact[];
         browsers: BrowserSession[];
-      }>(`/api/agent/tasks/${taskId}`)
-      .then((result) => {
-        if (active) {
-          setDetail(result);
-          setError("");
-        }
-      })
-      .catch((e) => {
-        if (active) setError(errorText(e));
-      });
+      }>(`/api/agent/tasks/${taskId}`);
+      if (version === requestVersion.current) {
+        setDetail(result);
+        setError("");
+      }
+    } catch (e) {
+      if (version === requestVersion.current) setError(errorText(e));
+    }
+  }, [api, taskId]);
+  useEffect(() => {
+    void loadDetail();
     return () => {
-      active = false;
+      requestVersion.current++;
     };
-  }, [api, taskId, task?.updatedAt]);
+  }, [loadDetail, task?.updatedAt]);
+  // While the task is running, refresh the detail every 3 s: run-events do
+  // not touch the task's updatedAt, so the effect above would not re-fire,
+  // and the agent's streamed text would only appear when the run ends.
+  useEffect(() => {
+    if (task?.status !== "running") return;
+    const timer = setInterval(() => {
+      void loadDetail();
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [loadDetail, task?.status]);
   async function act(path: string, body: unknown) {
     setBusy(true);
     setError("");
