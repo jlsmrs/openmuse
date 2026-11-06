@@ -17,56 +17,67 @@
 // output; Josh approves before anything goes out.
 // Notarial acts (oath, seal, witnessing, journal completion) are human-only
 // and are never performed by this tool.
+//
+// Confinement (M-B1): the file argument is a workspace artifact ID resolved
+// only through the Files service — never a filesystem path. A model-supplied
+// path can no longer reach files outside the workspace, and a non-workspace
+// ID fails the same way a missing file does.
 
-import { readFile } from "node:fs/promises";
 import { defineTool } from "@copilotkit/runtime/v2";
 import { z } from "zod";
+import type { Files } from "../files.ts";
 
 const docParams = z.object({
-  file: z.string().trim().min(1).max(500),
+  fileId: z.string().trim().min(1).max(500),
   prompt: z.string().trim().max(1000).optional(),
 });
 
-export const analyzeDocumentTool = defineTool({
-  name: "analyze_document",
-  description:
-    "Extract text and structured fields from a PDF or image already in the workspace using the owner's Foundry document-ai deployment. Returns extracted text and fields only — it files, sends, and notarizes nothing. Human approval is required before any reply, form, or filing goes out.",
-  parameters: docParams,
-  execute: async (args) => {
-    const { file, prompt } = docParams.parse(args);
-    const endpoint = process.env.FOUNDRY_DOCAI_ENDPOINT;
-    const key =
-      process.env.FOUNDRY_DOCAI_KEY || process.env.FOUNDRY_IMAGES_KEY || process.env.OPENAI_API_KEY;
-    if (!endpoint || !key) {
-      return {
-        error: "Document intake is not configured: FOUNDRY_DOCAI_ENDPOINT/KEY are missing.",
-      };
-    }
-    let raw: Buffer;
-    try {
-      raw = await readFile(file);
-    } catch {
-      return { error: `Could not read workspace file: ${file}` };
-    }
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      // Payload shape follows the deployment's documented request format;
-      // confirm against the Foundry deployment page at wiring time.
-      body: JSON.stringify({
-        model: "mistral-document-ai-2512",
-        document: { base64: raw.toString("base64") },
-        ...(prompt ? { prompt } : {}),
-      }),
-      signal: AbortSignal.timeout(180_000),
-    });
-    if (res.status === 429) {
-      return { error: "Document intake is rate limited. Retry shortly." };
-    }
-    if (!res.ok) {
-      return { error: `Document intake failed: HTTP ${res.status}.` };
-    }
-    const payload = await res.json();
-    return { file, extracted: payload };
-  },
-});
+export function analyzeDocumentTool(files: Files, owner: string) {
+  return defineTool({
+    name: "analyze_document",
+    description:
+      "Extract text and structured fields from a PDF or image already in the workspace by its artifact ID (the ID shown when the user attaches a file in chat) using the owner's Foundry document-ai deployment. Returns extracted text and fields only — it files, sends, and notarizes nothing. Human approval is required before any reply, form, or filing goes out.",
+    parameters: docParams,
+    execute: async (args) => {
+      const { fileId, prompt } = docParams.parse(args);
+      const endpoint = process.env.FOUNDRY_DOCAI_ENDPOINT;
+      const key =
+        process.env.FOUNDRY_DOCAI_KEY ||
+        process.env.FOUNDRY_IMAGES_KEY ||
+        process.env.OPENAI_API_KEY;
+      if (!endpoint || !key) {
+        return {
+          error: "Document intake is not configured: FOUNDRY_DOCAI_ENDPOINT/KEY are missing.",
+        };
+      }
+      let file: { name: string };
+      let raw: Buffer;
+      try {
+        file = await files.get(owner, fileId);
+        raw = await files.bytes(owner, fileId);
+      } catch {
+        return { error: `Could not read workspace file: ${fileId}` };
+      }
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+        // Payload shape follows the deployment's documented request format;
+        // confirm against the Foundry deployment page at wiring time.
+        body: JSON.stringify({
+          model: "mistral-document-ai-2512",
+          document: { base64: raw.toString("base64") },
+          ...(prompt ? { prompt } : {}),
+        }),
+        signal: AbortSignal.timeout(180_000),
+      });
+      if (res.status === 429) {
+        return { error: "Document intake is rate limited. Retry shortly." };
+      }
+      if (!res.ok) {
+        return { error: `Document intake failed: HTTP ${res.status}.` };
+      }
+      const payload = await res.json();
+      return { file: file.name, extracted: payload };
+    },
+  });
+}
