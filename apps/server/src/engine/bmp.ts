@@ -1,7 +1,8 @@
-// BMP decoding to PNG, pure JS (no dependency, no native code). BMP is the
-// one common raster format the vision models do not accept, so it is
-// converted here instead of refused: decode the bitmap, re-encode it as PNG
-// with the shared encoder, and hand the PNG to the model.
+// BMP decoding to raw RGB (pure JS, no dependency, no native code), with a
+// PNG wrapper for callers that need bytes. BMP is the one common raster
+// format the vision models do not accept, so it is converted here instead of
+// refused: decode the bitmap, re-encode it as PNG with the shared encoder,
+// and hand the PNG to the model.
 //
 // Supported: BITMAPINFOHEADER family (40/108/124 bytes), uncompressed
 // (BI_RGB) 24-bit and 32-bit, 8-bit paletted, and 32-bit BI_BITFIELDS with the
@@ -11,6 +12,10 @@
 // reason, never decoded into a guess.
 
 import { encodePng } from "./png.ts";
+
+export type BmpDecoded =
+  | { ok: true; rgb: Uint8Array; width: number; height: number }
+  | { ok: false; error: string };
 
 export type BmpConversion =
   | { ok: true; png: Uint8Array; width: number; height: number }
@@ -43,8 +48,12 @@ function i32le(bytes: Uint8Array, offset: number): number {
   );
 }
 
-export function bmpToPng(bytes: Uint8Array): BmpConversion {
-  const fail = (reason: string): BmpConversion => ({
+/** Decode a BMP to raw RGB (3 bytes per pixel, top-down). The allocation is
+ * bounded by the file itself: the truncation check above refuses any image
+ * whose pixel data does not fit in the file, so no dimension pre-check is
+ * needed here. */
+export function bmpToRgb(bytes: Uint8Array): BmpDecoded {
+  const fail = (reason: string): { ok: false; error: string } => ({
     ok: false,
     error: `This BMP image could not be converted for viewing in chat (${reason}). It is stored and can be opened, downloaded, or shared.`,
   });
@@ -132,5 +141,17 @@ export function bmpToPng(bytes: Uint8Array): BmpConversion {
       }
     }
   }
-  return { ok: true, png: encodePng(width, height, rgb), width, height };
+  return { ok: true, rgb, width, height };
+}
+
+/** Decode a BMP and re-encode it as PNG. */
+export function bmpToPng(bytes: Uint8Array): BmpConversion {
+  const decoded = bmpToRgb(bytes);
+  if (!decoded.ok) return decoded;
+  return {
+    ok: true,
+    png: encodePng(decoded.width, decoded.height, decoded.rgb),
+    width: decoded.width,
+    height: decoded.height,
+  };
 }

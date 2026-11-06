@@ -170,6 +170,16 @@ test("multi-page TIFFs show only the first page, and say so", async () => {
   if (text.type === "text") assert.match(text.content, /only the first page/);
 });
 
+test("TIFFs declaring over 50 megapixels are refused before decoding", async () => {
+  // A 10000x10000 declaration with a 3-byte strip: the pixel cap must fire
+  // on the header dimensions, before readRGB allocates ~300 MB.
+  const tiff = buildTiff([{ width: 10000, height: 10000, rgb: [255, 0, 0] }]);
+  const result = await visionParts("huge.tiff", "image/tiff", new Uint8Array(tiff));
+  assert.ok("error" in result);
+  assert.match(result.error, /too large to view in chat/);
+  assert.match(result.error, /50 megapixels/);
+});
+
 test("legacy .xls is extracted with the same xlsx reader", async () => {
   const extracted = await extractDocumentText(
     new Uint8Array(fixture("content-test.xls")),
