@@ -100,14 +100,40 @@ export async function createApp(
       502,
     );
   });
-  app.get("/api/health", (c) =>
-    c.json({
-      ok: true,
-      mode: config.mode,
-      agentConfigured: agentConfigured(config),
-      browserConfigured: Boolean(config.workerUrl && config.workerToken),
-    }),
-  );
+  // Live health probes (R5): the database and worker are probed on a short
+  // cache so a burst of health checks cannot fan out into probe traffic.
+  // The cached body never carries error details — only ok/down/unconfigured.
+  let healthCache: { at: number; body: Record<string, unknown> } | null = null;
+  const HEALTH_CACHE_MS = 10_000;
+  async function probeWorker(): Promise<"ok" | "down" | "unconfigured"> {
+    if (!config.workerUrl) return "unconfigured";
+    try {
+      const res = await fetch(`${config.workerUrl}/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
+      return res.ok ? "ok" : "down";
+    } catch {
+      return "down";
+    }
+  }
+  app.get("/api/health", async (c) => {
+    const now = Date.now();
+    if (!healthCache || now - healthCache.at >= HEALTH_CACHE_MS) {
+      const [database, worker] = await Promise.all([db.ping(), probeWorker()]);
+      healthCache = {
+        at: now,
+        body: {
+          ok: true,
+          mode: config.mode,
+          agentConfigured: agentConfigured(config),
+          browserConfigured: Boolean(config.workerUrl && config.workerToken),
+          database: database ? "ok" : "down",
+          worker,
+        },
+      };
+    }
+    return c.json(healthCache.body);
+  });
   let loginWindow = 0,
     loginAttempts = 0;
   app.post("/api/session", async (c) => {
