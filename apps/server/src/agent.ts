@@ -25,6 +25,13 @@ export function agentConfigured(config: Config) {
         ))
   );
 }
+
+/** The agui backend needs a real endpoint; the old dead-local-port fallback failed obscurely. */
+export function aguiAgentUrl(config: Config): string {
+  if (!config.agentUrl?.trim())
+    throw new Error("agent URL not configured: set AGENT_URL to use the agui backend");
+  return config.agentUrl;
+}
 export function makeRuntime(
   config: Config,
   service: AgentService,
@@ -45,7 +52,7 @@ export function makeRuntime(
           )
         : config.agentBackend === "agui"
           ? new HttpAgent({
-              url: config.agentUrl ?? "http://127.0.0.1:1/unconfigured",
+              url: aguiAgentUrl(config),
               headers: config.agentToken ? { Authorization: `Bearer ${config.agentToken}` } : {},
             })
           : new ConversationAgent(

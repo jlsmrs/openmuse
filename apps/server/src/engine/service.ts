@@ -54,6 +54,13 @@ export class AgentService {
   readonly search: SearchService;
   private maintenance?: ReturnType<typeof setInterval>;
   private refreshing = false;
+  /**
+   * updatedAt of each task the last time maintain() published its outcome,
+   * keyed by owner:id. A task whose row has not changed since its last
+   * publication is skipped, so the 60-second tick stops re-publishing every
+   * task. Entries for deleted tasks are pruned on each tick.
+   */
+  private publishedTaskOutcomes = new Map<string, string>();
   constructor(
     readonly db: Store,
     readonly config: Config,
@@ -87,8 +94,20 @@ export class AgentService {
     this.refreshing = true;
     try {
       // Recover publications if the process exited after committing an outcome.
-      for (const { owner, value } of await this.db.scan<AgentTask>("tasks"))
+      // Only rows whose updatedAt moved since their last publication are
+      // re-published; every status transition bumps updatedAt, so a changed
+      // outcome is never skipped, and a fresh process (empty watermark)
+      // publishes everything once, which is the recovery case.
+      const seen = new Set<string>();
+      for (const { owner, value } of await this.db.scan<AgentTask>("tasks")) {
+        const key = `${owner}:${value.id}`;
+        seen.add(key);
+        if (this.publishedTaskOutcomes.get(key) === value.updatedAt) continue;
         await this.publishOutcome(owner, value);
+        this.publishedTaskOutcomes.set(key, value.updatedAt);
+      }
+      for (const key of this.publishedTaskOutcomes.keys())
+        if (!seen.has(key)) this.publishedTaskOutcomes.delete(key);
       for (const { owner, value } of await this.db.scan<Monitor>("monitors"))
         await this.activateMonitor(owner, value);
       for (const { owner, value } of await this.db.scan<Idea>("ideas"))
@@ -192,7 +211,11 @@ export class AgentService {
   }
   async createTask(owner: string, raw: unknown, idempotencyKey?: string, held = false) {
     const input = createTaskSchema.parse(raw);
-    const id = idempotencyKey ? hash(`task:${idempotencyKey}`) : randomUUID();
+    // The owner is part of the hash: without it, two owners retrying with the
+    // same key derive the same task id, and the worker's global in-flight set
+    // (keyed by task id alone) would treat the second owner's task as already
+    // running and never start it.
+    const id = idempotencyKey ? hash(`task:${owner}:${idempotencyKey}`) : randomUUID();
     const existing = await this.db.get<AgentTask>(owner, "tasks", id);
     if (existing) return existing;
     if (input.milestoneId && !input.goalId) throw new AppError("A milestone requires a goal", 422);
@@ -685,7 +708,9 @@ export class AgentService {
         { status: "new" },
         {
           status: "accepted",
-          taskId: hash(`task:idea:${id}`),
+          // Predicted task id: must match what createTask derives from the
+          // same idempotency key (`idea:${id}`), owner included.
+          taskId: hash(`task:${owner}:idea:${id}`),
           prompt: prompt ?? idea.prompt,
         },
       );

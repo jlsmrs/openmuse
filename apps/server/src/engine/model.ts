@@ -16,6 +16,9 @@ export type TaskAnswer = { question?: string; answer: string };
 /** Character budget for the personal-context JSON embedded in the task prompt. */
 export const MAX_PROMPT_CONTEXT_CHARS = 20000;
 
+/** The model run is aborted after this long; a timed-out run fails. */
+export const MODEL_RUN_TIMEOUT_MS = 300000;
+
 /**
  * The background prompt embeds every stored memory plus the full prior task
  * state, evidence and artifact list with no size cap; clip the JSON so one
@@ -40,6 +43,7 @@ export async function executeModelTask(
   owner: string,
   initial: AgentTask,
   ctx: TaskContext,
+  options: { modelTimeoutMs?: number } = {},
 ): Promise<Partial<AgentTask>> {
   const config = service.config;
   const browserConfigured = !!(config.workerUrl && config.workerToken);
@@ -407,9 +411,16 @@ export async function executeModelTask(
   };
   await new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
+      // The timeout must not discard what the model already produced: flush
+      // the partial text as an Agent update before the run fails. The
+      // throttled progress emitter would otherwise drop everything since
+      // the last 800 ms window, and the final flush below never runs on
+      // rejection. Best-effort, like every other progress write.
+      lastEmittedAt = 0;
+      emitProgress();
       agent.abortRun();
       reject(new Error("Model run timed out after five minutes"));
-    }, 300000);
+    }, options.modelTimeoutMs ?? MODEL_RUN_TIMEOUT_MS);
     const abort = () => {
       clearTimeout(timeout);
       agent.abortRun();

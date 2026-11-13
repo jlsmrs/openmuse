@@ -639,17 +639,9 @@ export class ConversationAgent extends AbstractAgent {
     });
   }
   private async sample(prompt: string, key: string) {
-    if (/show.*calendar|what.*calendar|plan my day/i.test(prompt)) {
-      const w = await this.service.workspace.snapshot(this.owner);
-      return {
-        content: `Your local calendar has ${w.events.length} events. Open Calendar to see the details, or ask me to take care of a document.`,
-      };
-    }
-    if (/what can|help|hello|^hi[!. ]*$/i.test(prompt) && prompt.length < 70)
-      return {
-        content:
-          "What would you like to take off your plate? I can prepare the permission slip, keep an eye on a website, or organize your spending. For open-ended requests, connect a model in Apps.",
-      };
+    // The permission branch is checked first: a request like "help with the
+    // permission slip" matches the greeting branch below ("help"), and the
+    // greeting used to win, so no document task was ever created for it.
     if (/permission|pdf|form/i.test(prompt)) {
       const w = await this.service.workspace.snapshot(this.owner);
       const mail = w.mail.find((m) => m.attachments.length && !/^Sent\b/i.test(m.label));
@@ -674,6 +666,17 @@ export class ConversationAgent extends AbstractAgent {
         task,
       };
     }
+    if (/show.*calendar|what.*calendar|plan my day/i.test(prompt)) {
+      const w = await this.service.workspace.snapshot(this.owner);
+      return {
+        content: `Your local calendar has ${w.events.length} events. Open Calendar to see the details, or ask me to take care of a document.`,
+      };
+    }
+    if (/what can|help|hello|^hi[!. ]*$/i.test(prompt) && prompt.length < 70)
+      return {
+        content:
+          "What would you like to take off your plate? I can prepare the permission slip, keep an eye on a website, or organize your spending. For open-ended requests, connect a model in Apps.",
+      };
     const task = await this.service.createTask(
       this.owner,
       { kind: "agent", prompt: prompt || "Help with my next task" },

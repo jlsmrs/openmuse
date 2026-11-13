@@ -390,6 +390,35 @@ test("guided document delegation streams a rich tool result bound to its saved t
   assert.equal(task?.input.messageId, "mail-fieldtrip");
 });
 
+// S-B2: the permission branch is checked before the greeting branch, so a
+// request like "help with the permission slip" creates the document task
+// instead of answering with the greeting.
+test("sample agent checks the permission branch before the greeting branch", async () => {
+  const events = await lastValueFrom(
+    sampleRun(
+      "permission-help-thread",
+      "permission-help-run",
+      "permission-help-request",
+      "help with the permission slip",
+    ).pipe(toArray()),
+  );
+  const stream = JSON.stringify(events);
+  assert.match(stream, /I found the permission slip/);
+  assert.doesNotMatch(stream, /take off your plate/);
+  const start = events.find((event) => event.type === EventType.TOOL_CALL_START);
+  const result = events.find((event) => event.type === EventType.TOOL_CALL_RESULT);
+  assert.equal(start?.toolCallName, "delegate_task");
+  assert.ok(result && typeof result.content === "string");
+  const { id } = JSON.parse(result.content);
+  const task = await db.get<{ input: { messageId: string }; kind: string }>(
+    "local-user",
+    "tasks",
+    id,
+  );
+  assert.equal(task?.kind, "document");
+  assert.equal(task?.input.messageId, "mail-fieldtrip");
+});
+
 test("signed links authorize only the requests their page makes", async () => {
   const link = (path: string) => {
     const url = new URL(auth.sign("local-user", path));

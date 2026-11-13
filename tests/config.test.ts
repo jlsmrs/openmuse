@@ -4,6 +4,7 @@ import {
   assertApiDeploymentConfig,
   browserWorkerUrl,
   type Config,
+  MAX_STANDING_INSTRUCTIONS_CHARS,
   readConfig,
   shadowedEnvKeys,
 } from "../apps/server/src/config.ts";
@@ -153,4 +154,34 @@ test("computer provider defaults to Docker and e2b-desktop requires a server-sid
       else process.env[key] = value;
     }
   }
+});
+
+// S-B2: standing instructions are appended verbatim to every chat prompt, so
+// an oversized value gets a startup warning instead of silently taxing
+// every reply.
+test("oversized standing instructions warn at startup; a sane size stays quiet", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    warnings.push(args);
+  });
+  process.env.OPENMUSE_INSTRUCTIONS = "x".repeat(MAX_STANDING_INSTRUCTIONS_CHARS + 1);
+  readConfig();
+  assert.equal(warnings.length, 1);
+  assert.match(String(warnings[0][0]), /OPENMUSE_INSTRUCTIONS is 10001 characters/);
+  assert.match(String(warnings[0][0]), /appended verbatim to every chat prompt/);
+  warnings.length = 0;
+  process.env.OPENMUSE_INSTRUCTIONS = "x".repeat(MAX_STANDING_INSTRUCTIONS_CHARS);
+  readConfig();
+  assert.equal(warnings.length, 0);
+  delete process.env.OPENMUSE_INSTRUCTIONS;
+  readConfig();
+  assert.equal(warnings.length, 0);
 });

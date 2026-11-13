@@ -102,6 +102,14 @@ export function browserWorkerUrl(value?: string): string | undefined {
 // writes never re-fire here: they are dispatched outside the model loop through
 // reviewed, idempotency-keyed actions.
 export const MODEL_MAX_RETRIES = 2;
+
+/**
+ * Standing instructions over this size get a startup warning; they are
+ * appended verbatim to every chat prompt, so an oversized value silently
+ * taxes every reply. 10,000 stays above the ~8,700-character value live
+ * today, so the warning fires only on genuinely large values.
+ */
+export const MAX_STANDING_INSTRUCTIONS_CHARS = 10000;
 export function readConfig(): Config {
   const mode = process.env.WORKSPACE_MODE ?? "sample";
   if (mode !== "sample" && mode !== "live")
@@ -180,5 +188,12 @@ export function readConfig(): Config {
     );
   if (mode === "sample" && !["127.0.0.1", "localhost", "::1"].includes(config.host))
     throw new Error("Sample workspace is local-only. HOST must be a loopback address.");
+  const standingInstructions = process.env.OPENMUSE_INSTRUCTIONS;
+  if (standingInstructions && standingInstructions.length > MAX_STANDING_INSTRUCTIONS_CHARS)
+    console.warn(
+      `[OpenMuse] OPENMUSE_INSTRUCTIONS is ${standingInstructions.length} characters, ` +
+        `over the ${MAX_STANDING_INSTRUCTIONS_CHARS}-character sane size; it is appended verbatim ` +
+        `to every chat prompt. Shorten it to keep replies fast and within context.`,
+    );
   return config;
 }
