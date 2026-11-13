@@ -50,25 +50,41 @@ export interface PdfInspection {
 // so a file under MAX_PDF_BYTES could still expand without bound. Every pdf-lib decoder grows its
 // output buffer through DecodeStream.ensureBuffer, so cap what one load may allocate there.
 const decodeBudget = new AsyncLocalStorage<{ remaining: number }>();
-let decodeStream = Object.getPrototypeOf(
-  decodePDFRawStream(
-    PDFRawStream.of(PDFContext.create().obj({ Filter: "ASCIIHexDecode" }), new Uint8Array()),
-  ),
-);
-while (decodeStream && !Object.hasOwn(decodeStream, "ensureBuffer"))
-  decodeStream = Object.getPrototypeOf(decodeStream);
-if (!decodeStream) throw new Error("pdf-lib no longer decodes through DecodeStream");
-const ensureBuffer = decodeStream.ensureBuffer;
-decodeStream.ensureBuffer = function (this: { buffer: Uint8Array }, requested: number) {
-  const before = this.buffer.byteLength;
-  const buffer: Uint8Array = ensureBuffer.call(this, requested);
-  const budget = decodeBudget.getStore();
-  if (budget) {
-    budget.remaining -= buffer.byteLength - before;
-    if (budget.remaining < 0) throw new PdfError("PDF content expands beyond the supported size");
-  }
-  return buffer;
-};
+let decodeStreamPatched = false;
+/**
+ * Install the decode-budget cap on pdf-lib's DecodeStream.ensureBuffer.
+ * Runs on first PDF load, not at import time: if pdf-lib changes internals,
+ * the failure lands on a PDF load instead of breaking the import of this
+ * whole module.
+ */
+function patchDecodeStreamBudget(): void {
+  if (decodeStreamPatched) return;
+  let decodeStream = Object.getPrototypeOf(
+    decodePDFRawStream(
+      PDFRawStream.of(PDFContext.create().obj({ Filter: "ASCIIHexDecode" }), new Uint8Array()),
+    ),
+  );
+  while (decodeStream && !Object.hasOwn(decodeStream, "ensureBuffer"))
+    decodeStream = Object.getPrototypeOf(decodeStream);
+  if (!decodeStream) throw new Error("pdf-lib no longer decodes through DecodeStream");
+  const ensureBuffer = decodeStream.ensureBuffer;
+  decodeStream.ensureBuffer = function (this: { buffer: Uint8Array }, requested: number) {
+    const before = this.buffer.byteLength;
+    const budget = decodeBudget.getStore();
+    // Check the requested size against the remaining budget BEFORE allocating:
+    // the buffer grows to at least `requested`, so a request whose minimum
+    // growth already exceeds the budget must fail without allocating it.
+    if (budget && requested - before > budget.remaining)
+      throw new PdfError("PDF content expands beyond the supported size");
+    const buffer: Uint8Array = ensureBuffer.call(this, requested);
+    if (budget) {
+      budget.remaining -= buffer.byteLength - before;
+      if (budget.remaining < 0) throw new PdfError("PDF content expands beyond the supported size");
+    }
+    return buffer;
+  };
+  decodeStreamPatched = true;
+}
 
 /**
  * The "%PDF-" marker must start within the first 5 bytes of the file
@@ -86,6 +102,7 @@ async function loadPdf(bytes: Uint8Array): Promise<PDFDocument> {
   if (!bytes.length || bytes.length > MAX_PDF_BYTES || !pdfMarkerAtStart(bytes)) {
     throw new PdfError("Invalid PDF: expected nonempty PDF bytes up to 10 MiB");
   }
+  patchDecodeStreamBudget();
   const budget = { remaining: MAX_DECODED_BYTES };
   try {
     const doc = await decodeBudget.run(budget, () =>
