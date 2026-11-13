@@ -551,7 +551,6 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
   const [error, setError] = useState("");
   const action =
     local.status !== initial.status ? local : w.actions.find((a) => a.id === initial.id) || local;
-  const d = action.data;
   const pending = action.status === "awaiting_review";
   async function decide(decision: "approve" | "deny") {
     setBusy(true);
@@ -624,18 +623,18 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
         <ReviewLine label="Account" value={action.account || w.profile.email} />
         {email ? (
           <>
-            <ReviewLine label="To" value={arrayText(d.to)} />
-            <ReviewLine label="Cc" value={arrayText(d.cc) || "None"} />
-            <ReviewLine label="Bcc" value={arrayText(d.bcc) || "None"} />
-            <ReviewLine label="Subject" value={String(d.subject || "")} />
+            <ReviewLine label="To" value={arrayText(action.data.to)} />
+            <ReviewLine label="Cc" value={arrayText(action.data.cc) || "None"} />
+            <ReviewLine label="Bcc" value={arrayText(action.data.bcc) || "None"} />
+            <ReviewLine label="Subject" value={String(action.data.subject || "")} />
             <View style={s.divider} />
             <Text selectable style={[s.text, { lineHeight: 25 }]}>
-              {String(d.body || "")}
+              {String(action.data.body || "")}
             </Text>
             <View style={s.divider} />
             <Text style={s.label}>Attachments</Text>
-            {Array.isArray(d.attachmentIds) && d.attachmentIds.length ? (
-              d.attachmentIds.map((id) => {
+            {Array.isArray(action.data.attachmentIds) && action.data.attachmentIds.length ? (
+              action.data.attachmentIds.map((id) => {
                 const file = w.files.find((f) => f.id === id);
                 return (
                   <Text key={String(id)} style={s.text}>
@@ -649,33 +648,36 @@ function ReviewDetail({ initial }: { initial: ActionProposal }) {
           </>
         ) : (
           <>
-            <ReviewLine label="Event" value={String(d.title || "")} />
+            <ReviewLine label="Event" value={String(action.data.title || "")} />
             {action.kind !== "calendar.delete" && (
               <>
                 <ReviewLine
                   label="Starts"
                   value={
-                    d.allDay
-                      ? String(d.start || "")
-                      : `${dateLabel(String(d.start || ""), { year: "numeric", month: "short", day: "numeric", timeZone: String(d.timeZone || "UTC") })} · ${timeLabel(String(d.start || ""), String(d.timeZone || "UTC"))}`
+                    action.data.allDay
+                      ? String(action.data.start || "")
+                      : `${dateLabel(String(action.data.start || ""), { year: "numeric", month: "short", day: "numeric", timeZone: String(action.data.timeZone || "UTC") })} · ${timeLabel(String(action.data.start || ""), String(action.data.timeZone || "UTC"))}`
                   }
                 />
                 <ReviewLine
                   label="Ends"
                   value={
-                    d.allDay
-                      ? `${String(d.end || "")} (exclusive)`
-                      : `${dateLabel(String(d.end || ""), { year: "numeric", month: "short", day: "numeric", timeZone: String(d.timeZone || "UTC") })} · ${timeLabel(String(d.end || ""), String(d.timeZone || "UTC"))}`
+                    action.data.allDay
+                      ? `${String(action.data.end || "")} (exclusive)`
+                      : `${dateLabel(String(action.data.end || ""), { year: "numeric", month: "short", day: "numeric", timeZone: String(action.data.timeZone || "UTC") })} · ${timeLabel(String(action.data.end || ""), String(action.data.timeZone || "UTC"))}`
                   }
                 />
-                <ReviewLine label="Time zone" value={String(d.timeZone || "")} />
-                <ReviewLine label="All day" value={d.allDay ? "Yes" : "No"} />
-                <ReviewLine label="Location" value={String(d.location || "None")} />
-                <ReviewLine label="Attendees" value={arrayText(d.attendees) || "Just you"} />
-                <ReviewLine label="Notes" value={String(d.description || "None")} />
+                <ReviewLine label="Time zone" value={String(action.data.timeZone || "")} />
+                <ReviewLine label="All day" value={action.data.allDay ? "Yes" : "No"} />
+                <ReviewLine label="Location" value={String(action.data.location || "None")} />
+                <ReviewLine
+                  label="Attendees"
+                  value={arrayText(action.data.attendees) || "Just you"}
+                />
+                <ReviewLine label="Notes" value={String(action.data.description || "None")} />
               </>
             )}
-            <ReviewLine label="Calendar" value={String(d.calendarId || "primary")} />
+            <ReviewLine label="Calendar" value={String(action.data.calendarId || "primary")} />
             <Text style={s.small}>
               {action.kind === "calendar.delete"
                 ? "This removes the event and may notify its attendees."

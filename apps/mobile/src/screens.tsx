@@ -608,6 +608,7 @@ export function CalendarScreen() {
   const [date, setDate] = useState(todayDate());
   const [all, setAll] = useState(false);
   const [calendars, setCalendars] = useState<CalendarChoice[]>([]);
+  const [calendarsTruncated, setTruncated] = useState(false);
   const [calendarId, setCalendarId] = useState("primary");
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -625,10 +626,16 @@ export function CalendarScreen() {
   useEffect(() => {
     let active = true;
     void api
-      .request<CalendarChoice[]>("/api/calendars")
-      .then((items) => {
+      .request<{ calendars: CalendarChoice[]; truncated: boolean } | CalendarChoice[]>(
+        "/api/calendars",
+      )
+      .then((data) => {
         if (!active) return;
+        // The endpoint returns { calendars, truncated }; accept a bare array
+        // too so an older cached bundle shape still reads.
+        const items = Array.isArray(data) ? data : data.calendars;
         setCalendars(items);
+        setTruncated(!Array.isArray(data) && data.truncated);
         setCalendarId((current) =>
           items.some((c) => c.id === current) ? current : items[0]?.id || "primary",
         );
@@ -711,6 +718,9 @@ export function CalendarScreen() {
       {calendars.length > 0 && (
         <View style={{ gap: 9 }}>
           <Text style={s.label}>Your calendars</Text>
+          {calendarsTruncated && (
+            <Text style={s.muted}>More calendars exist than are shown here.</Text>
+          )}
           <View style={[s.row, { gap: 8, flexWrap: "wrap" }]}>
             {calendars.map((c) => (
               <Button
