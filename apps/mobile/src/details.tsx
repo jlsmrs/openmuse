@@ -35,6 +35,7 @@ import {
 import { DelegateSheet, NotificationsSheet, TaskDetail } from "./agent-ui";
 import BrowserConsole from "./BrowserConsole";
 import { browserAddress, browserSite } from "./browser-address";
+import { newerBrowserSession } from "./browser-session";
 import { ComputerSheet } from "./computer";
 import DateTimeEditor from "./DateTimeEditor";
 import { localDateTime, zonedInstant } from "./date-time";
@@ -874,11 +875,7 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
   const [loading, setLoading] = useState(true);
   const [retry, setRetry] = useState(0);
   const latest = w.browsers.find((b) => b.id === initial.id);
-  const browser = {
-    ...(latest && latest.updatedAt > local.updatedAt ? latest : local),
-    consoleUrl: local.consoleUrl,
-    previewUrl: local.previewUrl,
-  };
+  const browser = newerBrowserSession(local, latest);
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -977,7 +974,7 @@ function BrowserDetail({ initial }: { initial: BrowserSession }) {
           )}
         </View>
       ) : browser.status === "active" && browser.consoleUrl ? (
-        <BrowserConsole url={api.url(browser.consoleUrl)} />
+        <BrowserConsole url={api.url(browser.consoleUrl)} sandboxed />
       ) : browser.status === "active" && browser.previewUrl ? (
         <Image
           source={{ uri: api.url(browser.previewUrl) }}
