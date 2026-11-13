@@ -97,3 +97,46 @@ export function decryptSecret(encrypted: string, key: string, context?: Credenti
     throw new Error("Unable to authenticate or decrypt credential");
   }
 }
+
+/** Outcome of attempting to move one stored record to the v2 envelope. */
+export type SecretMigration =
+  | { status: "already-v2"; ciphertext: string }
+  | { status: "migrated"; ciphertext: string }
+  | { status: "failed"; reason: string };
+
+/**
+ * Move one stored credential to the v2 envelope (G4). Pure ciphertext
+ * in, ciphertext out — the plaintext is never returned or logged.
+ * Idempotent: a v2 record that decrypts under its context is returned
+ * unchanged. A record that cannot be authenticated is reported as
+ * failed and left untouched; the caller decides whether to retry it or
+ * leave the v1 read path in place.
+ */
+export function migrateSecretToV2(
+  encrypted: string,
+  key: string,
+  context: CredentialContext,
+): SecretMigration {
+  const version = encrypted.split(".", 1)[0];
+  if (version === "v2") {
+    try {
+      decryptSecret(encrypted, key, context);
+      return { status: "already-v2", ciphertext: encrypted };
+    } catch {
+      return {
+        status: "failed",
+        reason: "existing v2 record does not decrypt under its owner and record id",
+      };
+    }
+  }
+  if (version !== "v1") {
+    return { status: "failed", reason: "unrecognized credential envelope" };
+  }
+  let plaintext: string;
+  try {
+    plaintext = decryptSecret(encrypted, key);
+  } catch {
+    return { status: "failed", reason: "v1 record does not decrypt" };
+  }
+  return { status: "migrated", ciphertext: encryptSecretV2(plaintext, key, context) };
+}
