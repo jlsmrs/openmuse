@@ -91,8 +91,10 @@ export interface BrowserSession {
   previewUrl?: string;
   consoleUrl?: string;
 }
-// Invisible characters that reorder or hide text without showing on the review card. Joiners and
-// directional marks stay because emoji sequences, Persian and Arabic text depend on them.
+// Invisible characters that reorder or hide text without showing on the review card. Joiners
+// (ZWJ/ZWNJ) and directional marks (LRM/RLM) stay because emoji sequences, Persian and Arabic
+// text depend on them; directional embeddings, overrides, and isolates are stripped — they
+// reorder text, which is what this filter exists to prevent.
 const hiddenText = /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
 const visibleText = () => z.string().overwrite((text) => text.replace(hiddenText, ""));
 export const emailDraftSchema = z.object({
