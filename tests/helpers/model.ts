@@ -13,10 +13,11 @@ export async function modelFixture(
     errorStatus?: (index: number) => number | undefined;
     dropAfterStart?: (index: number) => boolean;
     dropAfterText?: (index: number) => boolean;
+    hangAfterText?: (index: number) => boolean;
     errorPart?: (index: number) => boolean;
   } = {},
 ) {
-  const { errorStatus, dropAfterStart, dropAfterText, errorPart } = options;
+  const { errorStatus, dropAfterStart, dropAfterText, hangAfterText, errorPart } = options;
   const requests: { path: string; body: string }[] = [];
   const server = createServer(async (request, response) => {
     let body = "";
@@ -88,6 +89,45 @@ export async function modelFixture(
         })}\n\n`,
       );
       setTimeout(() => response.socket?.destroy(), 120);
+      return;
+    }
+    if (hangAfterText?.(index)) {
+      // Deliver real assistant output, then hold the stream open forever so
+      // the caller can exercise the model-run timeout. The server's t.after
+      // closes the held-open connection when the test ends.
+      response.writeHead(200, { "Content-Type": "text/event-stream" });
+      response.write(
+        `data: ${JSON.stringify({
+          type: "response.created",
+          response: {
+            id: `hang-${index}`,
+            created_at: 1000,
+            model: "fixture",
+            status: "in_progress",
+          },
+        })}\n\n`,
+      );
+      response.write(
+        `data: ${JSON.stringify({
+          type: "response.output_item.added",
+          output_index: 0,
+          item: {
+            id: `msg-${index}`,
+            type: "message",
+            role: "assistant",
+            status: "in_progress",
+            content: [],
+          },
+        })}\n\n`,
+      );
+      response.write(
+        `data: ${JSON.stringify({
+          type: "response.output_text.delta",
+          item_id: `msg-${index}`,
+          output_index: 0,
+          delta: "Hello partial ",
+        })}\n\n`,
+      );
       return;
     }
     if (errorPart?.(index)) {
