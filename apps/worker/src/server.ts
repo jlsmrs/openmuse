@@ -148,7 +148,11 @@ export async function createWorkerServer(
       else response.end();
     }
   });
-  server.requestTimeout = 30_000;
+  // One POST /sessions request can chain a context launch (25 s timeout)
+  // and an initial navigation (20 s goto) plus validation — 45 s+ on a
+  // slow first launch. A 30 s request timeout drops the client connection
+  // while the work continues server-side, so allow 60 s.
+  server.requestTimeout = 60_000;
   server.headersTimeout = 10_000;
   server.keepAliveTimeout = 5_000;
   server.maxRequestsPerSocket = 100;
