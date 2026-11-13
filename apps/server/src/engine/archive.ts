@@ -7,7 +7,8 @@
 // described.
 //
 // Formats: ZIP (via jszip), TAR, and TAR.GZ (gzip via node:zlib + a small
-// tar header parser). RAR, 7z, and other formats are refused plainly.
+// tar header parser). A plain single-file .gz is gunzipped as a one-member
+// archive. RAR, 7z, and other formats are refused plainly.
 //
 // Guards (a small archive can expand without bound, so every expansion is
 // capped): at most 100 members, 25 MB total uncompressed, 10 MB per member,
@@ -40,7 +41,23 @@ const ZIP_MIMES = new Set(["application/zip", "application/x-zip-compressed", "a
 export function isArchiveMime(mime: string, name: string): boolean {
   if (ZIP_MIMES.has(mime) || mime === "application/x-tar") return true;
   if (mime === "application/gzip" && /\.t(ar\.)?gz$/i.test(name)) return true;
+  // A plain .gz is a one-member archive (its single file, gunzipped), not a
+  // refusal — gunzip support is already in this file for TAR.GZ.
+  if (mime === "application/gzip" && /\.gz$/i.test(name)) return true;
   return false;
+}
+
+/** True when the gzip file is a TAR.GZ (a tar archive), as opposed to a
+ * plain single-file .gz. */
+function isTarGz(name: string): boolean {
+  return /\.t(ar\.)?gz$/i.test(name);
+}
+
+/** The member name for a plain .gz: the filename with the .gz suffix
+ * stripped ("notes.txt.gz" → "notes.txt"). */
+export function gzMemberName(name: string): string {
+  const stripped = name.replace(/\.gz$/i, "");
+  return stripped || name;
 }
 
 interface Budget {
@@ -283,7 +300,7 @@ async function unpackArchive(
     }
     return;
   }
-  // TAR / TAR.GZ.
+  // TAR / TAR.GZ / plain .gz.
   let tarBytes = bytes;
   if (mime === "application/gzip") {
     try {
@@ -293,6 +310,27 @@ async function unpackArchive(
         `Archive ${name} expands beyond ${ARCHIVE_MAX_TOTAL_BYTES / (1024 * 1024)} MB.`,
       );
       acc.truncated = true;
+      return;
+    }
+    if (!isTarGz(name)) {
+      // A plain .gz holds one file: read it as a single member under its
+      // un-suffixed name, under the same member/total budget as tar members.
+      const memberName = gzMemberName(name);
+      if (acc.budget.members >= ARCHIVE_MAX_MEMBERS) {
+        acc.lines.push(`Stopped: archive member limit (${ARCHIVE_MAX_MEMBERS}) reached.`);
+        acc.truncated = true;
+        return;
+      }
+      acc.budget.members++;
+      acc.budget.bytes += tarBytes.length;
+      if (acc.budget.bytes > ARCHIVE_MAX_TOTAL_BYTES) {
+        acc.lines.push(
+          `Stopped: archive contents exceed ${ARCHIVE_MAX_TOTAL_BYTES / (1024 * 1024)} MB uncompressed.`,
+        );
+        acc.truncated = true;
+        return;
+      }
+      await processMember(memberName, tarBytes, depth, acc);
       return;
     }
   }

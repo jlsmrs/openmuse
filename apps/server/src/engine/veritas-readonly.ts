@@ -38,7 +38,12 @@ async function crmGet(path: string): Promise<unknown> {
   if (res.status === 401 || res.status === 403)
     return { error: "CRM token rejected (401/403). Token may be wrong or revoked." };
   if (!res.ok) return { error: `CRM request failed: HTTP ${res.status}.` };
-  const payload = await res.json();
+  let payload: unknown;
+  try {
+    payload = await res.json();
+  } catch {
+    return { error: "CRM returned an empty or non-JSON response." };
+  }
   return payload;
 }
 
@@ -46,6 +51,14 @@ const truncate = (value: unknown, chars = 8000) => {
   const s = JSON.stringify(value);
   return s.length > chars ? `${s.slice(0, chars)}…[truncated]` : s;
 };
+
+/** Return a crmGet result in the tool's normal shape: an error object comes
+ * back as {error}, not wrapped as result text — wrapping it would hand the
+ * model a JSON string that reads like a successful CRM reply. */
+function asToolResult(result: unknown): unknown {
+  if (result && typeof result === "object" && "error" in result) return result;
+  return { result: truncate(result) };
+}
 
 export const todaysSigningsTool = defineTool({
   name: "veritas_todays_signings",
@@ -59,8 +72,9 @@ export const todaysSigningsTool = defineTool({
   }),
   execute: async (args) => {
     const { date } = args as { date?: string };
-    const result = await crmGet(`/api/jobs/today${date ? `?date=${date}` : ""}`);
-    return { result: truncate(result) };
+    return asToolResult(
+      await crmGet(`/api/jobs/today${date ? `?date=${encodeURIComponent(date)}` : ""}`),
+    );
   },
 });
 
@@ -78,8 +92,7 @@ export const searchJobsTool = defineTool({
       ...(status ? { status } : {}),
       ...(q ? { q } : {}),
     }).toString();
-    const result = await crmGet(`/api/jobs${qs ? `?${qs}` : ""}`);
-    return { result: truncate(result) };
+    return asToolResult(await crmGet(`/api/jobs${qs ? `?${qs}` : ""}`));
   },
 });
 
@@ -90,7 +103,6 @@ export const getJobTool = defineTool({
   parameters: z.object({ id: z.string().trim().min(1).max(100) }),
   execute: async (args) => {
     const { id } = args as { id: string };
-    const result = await crmGet(`/api/jobs/${encodeURIComponent(id)}`);
-    return { result: truncate(result) };
+    return asToolResult(await crmGet(`/api/jobs/${encodeURIComponent(id)}`));
   },
 });

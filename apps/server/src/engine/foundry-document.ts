@@ -82,7 +82,12 @@ export function analyzeDocumentTool(files: Files, owner: string) {
       if (!res.ok) {
         return { error: `Document intake failed: HTTP ${res.status}.` };
       }
-      const payload = await res.json();
+      let payload: unknown;
+      try {
+        payload = await res.json();
+      } catch {
+        return { error: "Document intake returned a non-JSON response." };
+      }
       const text = JSON.stringify(payload);
       if (text.length > FOUNDRY_DOCAI_MAX_CHARS)
         return {
