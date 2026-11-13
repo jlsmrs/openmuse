@@ -422,6 +422,9 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   const renamed = !!editor && editor.savedPath !== "" && editor.path !== editor.savedPath;
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmRename, setConfirmRename] = useState(false);
+  // The id of a document armed to overwrite a same-name file in this folder;
+  // the first tap arms, the second copies. Cleared when the folder changes.
+  const [confirmImport, setConfirmImport] = useState<string>();
   // A save clears the dirty flag, which disarms both confirms; any path edit
   // re-arms the rename confirm.
   useEffect(() => {
@@ -433,6 +436,9 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   useEffect(() => {
     setConfirmRename(false);
   }, [editor?.path]);
+  useEffect(() => {
+    setConfirmImport(undefined);
+  }, [path]);
   useEffect(() => {
     if (!active || !running) {
       setLoading(false);
@@ -476,13 +482,25 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   }
   async function importDocument(file: Artifact) {
     if (busy || !running) return;
+    const target = `${path}/${file.name.replace(/[\\/]/g, "_")}`;
+    // Copying over a same-name file must not happen on one tap with warning
+    // text only: the first tap arms the overwrite, the second copies.
+    const exists = directory?.entries.some(
+      (entry) => entry.type === "file" && entry.path === target,
+    );
+    if (exists && confirmImport !== file.id) {
+      setConfirmImport(file.id);
+      setNotice(`A file named ${file.name} already exists here. Tap again to replace it.`);
+      return;
+    }
+    setConfirmImport(undefined);
     setBusy(true);
     setError("");
     setNotice("");
     try {
       await api.request("/api/computer/files/import", {
         fileId: file.id,
-        path: `${path}/${file.name.replace(/[\\/]/g, "_")}`,
+        path: target,
       });
       setImporting(false);
       setNotice("Document copied to your computer.");

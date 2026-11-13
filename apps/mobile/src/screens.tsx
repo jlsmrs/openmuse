@@ -42,7 +42,7 @@ import { useAgentWorkspace } from "./agent-workspace";
 import { API_URL } from "./api";
 import { browserAddress } from "./browser-address";
 import { AgentAvatar } from "./custom-avatar";
-import { localDateTime, startOfZonedDay, zonedInstant } from "./date-time";
+import { calendarRange, localDateTime, plusDays, zonedInstant } from "./date-time";
 import {
   Button,
   Card,
@@ -598,11 +598,6 @@ interface CalendarChoice {
   timeZone: string;
   accessRole: string;
 }
-function plusDays(date: string, days: number) {
-  const value = new Date(`${date}T12:00:00Z`);
-  value.setUTCDate(value.getUTCDate() + days);
-  return value.toISOString().slice(0, 10);
-}
 export function CalendarScreen() {
   const { workspace: w, api, open } = useWorkspace();
   const [date, setDate] = useState(todayDate());
@@ -653,11 +648,8 @@ export function CalendarScreen() {
     setError("");
     void Promise.resolve()
       .then(() => {
-        const query = new URLSearchParams({
-          calendarId,
-          timeMin: startOfZonedDay(date, zone),
-          timeMax: startOfZonedDay(plusDays(date, all ? 30 : 1), zone),
-        });
+        const { timeMin, timeMax } = calendarRange(date, zone, all);
+        const query = new URLSearchParams({ calendarId, timeMin, timeMax });
         return api.request<CalendarEvent[]>(`/api/calendar/events?${query}`);
       })
       .then((items) => {
@@ -846,6 +838,11 @@ export function BrowserScreen() {
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // The server marks the browser connection "unavailable" when a configured
+  // worker does not answer, and "unconfigured" when there is no worker at
+  // all; opening a session in either case can only fail server-side.
+  const browserConnection = w.connections.find((c) => c.id === "browser");
+  const browserReady = browserConnection?.status === "connected";
   async function create() {
     setError("");
     setBusy(true);
@@ -887,12 +884,19 @@ export function BrowserScreen() {
             primary
             icon={Plus}
             busy={busy}
-            disabled={!url.trim()}
+            disabled={!url.trim() || !browserReady}
             onPress={() => void create()}
           >
             Open session
           </Button>
         </View>
+        {!browserReady && (
+          <Text style={[s.muted, { marginTop: 10 }]}>
+            {browserConnection?.status === "unavailable"
+              ? "The browser worker is offline, so new sessions cannot be opened right now."
+              : "The browser worker is not configured, so new sessions cannot be opened."}
+          </Text>
+        )}
         <ErrorNotice error={error} />
       </Card>
       <Card>
@@ -952,6 +956,8 @@ function fileTypeLabel(f: Artifact): string {
   const ext = f.name.split(".").pop();
   return ext && ext !== f.name ? ext.toUpperCase().slice(0, 10) : "FILE";
 }
+/** Client-side mirror of the server's 10 MB file-import limit. */
+export const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 export function FilesScreen() {
   const { workspace: w, api, refresh, open } = useWorkspace();
   const [busy, setBusy] = useState(false);
@@ -966,6 +972,14 @@ export function FilesScreen() {
       });
       if (result.canceled) return;
       const file = result.assets[0];
+      // The server enforces a 10 MB import limit; check it here first so a
+      // too-large file fails immediately with a clear message instead of
+      // uploading and failing server-side. (Native pickers do not always
+      // report a size; then the server limit still applies.)
+      if (file.size !== undefined && file.size > MAX_IMPORT_BYTES)
+        throw new Error(
+          `That file is ${Math.ceil(file.size / (1024 * 1024))} MB, over the 10 MB import limit. Choose a smaller file.`,
+        );
       let artifact: Artifact;
       if (Platform.OS === "web") {
         const form = new FormData();

@@ -1,7 +1,7 @@
 import { ChevronLeft, ChevronRight, Minus, Plus } from "lucide-react-native";
 import { useState } from "react";
 import { Text, View } from "react-native";
-import { Button, s } from "./ui";
+import { Button, colors, s } from "./ui";
 
 interface PdfReaderProps {
   url: string;
@@ -11,6 +11,9 @@ interface PdfReaderProps {
 export default function PdfReader({ url, pageCount }: PdfReaderProps) {
   const [page, setPage] = useState(1);
   const [zoom, setZoom] = useState(100);
+  // A bare iframe shows nothing when the document fails to load; keep an
+  // error state so the failure is visible instead of a blank grey box.
+  const [failed, setFailed] = useState(false);
   return (
     <View style={{ gap: 12 }}>
       <View style={[s.between, { gap: 8, flexWrap: "wrap" }]}>
@@ -45,7 +48,14 @@ export default function PdfReader({ url, pageCount }: PdfReaderProps) {
         title="PDF document reader"
         src={`${url}#page=${page}&zoom=${zoom}`}
         style={{ height: 570, width: "100%", border: 0, borderRadius: 12, background: "#e7e9e3" }}
+        onError={() => setFailed(true)}
+        onLoad={() => setFailed(false)}
       />
+      {failed && (
+        <Text style={[s.small, { color: colors.danger }]}>
+          The PDF could not be loaded. Use the reader toolbar to download a copy instead.
+        </Text>
+      )}
       <Text style={s.small}>Use the reader toolbar to download or print a copy.</Text>
     </View>
   );

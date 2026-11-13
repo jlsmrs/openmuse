@@ -48,6 +48,7 @@ import { DesktopToolCard } from "./desktop-tool-card";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
+import { stripMarkdown } from "./plain-text";
 import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
@@ -527,7 +528,7 @@ export function ChatScreen({
       setVoiceError("There is no reply to read aloud yet.");
       return;
     }
-    const handle = speakText(defaultSpeechEnv(), latest.content, {
+    const handle = speakText(defaultSpeechEnv(), stripMarkdown(latest.content), {
       onEnd: () => setSpeaking(false),
       onError: (message) => {
         setVoiceError(message);
@@ -548,11 +549,24 @@ export function ChatScreen({
     setSpeaking(false);
     const text = draft.trim();
     if (!text || !isReady || !loaded) return;
+    // A picked attachment that disappeared from the workspace must not be
+    // sent silently without it: warn, drop the stale picks, and let the user
+    // send again knowingly instead of sending a message missing a file.
+    const files = w.files.filter((f) => attachments.includes(f.id));
+    const missing = attachments.filter((id) => !files.some((f) => f.id === id));
+    if (missing.length) {
+      setAttachments((current) => current.filter((id) => !missing.includes(id)));
+      setError(
+        missing.length === 1
+          ? "One attached file is no longer in your workspace, so it was removed from this message. Send again to send without it."
+          : `${missing.length} attached files are no longer in your workspace, so they were removed from this message. Send again to send without them.`,
+      );
+      return;
+    }
     // A new submission can continue after Stop; held follow-ups still need explicit resume.
     if (!busy && !agent.isRunning && !saveError && !queue.getSnapshot().pending.length)
       queue.resume();
     setShowResults(false);
-    const files = w.files.filter((f) => attachments.includes(f.id));
     enqueue(
       text +
         (files.length
@@ -1054,7 +1068,10 @@ export function ChatScreen({
                 ...noFocusRing,
               }}
               multiline
-              editable
+              // The draft is locked while dictating: dictation rebuilds it
+              // from the text captured when it started, so typing mid-dictation
+              // would be overwritten by the next transcript.
+              editable={!dictating}
               onKeyPress={
                 Platform.OS === "web"
                   ? (event) => {

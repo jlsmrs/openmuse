@@ -10,7 +10,10 @@ export function BackgroundUpdates() {
   const { open } = useWorkspace();
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const updates = data?.notifications.filter((item) => !item.read && item.taskId) || [];
+  // The banner shows the same unread set the bell badge counts — every unread
+  // notification, not just task-linked ones. (A non-task update has no task to
+  // open, so its "View task" button is omitted; dismiss still works.)
+  const updates = data?.notifications.filter((item) => !item.read) || [];
   const update = updates[0];
   if (!update || data?.identity.showChatUpdates === false) return null;
   async function dismiss() {
@@ -46,13 +49,15 @@ export function BackgroundUpdates() {
       <Text style={s.heading}>{update.title}</Text>
       <Text style={s.text}>{resultSummary(update.body)}</Text>
       <View style={[s.row, { gap: 8, flexWrap: "wrap" }]}>
-        <Button
-          small
-          icon={ArrowRight}
-          onPress={() => update.taskId && open({ type: "task", taskId: update.taskId })}
-        >
-          View task
-        </Button>
+        {update.taskId && (
+          <Button
+            small
+            icon={ArrowRight}
+            onPress={() => open({ type: "task", taskId: update.taskId })}
+          >
+            View task
+          </Button>
+        )}
         {updates.length > 1 && (
           <Button small onPress={() => open({ type: "notifications" })}>
             {updates.length - 1} more updates
