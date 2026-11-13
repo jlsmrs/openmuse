@@ -106,6 +106,11 @@ function parseTar(bytes: Uint8Array): { members: TarMember[] } | { error: string
       const fullName = pendingLongName ?? (prefix ? `${prefix}/${name}` : name);
       members.push({ name: fullName, offset: dataStart, size });
       pendingLongName = null;
+    } else {
+      // Any other entry (directory, symlink, pax header, ...) ends the
+      // long-name sequence: leaving it set would leak the pending name
+      // onto the next regular file.
+      pendingLongName = null;
     }
     offset = dataStart + dataBlocks * 512;
   }

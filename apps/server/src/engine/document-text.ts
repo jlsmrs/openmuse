@@ -40,6 +40,34 @@ function toBuffer(bytes: Uint8Array): Buffer {
   return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
 }
 
+/** Decode the XML entities a PPTX text run can carry (`&amp;`, `&lt;`,
+ * `&gt;`, `&quot;`, `&apos;`, numeric `&#NN;` / `&#xHH;`). Runs are joined
+ * raw otherwise, so `Fish &amp; Chips` would reach the model literally. */
+export function decodeXmlEntities(value: string): string {
+  return value.replace(/&(#x[0-9a-fA-F]+|#\d+|amp|lt|gt|quot|apos);/g, (match, body: string) => {
+    switch (body) {
+      case "amp":
+        return "&";
+      case "lt":
+        return "<";
+      case "gt":
+        return ">";
+      case "quot":
+        return '"';
+      case "apos":
+        return "'";
+      default: {
+        const code = body.startsWith("#x")
+          ? Number.parseInt(body.slice(2), 16)
+          : Number.parseInt(body.slice(1), 10);
+        return Number.isSafeInteger(code) && code >= 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : match;
+      }
+    }
+  });
+}
+
 async function extractDocx(bytes: Uint8Array): Promise<DocumentExtraction> {
   try {
     const result = await mammoth.extractRawText({ buffer: toBuffer(bytes) });
@@ -89,7 +117,7 @@ async function extractPptx(bytes: Uint8Array): Promise<DocumentExtraction> {
     for (const name of slideNames) {
       const xml = await zip.files[name]?.async("string");
       if (xml === undefined) continue;
-      const runs = [...xml.matchAll(/<a:t>([^<]*)<\/a:t>/g)].map((m) => m[1]);
+      const runs = [...xml.matchAll(/<a:t>([^<]*)<\/a:t>/g)].map((m) => decodeXmlEntities(m[1]));
       slides.push(`Slide: ${runs.join(" ")}`);
     }
     if (!slides.length) return { ok: false, error: "This presentation has no readable text." };

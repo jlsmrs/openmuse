@@ -32,6 +32,12 @@ const docParams = z.object({
   prompt: z.string().trim().max(1000).optional(),
 });
 
+/** Maximum characters of provider payload returned to the model: the full
+ * document-ai response is uncapped otherwise, and tool results replay as
+ * text in stored threads. Over the cap the payload is returned as a
+ * truncated string with `truncated: true`. */
+export const FOUNDRY_DOCAI_MAX_CHARS = 30_000;
+
 export function analyzeDocumentTool(files: Files, owner: string) {
   return defineTool({
     name: "analyze_document",
@@ -77,6 +83,13 @@ export function analyzeDocumentTool(files: Files, owner: string) {
         return { error: `Document intake failed: HTTP ${res.status}.` };
       }
       const payload = await res.json();
+      const text = JSON.stringify(payload);
+      if (text.length > FOUNDRY_DOCAI_MAX_CHARS)
+        return {
+          file: file.name,
+          extracted: `${text.slice(0, FOUNDRY_DOCAI_MAX_CHARS)}… [truncated]`,
+          truncated: true,
+        };
       return { file: file.name, extracted: payload };
     },
   });
