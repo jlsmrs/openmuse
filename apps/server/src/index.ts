@@ -14,12 +14,24 @@ if (config.taskWorkerEnabled) agent.start();
 const server = serve({ fetch: app.fetch, port: config.port, hostname: config.host }, () =>
   console.log(`OpenMuse ${config.mode} API ready at ${config.publicUrl}`),
 );
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+let shuttingDown = false;
 const shutdown = () => {
+  if (shuttingDown) {
+    // Second signal: the first shutdown is stuck; force an exit now.
+    process.exit(1);
+  }
+  shuttingDown = true;
+  const force = setTimeout(() => process.exit(1), SHUTDOWN_TIMEOUT_MS);
   server.close(() => {
     void agent
       .stop()
       .then(() => db.close())
-      .then(() => process.exit(0));
+      .then(() => {
+        clearTimeout(force);
+        process.exit(0);
+      })
+      .catch(() => process.exit(1));
   });
 };
 process.on("SIGINT", shutdown);

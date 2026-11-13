@@ -463,3 +463,36 @@ test("health reports live database and worker reachability", async () => {
   const cached = await (await app.request("/api/health")).json();
   assert.deepEqual(cached, body);
 });
+
+// S-B4 item 7: the root endpoint reports the configured public URL, not a
+// hardcoded localhost address.
+test("the root endpoint reports the configured public URL", async () => {
+  const response = await app.request("/");
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), {
+    name: "OpenMuse",
+    app: "http://localhost:8787",
+    health: "/api/health",
+  });
+});
+
+// S-B4 item 15: PUT /api/conversation accepts an optional expectedMessages
+// guard — a matching expectation overwrites, a stale one is refused (409)
+// and the stored messages are left untouched.
+test("conversation writes are guarded by the caller's expected messages", async () => {
+  const messages = [{ id: "m1", role: "user", content: "hello" }];
+  const put = (body: unknown) =>
+    app.request("/api/conversation", {
+      method: "PUT",
+      headers: headers(),
+      body: JSON.stringify(body),
+    });
+  assert.equal((await put({ messages })).status, 200);
+  const next = [{ id: "m2", role: "user", content: "again" }];
+  assert.equal((await put({ messages: next, expectedMessages: messages })).status, 200);
+  const stale = await put({ messages, expectedMessages: messages });
+  assert.equal(stale.status, 409);
+  assert.match((await stale.json()).error, /Conversation changed/);
+  const stored = await db.get<{ messages: unknown[] }>("local-user", "conversations", "default");
+  assert.deepEqual(stored?.messages, next);
+});

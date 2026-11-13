@@ -99,7 +99,9 @@ test("the main Rich Thread survives reopening and concurrent initialization", as
   );
   const threads = await Promise.all(responses.map((response) => response.json()));
   assert.ok(threads.every((thread) => thread.threadId === threads[0].threadId));
-  assert.equal(threads[0].existing, true);
+  // S-B4 item 6: exactly one of the concurrent first calls creates the
+  // thread; the others find it already there.
+  assert.equal(threads.filter((thread) => !thread.existing).length, 1);
   const reopened = await (
     await server.app.request("/api/main-thread", { headers: headers() })
   ).json();

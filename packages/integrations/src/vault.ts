@@ -1,11 +1,16 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
 
-function decodeKey(key: string): Buffer {
+/** True when the key is a canonical 32-byte base64 string, as decodeKey requires. */
+export function isValidEncryptionKey(key: string): boolean {
   const bytes = Buffer.from(key, "base64");
-  if (bytes.length !== 32 || bytes.toString("base64") !== key) {
+  return bytes.length === 32 && bytes.toString("base64") === key;
+}
+
+function decodeKey(key: string): Buffer {
+  if (!isValidEncryptionKey(key)) {
     throw new Error("Credential encryption requires a 32-byte base64 key");
   }
-  return bytes;
+  return Buffer.from(key, "base64");
 }
 
 /** Versioned AES-256-GCM envelope: version.nonce.tag.ciphertext. */

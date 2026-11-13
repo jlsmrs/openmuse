@@ -17,6 +17,8 @@ interface Tokens {
   refreshToken?: string;
   expiresAt: number;
   scopes: string[];
+  /** True when Google's token response carried no scope field, so the stored scopes are not a confirmed grant. */
+  scopesUncertain?: boolean;
   account: string;
 }
 interface OAuthState {
@@ -97,7 +99,7 @@ export class GoogleAuth {
       }
     }
   }
-  async connect(owner: string, write: boolean) {
+  async connect(owner: string, write: boolean, options: { resetScopes?: boolean } = {}) {
     if (!this.configured())
       throw new AppError(
         "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and TOKEN_ENCRYPTION_KEY to connect Google",
@@ -107,12 +109,15 @@ export class GoogleAuth {
       verifier = randomBytes(48).toString("base64url");
     const { generation, previous } = await this.rotateGeneration(owner);
     const existing = this.decodeTokens(previous);
+    // Reconnecting unions previously granted scopes into the new request, so
+    // a scope can never be dropped by reconnecting. Pass resetScopes to start
+    // from the base set instead — the previously granted scopes are dropped.
     const scopes = Array.from(
       new Set([
         "https://www.googleapis.com/auth/gmail.readonly",
         "https://www.googleapis.com/auth/calendar.events.readonly",
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
-        ...(existing?.scopes ?? []),
+        ...(options.resetScopes ? [] : (existing?.scopes ?? [])),
         ...(write
           ? [
               "https://www.googleapis.com/auth/gmail.send",
@@ -174,6 +179,11 @@ export class GoogleAuth {
       throw new AppError("Google did not grant Gmail read access. Connect again.", 403);
     const { emailAddress } = z.object({ emailAddress: z.email() }).parse(await profile.json());
     const previous = await this.tokens(state.owner);
+    // Store only what Google returned: when the token response omits the
+    // scope field, the granted set is unknown, so store an empty list and
+    // mark the grant uncertain instead of falling back to the requested
+    // scopes (which would claim access Google may not have granted).
+    const returnedScopes = token.scope?.split(" ").filter(Boolean);
     await this.save(
       state.owner,
       {
@@ -183,7 +193,8 @@ export class GoogleAuth {
           token.refresh_token ??
           (previous?.account === emailAddress ? previous.refreshToken : undefined),
         expiresAt: Date.now() + token.expires_in * 1000,
-        scopes: token.scope?.split(" ") ?? state.scopes,
+        scopes: returnedScopes ?? [],
+        scopesUncertain: returnedScopes === undefined,
         account: emailAddress,
       },
       state.generation,
@@ -237,7 +248,11 @@ export class GoogleAuth {
     return token.access_token;
   }
   async disconnect(owner: string) {
-    const { previous } = await this.rotateGeneration(owner, true);
+    // Rotate the generation first so an in-flight sign-in cannot complete
+    // after this disconnect, but keep the credential until revocation has
+    // succeeded: clearing first would leave Google holding a grant we can
+    // no longer revoke, with no way to retry.
+    const { previous } = await this.rotateGeneration(owner);
     const tokens = this.decodeTokens(previous);
     if (tokens) {
       const response = await fetch("https://oauth2.googleapis.com/revoke", {
@@ -248,9 +263,11 @@ export class GoogleAuth {
       });
       if (!response.ok && response.status !== 400)
         throw new AppError(
-          "Disconnected locally. Google revocation failed; remove access in your Google account settings.",
+          "Google revocation failed; the connection was kept so you can try disconnecting again, or remove access in your Google account settings.",
           502,
         );
     }
+    // Revocation succeeded (or there was nothing to revoke): now clear locally.
+    await this.rotateGeneration(owner, true);
   }
 }

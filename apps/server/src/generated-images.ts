@@ -65,7 +65,15 @@ export class GeneratedImages {
       const ext = entry.name.split(".").pop()?.toLowerCase() ?? "";
       const mimeType = IMAGE_MIME[ext];
       if (!mimeType) continue;
-      const info = await stat(join(this.dir(), entry.name));
+      let info: { size: number; mtimeMs: number };
+      try {
+        info = await stat(join(this.dir(), entry.name));
+      } catch (error) {
+        // The file can be deleted between readdir and stat; skip it instead
+        // of failing the whole listing for one vanished entry.
+        if (error instanceof Error && "code" in error && error.code === "ENOENT") continue;
+        throw error;
+      }
       images.push({
         name: entry.name,
         size: info.size,

@@ -89,15 +89,14 @@ export async function createApp(
     if (error instanceof z.ZodError)
       return c.json({ error: error.issues.map((i) => i.message).join("; ") }, 422);
     if (error instanceof AppError) return c.json({ error: error.message }, error.status);
-    if (error.name === "PdfError" || error.name === "RecurringEventError")
-      return c.json({ error: error.message }, 422);
+    if (error.name === "RecurringEventError") return c.json({ error: error.message }, 422);
     if (error instanceof SyntaxError) return c.json({ error: "Invalid request data" }, 400);
     // Provider and document errors are useful, but raw stack traces and token-bearing responses are not.
     console.error(`[OpenMuse] ${error.name}`);
     return c.json(
       {
         error:
-          error.name === "PdfError" || error.name === "GoogleApiError"
+          error.name === "GoogleApiError"
             ? error.message
             : "Request failed. Check the server setup and try again.",
       },
@@ -266,7 +265,11 @@ export async function createApp(
   });
   app.get("/api/main-thread", async (c) => {
     const owner = c.get("owner");
-    await db.insertIfAbsent(owner, "conversation-settings", {
+    // insertIfAbsent returns the inserted row, or null when the thread
+    // already existed: that is the real `existing` flag. The row's stored
+    // `existing` field is always false (set at insert, never updated), so
+    // returning it would claim every thread is new.
+    const inserted = await db.insertIfAbsent(owner, "conversation-settings", {
       id: "main",
       threadId: randomUUID(),
       existing: false,
@@ -285,15 +288,33 @@ export async function createApp(
         502,
       );
     }
-    return c.json({ threadId: main.threadId, existing: true });
+    return c.json({ threadId: main.threadId, existing: inserted === null });
   });
   app.get("/api/conversation", async (c) =>
     c.json((await db.get(c.get("owner"), "conversations", "default")) ?? { messages: [] }),
   );
   app.put("/api/conversation", async (c) => {
     const body = await c.req.json();
-    const messages = z.array(z.unknown()).max(1000).parse(body.messages);
+    const { messages, expectedMessages } = z
+      .object({
+        messages: z.array(z.unknown()).max(1000),
+        // Optimistic concurrency for the shared conversation row: when the
+        // caller passes the messages it based its edit on, the write is
+        // refused (409) if another client has since changed them.
+        expectedMessages: z.array(z.unknown()).max(1000).optional(),
+      })
+      .parse(body);
     for (const message of messages) MessageSchema.parse(message);
+    if (expectedMessages !== undefined) {
+      const saved = await db.putIfMatches(
+        c.get("owner"),
+        "conversations",
+        { id: "default", messages },
+        { id: "default", messages: expectedMessages },
+      );
+      if (!saved) throw new AppError("Conversation changed; refresh and try again", 409);
+      return c.json({ ok: true });
+    }
     await db.put(c.get("owner"), "conversations", { id: "default", messages });
     return c.json({ ok: true });
   });
@@ -371,7 +392,9 @@ export async function createApp(
     return c.json(await workspace.importAttachment(c.get("owner"), body.reference), 201);
   });
   app.post("/api/google/connect", async (c) => {
-    const body = z.object({ capability: z.enum(["read", "write"]) }).parse(await c.req.json());
+    const body = z
+      .object({ capability: z.enum(["read", "write"]), resetScopes: z.boolean().optional() })
+      .parse(await c.req.json());
     if (config.mode === "sample") {
       await db.put(c.get("owner"), "settings", {
         id: "google",
@@ -380,7 +403,11 @@ export async function createApp(
       });
       return c.json({ url: null, connected: true });
     }
-    return c.json(await google.connect(c.get("owner"), body.capability === "write"));
+    return c.json(
+      await google.connect(c.get("owner"), body.capability === "write", {
+        resetScopes: body.resetScopes,
+      }),
+    );
   });
   app.post("/api/google/disconnect", async (c) => {
     if (config.mode === "sample")
@@ -449,8 +476,6 @@ export async function createApp(
     );
     return new Response(body, { status: response.status, headers: response.headers });
   });
-  app.get("/", (c) =>
-    c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
-  );
+  app.get("/", (c) => c.json({ name: "OpenMuse", app: config.publicUrl, health: "/api/health" }));
   return { app, auth, files, actions, workspace, agent, computer };
 }
