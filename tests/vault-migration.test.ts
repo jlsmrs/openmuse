@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdtemp, readdir, rm, symlink } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -240,6 +240,35 @@ test("the migration script migrates a throwaway store and backs it up first", as
     { env },
   );
   assert.match(again.stdout, /examined=2 migrated=0 already-v2=2 empty=0 failed=0/);
+});
+
+test("the migration script removes a partial backup and touches nothing when the backup fails", async (t) => {
+  const { dataDir, key } = await seedDataDir();
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  // A dangling symlink is an entry the permission-tolerant copy refuses
+  // (fail-loud, never silently lossy) — the backup must fail cleanly.
+  await symlink(join(dataDir, "postgres", "does-not-exist"), join(dataDir, "postgres", "dangling"));
+  const env = { ...process.env, TOKEN_ENCRYPTION_KEY: key };
+  await assert.rejects(
+    execFileAsync(
+      process.execPath,
+      [tsxBin, scriptPath, "--data-dir", dataDir, "--api-health-url", "http://127.0.0.1:1/health"],
+      { env },
+    ),
+    /backup failed/,
+  );
+  // No partial backup left behind (G4 left one on the live volume),
+  // and the v1 record is untouched — the store was never opened.
+  assert.equal(
+    (await readdir(dataDir)).filter((name) => name.startsWith("postgres-backup-")).length,
+    0,
+  );
+  const db = await createStore({ dataDir: join(dataDir, "postgres") });
+  const a = await db.get<CredentialRecord>("owner-a", "credentials", "google");
+  assert.equal(a?.secret?.startsWith("v1."), true);
+  // Close explicitly: the t.after rm(dataDir) below must not delete the
+  // directory out from under a still-open store.
+  await db.close();
 });
 
 test("the migration script refuses while the API answers healthy", async (t) => {
