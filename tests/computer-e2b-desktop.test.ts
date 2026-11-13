@@ -8,6 +8,7 @@ import { after, before, test } from "node:test";
 import { EventType } from "@ag-ui/core";
 import { defineTool } from "@copilotkit/runtime/v2";
 import { CommandExitError, InvalidArgumentError, TimeoutError } from "@e2b/desktop";
+import { Hono } from "hono";
 import { z } from "zod";
 import { ComputerService, computerIdentity } from "../apps/server/src/computer.ts";
 import {
@@ -21,10 +22,13 @@ import {
   E2BDesktopComputer,
   e2bDesktopDriver,
 } from "../apps/server/src/computer-e2b-desktop.ts";
+import { computerRoutes } from "../apps/server/src/computer-routes.ts";
 import { computerInstructions, computerTools } from "../apps/server/src/computer-tools.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { tanstackAgent } from "../apps/server/src/engine/tanstack-agent.ts";
+import { AppError } from "../apps/server/src/errors.ts";
+import type { Files } from "../apps/server/src/files.ts";
 import type { ComputerCommand } from "../packages/domain/src/computer.ts";
 import { config as base } from "./helpers/computer.ts";
 import { modelFixture } from "./helpers/model.ts";
@@ -1298,4 +1302,73 @@ test("desktop command cannot bypass an interrupted receipt after lease validatio
   } finally {
     db.get = originalGet;
   }
+});
+
+// M-B10 / audit M5: the POST /desktop/actions route must accept an
+// Idempotency-Key header and feed the receipt-dedup, so a retried click does
+// not land twice on a send, submit, sign-in or buy control.
+test("POST /desktop/actions dedups on Idempotency-Key and re-fires without one", async () => {
+  const f = fake({ boxes: [{}] });
+  const { computer, owner } = service(f);
+  // Mount the real route with the owner pre-authenticated, mirroring app.ts;
+  // Files is unused by the desktop-actions route.
+  const app = new Hono<{ Variables: { owner: string } }>();
+  app.use((c, next) => {
+    c.set("owner", owner);
+    return next();
+  });
+  app.onError((error, c) => {
+    if (error instanceof AppError) return c.json({ error: error.message }, error.status);
+    throw error;
+  });
+  app.route("/", computerRoutes(computer, {} as unknown as Files));
+  const post = async (action: Record<string, unknown>, key?: string) => {
+    const response = await app.request("/desktop/actions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(key === undefined ? {} : { "Idempotency-Key": key }),
+      },
+      body: JSON.stringify(action),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  const clicks = () => f.calls.setup.filter((call) => call.command.includes("click 1")).length;
+  const receipts = () => db.list<ComputerCommand>(owner, "computer-desktop-actions");
+  const action = { action: "left_click", coordinate: [640, 400] };
+
+  const first = await post(action, "route-key-1");
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.receipt.status, "succeeded");
+  assert.equal(clicks(), 1, "the first action dispatches once");
+  assert.equal((await receipts()).length, 1);
+
+  // Same key, same action: the first receipt comes back, no new input sent.
+  const repeat = await post(action, "route-key-1");
+  assert.equal(repeat.status, 200, JSON.stringify(repeat.body));
+  assert.equal(repeat.body.receipt.id, first.body.receipt.id);
+  assert.match(repeat.body.warning, /already has a receipt/);
+  assert.equal(clicks(), 1, "the repeat must not dispatch again");
+  assert.equal((await receipts()).length, 1);
+
+  // Same key, different action: the key already belongs to another action.
+  const conflict = await post({ action: "screenshot" }, "route-key-1");
+  assert.equal(conflict.status, 409);
+  assert.match(conflict.body.error, /different desktop action/);
+  assert.equal(clicks(), 1, "the conflict must not dispatch");
+
+  // A different key re-fires the same action and records a second receipt.
+  const second = await post(action, "route-key-2");
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.notEqual(second.body.receipt.id, first.body.receipt.id);
+  assert.equal(clicks(), 2);
+  assert.equal((await receipts()).length, 2);
+
+  // No key: no dedup, a third receipt for the same action.
+  const unkeyed = await post(action);
+  assert.equal(unkeyed.status, 200, JSON.stringify(unkeyed.body));
+  assert.notEqual(unkeyed.body.receipt.id, first.body.receipt.id);
+  assert.notEqual(unkeyed.body.receipt.id, second.body.receipt.id);
+  assert.equal(clicks(), 3);
+  assert.equal((await receipts()).length, 3);
 });
