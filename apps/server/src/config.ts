@@ -43,7 +43,12 @@ export interface Config {
   agentBackend: "sample" | "model" | "agui";
   agentUrl?: string;
   agentToken?: string;
-  intelligenceApiKey?: string;
+  /**
+   * CopilotKit Intelligence key. Always required: readConfig throws without
+   * it and every API mode needs it at startup (the runtime is built in
+   * createApp), so it is typed as required rather than optional.
+   */
+  intelligenceApiKey: string;
   googleClientId?: string;
   googleClientSecret?: string;
   googleRedirectUri: string;
@@ -77,21 +82,23 @@ export function required(name: string, message: string, value = process.env[name
   return value.trim();
 }
 
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
-  required(
-    "CPK_INTELLIGENCE_API_KEY",
-    intelligenceKeyRequiredMessage,
-    config.intelligenceApiKey ?? "",
-  );
-}
-
 /** Accept a full worker URL, or host:port from a platform that omits the scheme. */
 export function browserWorkerUrl(value?: string): string | undefined {
   const trimmed = value?.trim();
   if (!trimmed) return undefined;
-  return trimmed.includes("://") ? trimmed : `http://${trimmed}`;
+  if (trimmed.includes("://")) return trimmed;
+  // A bare host:port is silently upgraded to plain http below. That is fine
+  // for loopback development, but a non-loopback worker would then carry its
+  // token in cleartext — warn loudly so the missing scheme is a deliberate
+  // choice, not a silent default. The upgrade itself is kept: internal
+  // container-app workers are addressed by bare host:port in production.
+  const host = trimmed.split(":")[0]?.toLowerCase() ?? "";
+  if (host !== "localhost" && host !== "::1" && !host.startsWith("127."))
+    console.warn(
+      `[OpenMuse] BROWSER_WORKER_URL "${trimmed}" has no scheme; assuming http://${trimmed}. ` +
+        `Set an explicit scheme (e.g. https://...) for a non-loopback worker.`,
+    );
+  return `http://${trimmed}`;
 }
 
 // Provider SDKs retry transient failures before the response starts, with
