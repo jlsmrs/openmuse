@@ -51,18 +51,23 @@ services:
         sync: false
       # Delete these two entries, and the openmuse-browser service below, to
       # deploy without browsing. The API boots either way.
-      # API-to-worker transport (G3): Render provides no managed TLS for
-      # private-service traffic, and the worker serves plain HTTP only
-      # (apps/worker/src/server.ts uses node:http) — so this hop stays
-      # http:// on Render's workspace-scoped private network, by
-      # deliberate choice, not by omission. The worker token still
+      # API-to-worker transport (G3): literal HTTPS via a private CA. The
+      # worker serves TLS with a certificate from a private CA (see
+      # docs/RENDER-WORKER-TLS.md for the generation commands); the API
+      # verifies it with WORKER_TLS_CA below. Render provides no managed
+      # TLS for private-service traffic, so the TLS is the worker's own —
+      # the service stays private (pserv) and the hop never leaves
+      # Render's workspace-scoped private network. The worker token still
       # travels only as an Authorization: Bearer header, and the worker
-      # rejects every non-health request without it (application-layer
-      # authorization, per Render's own private-networking guidance).
-      # If the browser service is ever made public, switch this to its
-      # https RENDER_EXTERNAL_URL instead.
+      # rejects every non-health request without it.
       - key: BROWSER_WORKER_URL
-        value: http://openmuse-browser:8790
+        value: https://openmuse-browser:8790
+      # Private CA that signed the worker certificate (G3): paste the full
+      # ca.crt PEM here in the Render dashboard (sync: false — never put
+      # the value in this file). The API refuses an https worker URL
+      # without it, and verification is never disabled.
+      - key: WORKER_TLS_CA
+        sync: false
       - key: WORKER_TOKEN
         fromService:
           name: openmuse-browser
@@ -95,6 +100,16 @@ services:
       # session state, and temp files on the same disk.
       - key: WORKER_DOWNLOAD_QUOTA_BYTES
         value: "838860800"
+      # Worker TLS certificate + key (G3): paste the full worker.crt and
+      # worker.key PEMs here in the Render dashboard (sync: false — never
+      # put the values in this file). Generated once from the private CA;
+      # see docs/RENDER-WORKER-TLS.md. Both must be set together — the
+      # worker fails fast if only one is present. The cert SAN must be
+      # openmuse-browser, the hostname the API connects to.
+      - key: WORKER_TLS_CERT
+        sync: false
+      - key: WORKER_TLS_KEY
+        sync: false
 
   - type: web
     name: openmuse-web
