@@ -1372,3 +1372,76 @@ test("POST /desktop/actions dedups on Idempotency-Key and re-fires without one",
   assert.equal(clicks(), 3);
   assert.equal((await receipts()).length, 3);
 });
+
+// M-B11 / audit M6: the POST /commands route must accept an Idempotency-Key
+// header and feed the receipt-dedup, so a retried terminal command does not
+// run twice — its side effects (writes, installs, sends) would otherwise be
+// duplicated silently.
+test("POST /commands dedups on Idempotency-Key and re-runs without one", async () => {
+  const f = fake({ boxes: [{}] });
+  const { computer, owner } = service(f);
+  // Mount the real route with the owner pre-authenticated, mirroring app.ts;
+  // Files is unused by the commands route.
+  const app = new Hono<{ Variables: { owner: string } }>();
+  app.use((c, next) => {
+    c.set("owner", owner);
+    return next();
+  });
+  app.onError((error, c) => {
+    if (error instanceof AppError) return c.json({ error: error.message }, error.status);
+    throw error;
+  });
+  app.route("/", computerRoutes(computer, {} as unknown as Files));
+  const post = async (command: Record<string, unknown>, key?: string) => {
+    const response = await app.request("/commands", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(key === undefined ? {} : { "Idempotency-Key": key }),
+      },
+      body: JSON.stringify(command),
+    });
+    return { status: response.status, body: await response.json() };
+  };
+  // The backend wraps the command in the desktopCommand watchdog script
+  // before dispatch, so count runs of the wrapped command, not the raw text.
+  const runs = () => f.calls.run.filter((call) => call.command === desktopCommand("pwd")).length;
+  // The desktop backend stores command receipts under
+  // "computer-desktop-commands" (the Docker backend uses "computer-commands").
+  const receipts = () => db.list<ComputerCommand>(owner, "computer-desktop-commands");
+  const command = { command: "pwd" };
+
+  const first = await post(command, "route-key-1");
+  assert.equal(first.status, 200, JSON.stringify(first.body));
+  assert.equal(first.body.status, "succeeded");
+  assert.equal(runs(), 1, "the first command runs once");
+  assert.equal((await receipts()).length, 1);
+
+  // Same key, same command: the first receipt comes back, no re-execution.
+  const repeat = await post(command, "route-key-1");
+  assert.equal(repeat.status, 200, JSON.stringify(repeat.body));
+  assert.equal(repeat.body.id, first.body.id);
+  assert.equal(runs(), 1, "the repeat must not run again");
+  assert.equal((await receipts()).length, 1);
+
+  // Same key, different command: the key already belongs to another command.
+  const conflict = await post({ command: "whoami" }, "route-key-1");
+  assert.equal(conflict.status, 409);
+  assert.match(conflict.body.error, /different command/);
+  assert.equal(runs(), 1, "the conflict must not run");
+
+  // A different key re-runs the same command and records a second receipt.
+  const second = await post(command, "route-key-2");
+  assert.equal(second.status, 200, JSON.stringify(second.body));
+  assert.notEqual(second.body.id, first.body.id);
+  assert.equal(runs(), 2);
+  assert.equal((await receipts()).length, 2);
+
+  // No key: no dedup, a third receipt for the same command.
+  const unkeyed = await post(command);
+  assert.equal(unkeyed.status, 200, JSON.stringify(unkeyed.body));
+  assert.notEqual(unkeyed.body.id, first.body.id);
+  assert.notEqual(unkeyed.body.id, second.body.id);
+  assert.equal(runs(), 3);
+  assert.equal((await receipts()).length, 3);
+});
