@@ -158,27 +158,37 @@ export class ActionService {
       if (!current) throw new AppError("Action not found", 404);
       return current;
     }
-    await this.record(
-      owner,
-      claimed,
-      decision === "deny" ? "Declined; no changes made" : "Approved; execution started",
-    );
-    if (decision === "deny") return claimed;
-    if (claimed.taskId) {
-      const task = await this.db.get<{ status: string }>(owner, "tasks", claimed.taskId);
-      if (!task || !["running", "waiting_approval"].includes(task.status)) {
-        await this.db.compareAndSwap<ActionProposal>(
-          owner,
-          "actions",
-          id,
-          { status: "executing" },
-          { status: "awaiting_review" },
-        );
-        throw new AppError(
-          "Resume the task before approving this action. Cancelled tasks cannot execute.",
-          409,
-        );
+    try {
+      await this.record(
+        owner,
+        claimed,
+        decision === "deny" ? "Declined; no changes made" : "Approved; execution started",
+      );
+      if (decision === "deny") return claimed;
+      if (claimed.taskId) {
+        const task = await this.db.get<{ status: string }>(owner, "tasks", claimed.taskId);
+        if (!task || !["running", "waiting_approval"].includes(task.status)) {
+          await this.db.compareAndSwap<ActionProposal>(
+            owner,
+            "actions",
+            id,
+            { status: "executing" },
+            { status: "awaiting_review" },
+          );
+          throw new AppError(
+            "Resume the task before approving this action. Cancelled tasks cannot execute.",
+            409,
+          );
+        }
       }
+    } catch (error) {
+      // A failure after the claim (record step or task lookup) must not
+      // strand the proposal in `executing`: decide() early-returns any
+      // non-`awaiting_review` proposal, and the worker skips `executing`
+      // tasks, so the task would block permanently and silently. Return
+      // it to `awaiting_review` so it can be decided again.
+      await this.resetStuckClaim(owner, id);
+      throw error;
     }
     let finished: ActionProposal;
     try {
@@ -204,6 +214,28 @@ export class ActionService {
     await this.db.put(owner, "actions", finished);
     await this.record(owner, finished, finished.result ?? finished.error ?? finished.status);
     return finished;
+  }
+  /**
+   * Best-effort: return a still-`executing` proposal to `awaiting_review`.
+   * The swap only applies while the row is still `executing`, so a
+   * proposal that already reached a terminal state (`denied`,
+   * `succeeded`, `failed`, `outcome_unknown`) — or one the task-cancel
+   * path already reset — is untouched. Never throws: if the reset itself
+   * fails, the original error still propagates, and startup recovery
+   * surfaces any row left in `executing` as `outcome_unknown`.
+   */
+  private async resetStuckClaim(owner: string, id: string): Promise<void> {
+    try {
+      await this.db.compareAndSwap<ActionProposal>(
+        owner,
+        "actions",
+        id,
+        { status: "executing" },
+        { status: "awaiting_review" },
+      );
+    } catch {
+      // Best effort only; see above.
+    }
   }
   private async record(owner: string, action: ActionProposal, detail: string) {
     await this.db.put(owner, "activity", {
