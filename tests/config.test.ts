@@ -1,33 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  assertApiDeploymentConfig,
   browserWorkerUrl,
-  type Config,
   MAX_STANDING_INSTRUCTIONS_CHARS,
   readConfig,
   shadowedEnvKeys,
 } from "../apps/server/src/config.ts";
-
-const sampleConfig: Config = {
-  mode: "sample",
-  port: 8787,
-  host: "127.0.0.1",
-  publicUrl: "http://localhost:8787",
-  dataDir: ".openmuse",
-  agentBackend: "sample",
-  googleRedirectUri: "http://localhost:8787/api/google/callback",
-  allowedOrigins: ["http://localhost:8081"],
-};
-
-function liveConfig(intelligenceApiKey?: string): Config {
-  return {
-    ...sampleConfig,
-    mode: "live",
-    agentBackend: "model",
-    intelligenceApiKey,
-  };
-}
 
 const missingKeyMessage =
   "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
@@ -35,22 +13,39 @@ const missingKeyMessage =
   "then set the generated server-only key. " +
   "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
 
-test("every API mode rejects a missing or blank Intelligence key", () => {
-  for (const mode of [sampleConfig, liveConfig()]) {
-    for (const key of [undefined, "", " \t\n"]) {
-      assert.throws(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }), {
-        name: "Error",
-        message: missingKeyMessage,
-      });
-    }
+// S-B3: the Intelligence key is always required — readConfig enforces it in
+// every mode, and the Config type says so (the old deferred assertion is
+// gone; the requirement lives in one place now).
+test("every mode rejects a missing or blank Intelligence key at startup", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  for (const key of [undefined, "", " \t\n"]) {
+    if (key === undefined) delete process.env.CPK_INTELLIGENCE_API_KEY;
+    else process.env.CPK_INTELLIGENCE_API_KEY = key;
+    assert.throws(() => readConfig(), { name: "Error", message: missingKeyMessage });
   }
 });
 
-test("every API mode accepts a non-empty Intelligence key", () => {
-  for (const mode of [sampleConfig, liveConfig()]) {
-    assert.doesNotThrow(() =>
-      assertApiDeploymentConfig({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
-    );
+test("every mode accepts a non-empty Intelligence key at startup", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  for (const mode of ["sample", "live"]) {
+    process.env.WORKSPACE_MODE = mode;
+    process.env.AGENT_BACKEND = mode === "live" ? "model" : "sample";
+    process.env.HOST = "127.0.0.1";
+    process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+    if (mode === "live") {
+      process.env.OPENMUSE_ACCESS_KEY = "test-access-key-24-chars!!";
+      process.env.TOKEN_ENCRYPTION_KEY = Buffer.alloc(32).toString("base64");
+    }
+    assert.equal(readConfig().intelligenceApiKey, "test-project-key-never-sent");
   }
 });
 
@@ -101,12 +96,26 @@ test("Jev mode is off by default and validates explicit modes", async () => {
   }
 });
 
-test("browser worker URL keeps an existing scheme and adds http to host:port", () => {
+test("browser worker URL keeps an existing scheme and adds http to host:port", (t) => {
   assert.equal(browserWorkerUrl(undefined), undefined);
   assert.equal(browserWorkerUrl("  "), undefined);
   assert.equal(browserWorkerUrl("http://127.0.0.1:8790"), "http://127.0.0.1:8790");
   assert.equal(browserWorkerUrl("https://browser.internal:8790"), "https://browser.internal:8790");
+  // A bare non-loopback host:port still upgrades to http (internal workers
+  // are addressed that way), but it must warn loudly instead of silently.
+  const warnings: unknown[][] = [];
+  t.mock.method(console, "warn", (...args: unknown[]) => {
+    warnings.push(args);
+  });
   assert.equal(browserWorkerUrl("openmuse-browser-h4fx:8790"), "http://openmuse-browser-h4fx:8790");
+  assert.equal(warnings.length, 1);
+  assert.match(
+    String(warnings[0][0]),
+    /BROWSER_WORKER_URL "openmuse-browser-h4fx:8790" has no scheme/,
+  );
+  warnings.length = 0;
+  assert.equal(browserWorkerUrl("127.0.0.1:8790"), "http://127.0.0.1:8790");
+  assert.equal(warnings.length, 0, "loopback upgrades stay quiet");
 });
 
 test("environment variables that override a different .env value are reported by name", () => {

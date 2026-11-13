@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { link, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
 import type { Artifact } from "../../../packages/domain/src/index.ts";
 import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integrations/src/pdf.ts";
@@ -68,10 +68,85 @@ export function extensionOf(name: string): string {
   return match ? match[1].toLowerCase() : "";
 }
 
+/** Every MIME type the workspace recognises by extension. */
+const KNOWN_MIME_TYPES = new Set(Object.values(MIME_BY_EXTENSION));
+
 export function mimeTypeForFile(name: string, provided?: string): string {
   const clean = (provided ?? "").split(";")[0].trim().toLowerCase();
-  if (clean && clean !== "application/octet-stream") return clean;
-  return MIME_BY_EXTENSION[extensionOf(name)] ?? "application/octet-stream";
+  const byExtension = MIME_BY_EXTENSION[extensionOf(name)] ?? "application/octet-stream";
+  // A caller-supplied type is a claim, not evidence: accept it only when it
+  // agrees with the extension, or when the extension says nothing and the
+  // claim is a type the workspace recognises. A mismatched claim (e.g. HTML
+  // bytes uploaded as "text/plain", or a PDF claimed as an image) never
+  // becomes the stored type.
+  if (clean && clean !== "application/octet-stream") {
+    if (clean === byExtension) return clean;
+    if (byExtension === "application/octet-stream" && KNOWN_MIME_TYPES.has(clean)) return clean;
+  }
+  return byExtension;
+}
+
+function startsWith(bytes: Uint8Array, prefix: number[] | string): boolean {
+  if (typeof prefix === "string") {
+    if (bytes.length < prefix.length) return false;
+    for (let i = 0; i < prefix.length; i++) if (bytes[i] !== prefix.charCodeAt(i)) return false;
+    return true;
+  }
+  if (bytes.length < prefix.length) return false;
+  for (let i = 0; i < prefix.length; i++) if (bytes[i] !== prefix[i]) return false;
+  return true;
+}
+
+/**
+ * Identify a file's type from its bytes, not from what the uploader claimed.
+ * Returns undefined when the bytes match no known signature; the caller then
+ * falls back to the extension-derived type. ZIP is deliberately included:
+ * office documents are ZIP containers, so the caller keeps the extension
+ * type when the sniffed type is ZIP and the extension names an office
+ * document — a real ZIP stays application/zip.
+ */
+export function sniffMimeType(bytes: Uint8Array): string | undefined {
+  if (startsWith(bytes, [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+  if (startsWith(bytes, [0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (startsWith(bytes, "GIF87a") || startsWith(bytes, "GIF89a")) return "image/gif";
+  if (startsWith(bytes, "%PDF-")) return "application/pdf";
+  if (
+    startsWith(bytes, "RIFF") &&
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.subarray(8, 12)) === "WEBP"
+  )
+    return "image/webp";
+  if (
+    startsWith(bytes, "RIFF") &&
+    bytes.length >= 12 &&
+    String.fromCharCode(...bytes.subarray(8, 12)) === "WAVE"
+  )
+    return "audio/wav";
+  if (startsWith(bytes, [0x49, 0x49, 0x2a, 0x00]) || startsWith(bytes, [0x4d, 0x4d, 0x00, 0x2a]))
+    return "image/tiff";
+  if (startsWith(bytes, "BM")) return "image/bmp";
+  if (startsWith(bytes, [0x50, 0x4b, 0x03, 0x04]) || startsWith(bytes, [0x50, 0x4b, 0x05, 0x06]))
+    return "application/zip";
+  if (startsWith(bytes, [0x1f, 0x8b])) return "application/gzip";
+  if (startsWith(bytes, "ID3")) return "audio/mpeg";
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0xff &&
+    (bytes[1] & 0xe0) === 0xe0 &&
+    ((bytes[1] >> 1) & 0x3) !== 0
+  )
+    return "audio/mpeg";
+  if (bytes.length >= 8 && String.fromCharCode(...bytes.subarray(4, 8)) === "ftyp")
+    return "video/mp4";
+  // Text that opens with an HTML or SVG tag is active content, whatever the
+  // filename or the claimed type says.
+  const text = new TextDecoder("utf-8", { fatal: false })
+    .decode(bytes.subarray(0, 512))
+    .replace(/^\uFEFF/, "")
+    .trimStart();
+  if (/^<!doctype html|^<html[\s>]/i.test(text)) return "text/html";
+  if (/^<svg[\s>]/i.test(text)) return "image/svg+xml";
+  return undefined;
 }
 
 // Formats Charlie can actually read as text in chat (via read_workspace_file).
@@ -129,6 +204,40 @@ export class Files {
     private readonly config: Config,
     private readonly auth: Auth,
   ) {}
+  private async bytesExist(id: string, name: string): Promise<boolean> {
+    try {
+      await stat(this.pathFor(id, name));
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  /**
+   * The stored type follows the bytes: a sniffed signature wins, except a
+   * ZIP sniff on an office extension stays the office type (docx/xlsx/pptx
+   * are ZIP containers). With no sniffed signature the extension-derived
+   * type wins over the caller-supplied claim.
+   */
+  private mimeTypeForImport(name: string, provided: string | undefined, bytes: Uint8Array): string {
+    const sniffed = sniffMimeType(bytes);
+    if (sniffed) {
+      const byExtension = MIME_BY_EXTENSION[extensionOf(name)];
+      if (
+        sniffed === "application/zip" &&
+        (byExtension ===
+          "application/vnd.openxmlformats-officedocument.wordprocessingml.document" ||
+          byExtension === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+          byExtension ===
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation")
+      )
+        return byExtension;
+      return sniffed;
+    }
+    return mimeTypeForFile(name, provided);
+  }
+
   async import(
     owner: string,
     name: string,
@@ -141,11 +250,16 @@ export class Files {
     const id = operationKey === undefined ? randomUUID() : deterministicFileId(owner, operationKey);
     if (operationKey !== undefined) {
       const existing = await this.db.get<Artifact>(owner, "files", id);
-      if (existing) return this.signed(owner, existing);
+      if (existing) {
+        // The row can outlive its bytes (data dir wiped, restored from a
+        // backup, moved): verify the bytes are still on disk before
+        // returning the row, and re-import when they are gone.
+        if (await this.bytesExist(id, existing.name)) return this.signed(owner, existing);
+      }
     }
     if (bytes.length > MAX_FILE_BYTES) throw new AppError("Files must be 10 MB or smaller", 413);
     const safeName = sanitizeFileName(name);
-    const mime = mimeTypeForFile(safeName, mimeType);
+    const mime = this.mimeTypeForImport(safeName, mimeType, bytes);
     const isPdf = mime === "application/pdf";
     // PDFs keep the existing inspection (page count + form fields). Every
     // other type is accepted as-is: pageCount 0, no fields, stored under its

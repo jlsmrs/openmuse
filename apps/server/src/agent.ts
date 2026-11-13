@@ -13,17 +13,21 @@ import type { AgentService } from "./engine/service.ts";
 import { createJevAdapter, type JevAdapter } from "./jev/adapter.ts";
 
 export function agentConfigured(config: Config) {
-  return (
-    config.agentBackend === "sample" ||
-    (config.agentBackend === "agui"
-      ? Boolean(config.agentUrl)
-      : Boolean(
-          config.model &&
-            (process.env.OPENAI_API_KEY ||
-              process.env.ANTHROPIC_API_KEY ||
-              process.env.GOOGLE_API_KEY),
-        ))
-  );
+  if (config.agentBackend === "sample") return true;
+  if (config.agentBackend === "agui") return Boolean(config.agentUrl);
+  // The model string is "provider/model-id" (see the adapter in
+  // engine/tanstack-agent.ts): the gate needs the key for THAT provider, not
+  // just any provider key. An unset or unparseable model is not configured.
+  const provider = config.model?.trim().split(/[/:]/)[0]?.toLowerCase();
+  const keyName =
+    provider === "openai"
+      ? "OPENAI_API_KEY"
+      : provider === "anthropic"
+        ? "ANTHROPIC_API_KEY"
+        : provider === "google" || provider === "gemini" || provider === "google-gemini"
+          ? "GOOGLE_API_KEY"
+          : undefined;
+  return Boolean(keyName && process.env[keyName]?.trim());
 }
 
 /** The agui backend needs a real endpoint; the old dead-local-port fallback failed obscurely. */

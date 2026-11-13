@@ -82,12 +82,31 @@ export function resolveClientKey(input: {
 // getConnInfo reads the raw Node socket, which only exists behind a real
 // @hono/node-server listener; in-memory `app.request()` calls (as used in
 // tests) have no socket, so this must degrade rather than throw.
-function connectionAddress(c: Context): string | undefined {
+export function connectionAddress(c: Context): string | undefined {
   try {
     return getConnInfo(c).remote.address;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * Sign-in throttle with two independent buckets, so one bad actor cannot
+ * lock every sign-in out (the old single global counter did exactly that):
+ * one bucket per client address and one per account (hashed access key).
+ * Both buckets share the same window and limit; an attempt counts against
+ * both. The account key is a hash, never the raw key.
+ */
+export function createLoginThrottle(options: { windowMs?: number; maxAttempts?: number } = {}) {
+  const windowMs = options.windowMs ?? 60_000;
+  const maxAttempts = options.maxAttempts ?? 30;
+  const ipLimits = createRateLimitStore({ windowMs, maxRequests: maxAttempts });
+  const accountLimits = createRateLimitStore({ windowMs, maxRequests: maxAttempts });
+  return {
+    check(ipKey: string, accountKey: string, now = Date.now()): boolean {
+      return ipLimits.take(ipKey, now) && accountLimits.take(accountKey, now);
+    },
+  };
 }
 
 export function rateLimit(

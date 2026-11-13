@@ -1,5 +1,5 @@
 import "./config.ts";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { MessageSchema } from "@ag-ui/core";
 import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
 import { Hono } from "hono";
@@ -18,7 +18,7 @@ import { createAuth } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
 import { ComputerService, type DockerRunner, resolveComputerDeployment } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
-import { assertApiDeploymentConfig, type Config } from "./config.ts";
+import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
@@ -26,7 +26,12 @@ import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GeneratedImages } from "./generated-images.ts";
 import { GoogleAuth } from "./google-auth.ts";
-import { rateLimit } from "./rate-limit.ts";
+import {
+  connectionAddress,
+  createLoginThrottle,
+  rateLimit,
+  resolveClientKey,
+} from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -34,7 +39,6 @@ export async function createApp(
   config: Config,
   options: { docker?: DockerRunner } = {},
 ) {
-  assertApiDeploymentConfig(config);
   await resolveComputerDeployment(config);
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
@@ -134,16 +138,24 @@ export async function createApp(
     }
     return c.json(healthCache.body);
   });
-  let loginWindow = 0,
-    loginAttempts = 0;
+  // Sign-in throttle: per-client-address and per-account buckets, so one
+  // bad actor hammering sign-in cannot lock every sign-in out the way the
+  // old single global counter did. The account bucket is keyed by a hash of
+  // the supplied key, never the key itself.
+  const loginThrottle = createLoginThrottle();
   app.post("/api/session", async (c) => {
-    if (Date.now() - loginWindow > 60000) {
-      loginWindow = Date.now();
-      loginAttempts = 0;
-    }
-    if (++loginAttempts > 30)
-      throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const body = z.object({ accessKey: z.string().optional() }).parse(await c.req.json());
+    const ipKey = resolveClientKey({
+      trustProxy: Boolean(config.trustProxy),
+      forwardedFor: c.req.header("x-forwarded-for"),
+      realIp: c.req.header("x-real-ip"),
+      connectionAddress: connectionAddress(c),
+    });
+    const accountKey = `account:${createHash("sha256")
+      .update(body.accessKey ?? "")
+      .digest("hex")}`;
+    if (!loginThrottle.check(ipKey, accountKey))
+      throw new AppError("Too many sign-in attempts. Try again in a minute.", 429);
     const session = await auth.session(body.accessKey);
     await workspace.ensureSample("local-user", actions);
     await agent.ensure("local-user");
@@ -290,6 +302,11 @@ export async function createApp(
   app.get("/api/generated-images/:name/content", async (c) => {
     const { bytes, mimeType } = await generatedImages.bytes(c.req.param("name"));
     c.header("Content-Type", mimeType);
+    // Stored bytes are served from the API origin: sandbox them so an
+    // uploaded HTML/SVG can never execute here, and never let the browser
+    // sniff the type into something executable.
+    c.header("Content-Security-Policy", "sandbox");
+    c.header("X-Content-Type-Options", "nosniff");
     c.header(
       "Content-Disposition",
       `inline; filename*=UTF-8''${encodeURIComponent(c.req.param("name"))}`,
@@ -335,6 +352,11 @@ export async function createApp(
   app.get("/api/files/:id/content", async (c) => {
     const file = await files.get(c.get("owner"), c.req.param("id"));
     c.header("Content-Type", file.mimeType || "application/octet-stream");
+    // Stored bytes are served from the API origin: sandbox them so an
+    // uploaded HTML/SVG can never execute here, and never let the browser
+    // sniff the type into something executable.
+    c.header("Content-Security-Policy", "sandbox");
+    c.header("X-Content-Type-Options", "nosniff");
     c.header("Content-Disposition", `inline; filename*=UTF-8''${encodeURIComponent(file.name)}`);
     return c.body(await files.bytes(c.get("owner"), file.id));
   });

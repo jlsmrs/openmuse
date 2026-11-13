@@ -220,6 +220,10 @@ export class GoogleAuth {
     const refreshed = {
       ...tokens,
       accessToken: token.access_token,
+      // Google rotates the refresh token on some refreshes: keep the new one
+      // when the provider returns it, or the next refresh would reuse the
+      // revoked old token and the session would die.
+      refreshToken: token.refresh_token ?? tokens.refreshToken,
       expiresAt: Date.now() + token.expires_in * 1000,
     };
     if (!this.config.encryptionKey) throw new AppError("Token encryption is not configured", 503);
