@@ -72,6 +72,11 @@ export interface Config {
   googleRedirectUri: string;
   workerUrl?: string;
   workerToken?: string;
+  /**
+   * PEM of the private CA that signed the worker certificate (G3).
+   * Required when workerUrl is https; unused for plain-http workers.
+   */
+  workerTlsCa?: string;
   taskWorkerEnabled?: boolean;
   webSearchEnabled?: boolean;
   computerEnabled?: boolean;
@@ -190,6 +195,7 @@ export function readConfig(): Config {
     googleRedirectUri: `${publicUrl.replace(/\/+$/, "")}/api/google/callback`,
     workerUrl: browserWorkerUrl(process.env.BROWSER_WORKER_URL),
     workerToken: process.env.WORKER_TOKEN,
+    workerTlsCa: process.env.WORKER_TLS_CA?.trim() || undefined,
     taskWorkerEnabled: process.env.TASK_WORKER_ENABLED !== "false",
     webSearchEnabled: process.env.WEB_SEARCH_ENABLED !== "false",
     computerEnabled: process.env.COMPUTER_ENABLED === "true",
@@ -207,6 +213,13 @@ export function readConfig(): Config {
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
   };
+  // G3: an https worker URL without the private CA can never verify, so
+  // fail fast at startup instead of failing every worker call at runtime.
+  if (config.workerUrl?.startsWith("https://") && !config.workerTlsCa)
+    throw new Error(
+      "BROWSER_WORKER_URL is https but WORKER_TLS_CA is not set. Set WORKER_TLS_CA to the PEM " +
+        "of the private CA that signed the worker certificate (see docs/RENDER-WORKER-TLS.md).",
+    );
   if (
     mode === "live" &&
     (!config.accessKey ||

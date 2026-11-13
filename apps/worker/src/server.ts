@@ -1,6 +1,8 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { statfs } from "node:fs/promises";
-import { createServer, type IncomingMessage } from "node:http";
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer as createHttpsServer } from "node:https";
+import { createSecureContext } from "node:tls";
 import { createBrowserManager, validateSessionId } from "./browser.ts";
 import { WorkerError } from "./errors.ts";
 
@@ -38,14 +40,31 @@ export async function createWorkerServer(
     maxSessions?: number;
     idleTimeoutMs?: number;
     downloadQuotaBytes?: number;
+    /**
+     * TLS material (PEM) for the worker's own certificate (G3). When set,
+     * the worker serves HTTPS; when absent it serves plain HTTP exactly as
+     * before. The live Azure worker has no certs and stays plain HTTP on
+     * its internal network. The certificate is pre-generated from a
+     * private CA (see docs/RENDER-WORKER-TLS.md) — never generated here.
+     */
+    tls?: { cert: string; key: string };
   },
   createBrowser = createBrowserManager,
 ) {
   if (options.token.length < 32)
     throw new Error("WORKER_TOKEN must contain at least 32 characters.");
+  if (options.tls) {
+    try {
+      createSecureContext(options.tls);
+    } catch {
+      throw new Error(
+        "WORKER_TLS_CERT and WORKER_TLS_KEY must be a matching certificate/key pair in PEM format.",
+      );
+    }
+  }
   const tokenHash = createHash("sha256").update(`Bearer ${options.token}`).digest();
   const browser = await createBrowser(options);
-  const server = createServer(async (request, response) => {
+  const handler = async (request: IncomingMessage, response: ServerResponse) => {
     response.setHeader("cache-control", "no-store");
     response.setHeader("x-content-type-options", "nosniff");
     const json = (status: number, body: unknown) => {
@@ -148,7 +167,10 @@ export async function createWorkerServer(
         json(safe.status, { error: { code: safe.code, message: safe.message } });
       else response.end();
     }
-  });
+  };
+  // TLS is env-gated (G3): with a certificate the worker serves HTTPS,
+  // without one it serves plain HTTP exactly as before.
+  const server = options.tls ? createHttpsServer(options.tls, handler) : createServer(handler);
   // One POST /sessions request can chain a context launch (25 s timeout)
   // and an initial navigation (20 s goto) plus validation — 45 s+ on a
   // slow first launch. A 30 s request timeout drops the client connection
