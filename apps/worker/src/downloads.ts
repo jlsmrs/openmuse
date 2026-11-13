@@ -74,33 +74,39 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
   for (const name of await readdir(folder)) {
     if (!name.endsWith(".json")) continue;
     const path = join(folder, name);
+    let outcome: Outcome;
     try {
-      const outcome = parseOutcome(await readFile(path, "utf8"));
-      if (outcome.status === "pending" && recoverInterrupted) {
-        const metadata = await stat(join(directory, "downloads", `${outcome.id}.json`)).catch(
-          (error: unknown) => {
-            if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-            throw error;
-          },
-        );
-        if (metadata) {
-          await rm(path, { force: true });
-          continue;
-        }
-        // Clear unpublished files first so an incomplete cleanup can be retried.
-        await rm(join(directory, "downloads", `${outcome.id}.pdf`), { force: true });
-        await rm(join(directory, "downloads", `${outcome.id}.json.tmp`), { force: true });
-        outcome.status = "failed";
-        await persist(path, outcome);
-      }
-      if (outcome.status === "failed") {
-        const { status: _status, ...failure } = outcome;
-        failures.push(failure);
-      }
+      outcome = parseOutcome(await readFile(path, "utf8"));
     } catch {
       // One corrupt bookkeeping file must not fail the whole read (or
       // worker startup): move it aside and keep the healthy outcomes.
+      // Only the read+parse is guarded here: a failure in the recovery
+      // steps below (inspecting metadata, clearing unpublished files,
+      // recording the failure) must reject instead, so the journal stays
+      // pending and the next recovery can retry the cleanup.
       await quarantineFile(path);
+      continue;
+    }
+    if (outcome.status === "pending" && recoverInterrupted) {
+      const metadata = await stat(join(directory, "downloads", `${outcome.id}.json`)).catch(
+        (error: unknown) => {
+          if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+          throw error;
+        },
+      );
+      if (metadata) {
+        await rm(path, { force: true });
+        continue;
+      }
+      // Clear unpublished files first so an incomplete cleanup can be retried.
+      await rm(join(directory, "downloads", `${outcome.id}.pdf`), { force: true });
+      await rm(join(directory, "downloads", `${outcome.id}.json.tmp`), { force: true });
+      outcome.status = "failed";
+      await persist(path, outcome);
+    }
+    if (outcome.status === "failed") {
+      const { status: _status, ...failure } = outcome;
+      failures.push(failure);
     }
   }
   return failures.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
