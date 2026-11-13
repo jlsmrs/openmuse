@@ -45,10 +45,6 @@ if (envPath) {
           : "Unset them to use the .env values."),
     );
 }
-// Capture the full setup/activation funnel while preserving explicit SDK opt-outs
-// and any deployment-specific sampling rate. Config loads before runtime imports.
-process.env.COPILOTKIT_TELEMETRY_SAMPLE_RATE ??= "1";
-
 export interface Config {
   mode: "sample" | "live";
   port: number;

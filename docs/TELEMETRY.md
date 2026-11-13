@@ -31,9 +31,10 @@ tracking commit; adding it to the Blueprint does not populate an existing servic
 
 The SDK sends existing runtime events to
 `https://telemetry.copilotkit.ai/ingest`. OpenMuse adds
-`accessibility_title: "OpenMuse"` and defaults
-`COPILOTKIT_TELEMETRY_SAMPLE_RATE` to `1` so setup and usage events are not
-randomly sampled away. It respects an explicit sampling override.
+`accessibility_title: "OpenMuse"`. When `COPILOTKIT_TELEMETRY_SAMPLE_RATE`
+is unset the SDK samples at its 0.05 default, so most runtime events are
+sampled away; set the variable explicitly (for example `1`) to capture
+every event.
 
 Remove old deployment settings that disable telemetry if tracking is desired.
 To opt out, set either `COPILOTKIT_TELEMETRY_DISABLED=true` or `DO_NOT_TRACK=1`
@@ -60,7 +61,9 @@ OpenMuse does not emit a duplicate signup event on startup, login or key entry.
 
 ## Validate in PostHog
 
-After deploying, restart the API and make one chat request. In
+After deploying, restart the API and make one chat request. With the
+default 0.05 sampling rate a single request usually produces no event —
+set `COPILOTKIT_TELEMETRY_SAMPLE_RATE=1` on the API for validation. In
 [PostHog project 26816](https://eu.posthog.com/project/26816), run:
 
 ```sql
@@ -110,7 +113,8 @@ reporting surface is [dashboard 664553](https://eu.posthog.com/project/26816/das
 
 `pnpm test` disables production telemetry for ordinary fixtures. The telemetry
 tests start fresh processes, intercept SDK fetch calls before importing it,
-and check the OpenMuse tag, CLI-issued identity header, full sampling, explicit
-sampling override, both opt-outs and absence of the project key in the payload.
+and check the OpenMuse tag, CLI-issued identity header, the SDK default
+sampling rate when unset, explicit sampling override, both opt-outs and
+absence of the project key in the payload.
 These checks prove the local SDK contract; production delivery and identity
 resolution require the PostHog checks above.
