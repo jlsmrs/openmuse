@@ -27,6 +27,32 @@ async function persist(path: string, value: unknown) {
   await rename(`${path}.tmp`, path);
 }
 
+function parseOutcome(text: string): Outcome {
+  const value: unknown = JSON.parse(text);
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Invalid download outcome");
+  }
+  const { id, status, createdAt } = value as Partial<Outcome>;
+  if (
+    typeof id !== "string" ||
+    (status !== "pending" && status !== "failed") ||
+    typeof createdAt !== "string"
+  ) {
+    throw new Error("Invalid download outcome");
+  }
+  return value as Outcome;
+}
+
+async function quarantine(path: string) {
+  // Best effort only: never delete a corrupt outcome — move it aside so
+  // the operator can inspect it, and so it stops breaking every read.
+  let target = `${path}.corrupt`;
+  for (let attempt = 1; await stat(target).catch(() => null); attempt++) {
+    target = `${path}.corrupt-${attempt}`;
+  }
+  await rename(path, target).catch(() => {});
+}
+
 export async function readDownloadFailures(directory: string, recoverInterrupted = false) {
   const folder = join(directory, "download-outcomes");
   await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -34,27 +60,33 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
   for (const name of await readdir(folder)) {
     if (!name.endsWith(".json")) continue;
     const path = join(folder, name);
-    const outcome = JSON.parse(await readFile(path, "utf8")) as Outcome;
-    if (outcome.status === "pending" && recoverInterrupted) {
-      const metadata = await stat(join(directory, "downloads", `${outcome.id}.json`)).catch(
-        (error: unknown) => {
-          if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-          throw error;
-        },
-      );
-      if (metadata) {
-        await rm(path, { force: true });
-        continue;
+    try {
+      const outcome = parseOutcome(await readFile(path, "utf8"));
+      if (outcome.status === "pending" && recoverInterrupted) {
+        const metadata = await stat(join(directory, "downloads", `${outcome.id}.json`)).catch(
+          (error: unknown) => {
+            if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
+            throw error;
+          },
+        );
+        if (metadata) {
+          await rm(path, { force: true });
+          continue;
+        }
+        // Clear unpublished files first so an incomplete cleanup can be retried.
+        await rm(join(directory, "downloads", `${outcome.id}.pdf`), { force: true });
+        await rm(join(directory, "downloads", `${outcome.id}.json.tmp`), { force: true });
+        outcome.status = "failed";
+        await persist(path, outcome);
       }
-      // Clear unpublished files first so an incomplete cleanup can be retried.
-      await rm(join(directory, "downloads", `${outcome.id}.pdf`), { force: true });
-      await rm(join(directory, "downloads", `${outcome.id}.json.tmp`), { force: true });
-      outcome.status = "failed";
-      await persist(path, outcome);
-    }
-    if (outcome.status === "failed") {
-      const { status: _status, ...failure } = outcome;
-      failures.push(failure);
+      if (outcome.status === "failed") {
+        const { status: _status, ...failure } = outcome;
+        failures.push(failure);
+      }
+    } catch {
+      // One corrupt bookkeeping file must not fail the whole read (or
+      // worker startup): move it aside and keep the healthy outcomes.
+      await quarantine(path);
     }
   }
   return failures.sort((a, b) => b.createdAt.localeCompare(a.createdAt));

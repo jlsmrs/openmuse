@@ -57,7 +57,15 @@ export async function createBrowserManager(
     } catch {
       /* An incomplete first launch has no session metadata to restore. */
     }
-    if (sessions.has(id)) await readDownloadFailures(join(dataDir, id), true);
+    if (sessions.has(id)) {
+      try {
+        await readDownloadFailures(join(dataDir, id), true);
+      } catch {
+        // Startup recovery must not kill the worker: a corrupt outcome is
+        // already quarantined by readDownloadFailures, and the failures
+        // list is rebuilt on the next downloads call.
+      }
+    }
   }
   const directory = (id: string) => join(dataDir, validateSessionId(id));
   async function persist(session: Session) {
