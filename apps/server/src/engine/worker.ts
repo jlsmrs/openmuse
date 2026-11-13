@@ -121,6 +121,39 @@ export class TaskWorker {
     }
     await Promise.all(started);
   }
+  /**
+   * Renew the lease for a running task. A database error is not proof the
+   * lease is gone: log it and retry once so a transient blip does not kill
+   * a healthy run. Only a compare-and-swap that returns no row — the lease
+   * confirmed lost — aborts the run. A retry that also fails is logged and
+   * left for the next heartbeat tick.
+   */
+  private async renewLease(
+    owner: string,
+    taskId: string,
+    leaseId: string,
+    leaseMs: number,
+    controller: AbortController,
+  ): Promise<void> {
+    const renew = () =>
+      this.db.compareAndSwap<AgentTask>(
+        owner,
+        "tasks",
+        taskId,
+        { leaseId, status: "running" },
+        { leaseUntil: new Date(this.now() + leaseMs).toISOString() },
+      );
+    try {
+      if (!(await renew())) controller.abort();
+    } catch (error) {
+      backgroundFailure("lease heartbeat", error);
+      try {
+        if (!(await renew())) controller.abort();
+      } catch (retryError) {
+        backgroundFailure("lease heartbeat retry", retryError);
+      }
+    }
+  }
   private async run(owner: string, previous: AgentTask) {
     if (this.stopping) return;
     const leaseId = randomUUID(),
@@ -173,18 +206,7 @@ export class TaskWorker {
     const startedAt = new Date(this.now()).toISOString();
     const heartbeat = setInterval(
       () => {
-        void this.db
-          .compareAndSwap(
-            owner,
-            "tasks",
-            taskId,
-            { leaseId, status: "running" },
-            { leaseUntil: new Date(this.now() + leaseMs).toISOString() },
-          )
-          .then((value) => {
-            if (!value) controller.abort();
-          })
-          .catch(() => controller.abort());
+        void this.renewLease(owner, taskId, leaseId, leaseMs, controller);
       },
       Math.max(10, Math.floor(leaseMs / 3)),
     );
