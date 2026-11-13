@@ -242,6 +242,53 @@ test("PDF full text is extracted in-process", async () => {
   assert.ok(!broken.ok);
 });
 
+test("PDF fragments on one line are separated instead of running together", async () => {
+  // Two adjacent fragments on the same line are separate text items with no
+  // EOL: without the separator they would read "HelloWorld". (Same font and
+  // size would be merged into one item by pdf.js, so the second fragment
+  // uses a different font — the way real-world PDFs emit per-word runs.)
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const font2 = await doc.embedFont(StandardFonts.TimesRoman);
+  const page = doc.addPage();
+  page.drawText("Hello", { x: 50, y: 700, font, size: 24 });
+  // "Hello" in Helvetica at 24pt is ~55pt wide: place "World" right after it.
+  page.drawText("World", { x: 105, y: 700, font: font2, size: 24 });
+  const bytes = await doc.save();
+  const extracted = await extractPdfText(new Uint8Array(bytes));
+  assert.ok(extracted.ok);
+  assert.match(extracted.text, /Hello World/);
+  assert.doesNotMatch(extracted.text, /HelloWorld/);
+});
+
+test("a GIF is disclosed as first-frame-only", async () => {
+  // Minimal 1x1 GIF.
+  const gif = Buffer.from("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==", "base64");
+  const result = await visionParts("anim.gif", "image/gif", new Uint8Array(gif));
+  assert.ok(!("error" in result));
+  const text = result.parts[0];
+  assert.equal(text.type, "text");
+  if (text.type === "text") assert.match(text.content, /Only the first frame/);
+});
+
+test("a plain single-file .gz is read as a one-member archive", async () => {
+  assert.equal(isArchiveMime("application/gzip", "notes.txt.gz"), true);
+  const gzipped = gzipSync(Buffer.from("gzipped note here"));
+  const archive = await readArchive(new Uint8Array(gzipped), "notes.txt.gz", "application/gzip");
+  assert.ok(archive.ok);
+  assert.match(archive.summary, /== notes\.txt ==/);
+  assert.match(archive.summary, /gzipped note here/);
+  // A .tar.gz is still read as a tar archive, not a single file.
+  assert.equal(isArchiveMime("application/gzip", "bundle.tar.gz"), true);
+  const notArchive = await readArchive(
+    new Uint8Array(gzipSync(Buffer.from("not a tar"))),
+    "plain.txt.gz",
+    "application/gzip",
+  );
+  assert.ok(notArchive.ok);
+  assert.match(notArchive.summary, /not a tar/);
+});
+
 test("PDF text extraction accepts a Node Buffer, not just a plain Uint8Array", async () => {
   // Regression: production file bytes arrive as Buffers (fs.readFile),
   // and pdfjs-dist 6 rejects Buffer input. Passing a Buffer here must
@@ -387,6 +434,7 @@ test("readability notes reflect the pipeline", () => {
   assert.equal(isArchiveMime("application/zip", "a.zip"), true);
   assert.equal(isArchiveMime("application/x-tar", "a.tar"), true);
   assert.equal(isArchiveMime("application/gzip", "a.tgz"), true);
-  assert.equal(isArchiveMime("application/gzip", "a.gz"), false);
+  // S-B6 item 4: a plain .gz is now a one-member archive, not a refusal.
+  assert.equal(isArchiveMime("application/gzip", "a.gz"), true);
   assert.equal(isArchiveMime("image/png", "a.png"), false);
 });

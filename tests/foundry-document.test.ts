@@ -66,3 +66,11 @@ test("an over-cap provider payload is truncated and flagged", async (t) => {
   assert.match(result.extracted, /\[truncated\]$/);
   assert.equal(result.truncated, true);
 });
+
+test("a non-JSON success response returns the normal error object", async (t) => {
+  setEnv(t);
+  stubFetch(t, async () => new Response("<html>not json</html>", { status: 200 }));
+  const result = await executeDoc("f1");
+  assert.match(result.error ?? "", /non-JSON/);
+  assert.equal(result.extracted, undefined);
+});
