@@ -42,6 +42,8 @@ export interface DockerResult {
   timedOut: boolean;
   interrupted: boolean;
   truncated: boolean;
+  /** The box paused before the command could start; nothing ran. */
+  paused?: boolean;
 }
 export type DockerRunner = (
   args: string[],
@@ -255,8 +257,13 @@ export class ComputerService {
       executorDone: operation !== "command",
       operation,
     };
-    if (previous && previous.expiresAt > Date.now())
-      throw new AppError("Computer is busy. Wait for the current operation to finish.", 409);
+    // State the live lease expiry, so the caller knows how long to back off.
+    const busy = (expiresAt: number) =>
+      new AppError(
+        `Computer is busy until ${new Date(expiresAt).toISOString()}. Wait for the current operation to finish, then try again.`,
+        409,
+      );
+    if (previous && previous.expiresAt > Date.now()) throw busy(previous.expiresAt);
     const claimed = previous
       ? await this.db.compareAndSwap<Lease>(
           owner,
@@ -266,8 +273,10 @@ export class ComputerService {
           lease,
         )
       : await this.db.insertIfAbsent(owner, "computer-state", lease);
-    if (!claimed)
-      throw new AppError("Computer is busy. Wait for the current operation to finish.", 409);
+    if (!claimed) {
+      const current = await this.db.get<Lease>(owner, "computer-state", "lease");
+      throw busy(current && current.expiresAt > Date.now() ? current.expiresAt : lease.expiresAt);
+    }
     return lease;
   }
   private async exclusive<T>(
@@ -276,9 +285,26 @@ export class ComputerService {
     kind: Lease["operation"] = "operation",
   ) {
     const lease = await this.acquire(owner, kind);
+    // The lease is 3 minutes, but an E2B start (create + connect + session
+    // setup) can run longer. Renew it while the operation runs so a slow
+    // start cannot lose the lease mid-flight. The renewal only extends a
+    // lease this operation still owns and has not stopped.
+    const renew = setInterval(() => {
+      void this.db
+        .compareAndSwap(
+          owner,
+          "computer-state",
+          "lease",
+          { token: lease.token, stopping: false },
+          { expiresAt: Date.now() + leaseDuration },
+        )
+        .catch(() => {});
+    }, 60000);
+    renew.unref?.();
     try {
       return await operation(lease);
     } finally {
+      clearInterval(renew);
       // A stopped command must acknowledge completion before a new lifecycle can
       // begin. A delayed Docker client can otherwise exec into a restarted box.
       if (kind === "command")
@@ -329,15 +355,20 @@ export class ComputerService {
           if (saved) Object.assign(command, saved);
         }
     }
-    return commands.sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 100);
+    return {
+      commands: commands.sort((a, b) => b.startedAt.localeCompare(a.startedAt)).slice(0, 100),
+      total: commands.length,
+    };
   }
   async snapshot(owner: string): Promise<ComputerSnapshot> {
+    const { commands, total } = await this.commands(owner);
     const base = {
       enabled: Boolean(this.config.computerEnabled),
       provider: this.provider,
       workspacePath: "/workspace" as const,
       network: this.backend.network,
-      commands: await this.commands(owner),
+      commands,
+      totalCommands: total,
     };
     if (!base.enabled)
       return {
@@ -363,6 +394,12 @@ export class ComputerService {
   }
   async start(owner: string) {
     await this.exclusive(owner, () => this.backend.start(owner));
+    return this.snapshot(owner);
+  }
+  async forget(owner: string) {
+    // Runs under the lease, so it cannot race a running command; the backend
+    // re-confirms ownership before deleting anything, and receipts stay.
+    await this.exclusive(owner, () => this.backend.forget(owner));
     return this.snapshot(owner);
   }
   async stop(owner: string) {
@@ -516,7 +553,11 @@ export class ComputerService {
             truncated: false,
           };
         }
-        const timedOut = result.timedOut || result.exitCode === 124;
+        // Only an SDK-reported timeout is timed_out: a user command that
+        // itself exits 124 (the wrapper's timeout code) is a failed command
+        // with exit code 124, not a timeout — and it does not stop the box,
+        // because the cleanup below keys on result.timedOut, not this flag.
+        const timedOut = result.timedOut;
         // A lost Docker client cannot cancel exec reliably. Stop the whole sandbox
         // to ensure no unknown command continues after the lease is released.
         if (result.timedOut || result.interrupted) {
@@ -563,11 +604,13 @@ export class ComputerService {
           ...command,
           status: result.interrupted
             ? "interrupted"
-            : timedOut
-              ? "timed_out"
-              : result.exitCode === 0
-                ? "succeeded"
-                : "failed",
+            : result.paused
+              ? "paused"
+              : timedOut
+                ? "timed_out"
+                : result.exitCode === 0
+                  ? "succeeded"
+                  : "failed",
           ...(result.exitCode !== null ? { exitCode: result.exitCode } : {}),
           stdout: result.stdout,
           stderr: result.stderr,
@@ -611,11 +654,37 @@ export class ComputerService {
       const expectedOutput = operation === "read_pdf" ? maxOutputBytes : 0;
       const seconds = 8 + Math.ceil(Math.max(input.length, expectedOutput) / (1024 * 1024));
       const result = await session.file(input, seconds, maxOutputBytes);
-      if (result.exitCode !== 0 || result.timedOut || result.interrupted || result.truncated)
+      if (result.timedOut)
         throw new AppError(
-          "Computer file operation failed. Check the path, permissions and file size; symlinks cannot be opened.",
+          "Computer file operation timed out before it finished. Try a smaller file.",
+          504,
+        );
+      if (result.interrupted)
+        throw new AppError(
+          "Computer file operation was interrupted. The computer may have stopped; start it and try again.",
+          409,
+        );
+      if (result.truncated)
+        throw new AppError(
+          "Computer file operation response was too large. Try a smaller file.",
+          413,
+        );
+      if (result.exitCode !== 0) {
+        // The helper's stderr names the cause (missing path, permissions,
+        // too large); keep its last line so the reason survives, bounded.
+        const detail = result.stderr
+          .trim()
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .at(-1);
+        throw new AppError(
+          result.exitCode !== null && detail
+            ? `Computer file operation failed with exit code ${result.exitCode}: ${detail.slice(0, 200)}`
+            : "Computer file operation failed. Check the path, permissions and file size; symlinks cannot be opened.",
           422,
         );
+      }
       try {
         return JSON.parse(result.stdout) as T;
       } catch {
@@ -753,13 +822,14 @@ export class ComputerService {
     const shot = await this.db.get<Screen>(owner, "computer-desktop-screens", "latest");
     if (!shot || (receiptId && shot.receiptId !== receiptId))
       throw new AppError("No desktop screenshot yet", 404);
-    return {
-      mimeType: shot.mimeType,
-      bytes:
-        shot.blob === `${hash(owner)}.jpg`
-          ? await readFile(join(this.config.dataDir, "desktop-screens", shot.blob))
-          : Buffer.from(shot.data ?? "", "base64"),
-    };
+    const bytes =
+      shot.blob === `${hash(owner)}.jpg`
+        ? await readFile(join(this.config.dataDir, "desktop-screens", shot.blob))
+        : Buffer.from(shot.data ?? "", "base64");
+    // The legacy fallback (a record with no data) must not answer 200 with
+    // an empty body labeled image/jpeg.
+    if (!bytes.length) throw new AppError("No desktop screenshot yet", 404);
+    return { mimeType: shot.mimeType, bytes };
   }
   list(owner: string, path = "/workspace") {
     return this.file<ComputerDirectory>(owner, "list", path);

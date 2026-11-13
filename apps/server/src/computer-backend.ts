@@ -21,6 +21,9 @@ export interface ComputerBackend {
   state(owner: string): Promise<ComputerState>;
   start(owner: string): Promise<void>;
   stop(owner: string): Promise<void>;
+  /** Delete the owner's computer after re-confirming it belongs to this
+   * deployment. Receipts are untouched; a missing computer is a no-op. */
+  forget(owner: string): Promise<void>;
   running(owner: string): Promise<ComputerSession>;
 }
 const controlTimeout = 10000;
@@ -274,6 +277,71 @@ export class DockerComputer implements ComputerBackend {
         computerIdentity(this.config, owner).container,
       ]);
   }
+  async forget(owner: string) {
+    const identity = computerIdentity(this.config, owner);
+    // Lenient re-check, not the strict attach inspection: the point of
+    // forget is to delete a computer that can no longer be attached to, so
+    // only the ownership labels are confirmed — never isolation details.
+    // A label mismatch refuses with 409 instead of deleting a stranger.
+    const refuse = (what: string) =>
+      new AppError(
+        `Computer ${what} ownership does not match this deployment; refusing to delete`,
+        409,
+      );
+    const found = (
+      await this.checked([
+        "container",
+        "ls",
+        "--all",
+        "--filter",
+        `name=^/${identity.container}$`,
+        "--format",
+        "{{.ID}}",
+      ])
+    ).trim();
+    if (found) {
+      const parsed = z
+        .array(
+          z.object({
+            Config: z.object({ Labels: z.record(z.string(), z.string()).nullable() }),
+          }),
+        )
+        .length(1)
+        .safeParse(JSON.parse(await this.checked(["container", "inspect", identity.container])));
+      if (
+        !parsed.success ||
+        !Object.entries(identity.labels).every(
+          ([key, value]) => parsed.data[0].Config.Labels?.[key] === value,
+        )
+      )
+        throw refuse("container");
+      await this.checked(["container", "rm", "--force", identity.container]);
+    }
+    const volume = (
+      await this.checked([
+        "volume",
+        "ls",
+        "--filter",
+        `name=^${identity.volume}$`,
+        "--format",
+        "{{.Name}}",
+      ])
+    ).trim();
+    if (volume) {
+      const parsed = z
+        .array(z.object({ Labels: z.record(z.string(), z.string()).nullable() }))
+        .length(1)
+        .safeParse(JSON.parse(await this.checked(["volume", "inspect", identity.volume])));
+      if (
+        !parsed.success ||
+        !Object.entries(identity.labels).every(
+          ([key, value]) => parsed.data[0].Labels?.[key] === value,
+        )
+      )
+        throw refuse("workspace");
+      await this.checked(["volume", "rm", identity.volume]);
+    }
+  }
   async running(owner: string): Promise<ComputerSession> {
     if ((await this.state(owner)) !== "running") throw stopped();
     const container = computerIdentity(this.config, owner).container;
@@ -299,7 +367,7 @@ export class DockerComputer implements ComputerBackend {
           ],
           { timeoutMs: 35000, signal },
         ),
-      file: (input, _seconds, maxOutputBytes) =>
+      file: (input, seconds, maxOutputBytes) =>
         this.docker(
           [
             "exec",
@@ -309,12 +377,12 @@ export class DockerComputer implements ComputerBackend {
             container,
             "/usr/bin/timeout",
             "--kill-after=1s",
-            "8s",
+            `${seconds}s`,
             "/usr/bin/python3",
             "-I",
             "/opt/openmuse/files.py",
           ],
-          { timeoutMs: 10000, input, maxOutputBytes },
+          { timeoutMs: (seconds + 2) * 1000, input, maxOutputBytes },
         ),
       stop: async () => {
         await this.checked(["container", "stop", "--time", "2", container]);
@@ -342,6 +410,9 @@ export class DesktopComputerBackend implements ComputerBackend {
   }
   stop(owner: string) {
     return this.desktop.stop(this.labels(owner));
+  }
+  forget(owner: string) {
+    return this.desktop.forget(this.labels(owner));
   }
   async running(owner: string): Promise<ComputerSession> {
     const labels = this.labels(owner);
