@@ -22,7 +22,7 @@ export function sanitizeFileName(name: string): string {
   return cleaned || "document.pdf";
 }
 
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
+export const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 // MIME types the workspace recognises by file extension. Anything else is
 // still accepted and stored — it is recorded as application/octet-stream and

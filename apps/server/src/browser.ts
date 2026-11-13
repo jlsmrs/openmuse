@@ -6,7 +6,7 @@ import { browserConsole } from "./browser-console.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
-import type { Files } from "./files.ts";
+import { type Files, MAX_FILE_BYTES } from "./files.ts";
 
 const sessionSchema = z.object({
   id: z.string(),
@@ -35,6 +35,41 @@ const BROWSER_SESSION_ID =
 
 function assertSessionId(id: string): void {
   if (!BROWSER_SESSION_ID.test(id)) throw new AppError("Browser session not found", 404);
+}
+
+/**
+ * Read a worker response body without ever holding more than the file cap in
+ * memory: chunks are accumulated only until the cap is crossed, at which
+ * point the stream is cancelled and the download is rejected — the caller
+ * never buffers the whole body the way `response.arrayBuffer()` would.
+ */
+async function readCappedBody(response: Response, maxBytes: number): Promise<Uint8Array> {
+  const body = response.body;
+  if (!body) return new Uint8Array();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > maxBytes) {
+        await reader.cancel();
+        throw new AppError("Files must be 10 MB or smaller", 413);
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return bytes;
 }
 
 export class BrowserService {
@@ -275,13 +310,19 @@ export class BrowserService {
         saved.push(this.files.signed(owner, await this.files.get(owner, existing.fileId)));
         continue;
       }
+      // The listed size is checked before fetching so an over-cap download
+      // is rejected without touching the body at all. The streamed read
+      // below is the backstop for a listed size that understates the body.
+      if (download.size > MAX_FILE_BYTES) {
+        throw new AppError("Files must be 10 MB or smaller", 413);
+      }
       const response = await this.request(
         `/sessions/${encodeURIComponent(id)}/downloads/${encodeURIComponent(download.id)}`,
       );
       const file = await this.files.import(
         owner,
         download.name,
-        new Uint8Array(await response.arrayBuffer()),
+        await readCappedBody(response, MAX_FILE_BYTES),
         `Browser · ${id}`,
       );
       await this.db.put(owner, "browser-downloads", { id: download.id, fileId: file.id });
