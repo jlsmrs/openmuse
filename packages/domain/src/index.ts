@@ -13,54 +13,62 @@ export type Section =
   | "ideas"
   | "goals"
   | "apps";
-export interface Mail {
-  id: string;
-  threadId: string;
-  from: string;
-  sender: string;
-  to: string[];
-  subject: string;
-  body: string;
-  date: string;
-  unread: boolean;
-  label: string;
-  attachments: string[];
-}
+/**
+ * Shared shape for a full mail row, as mapMessage produces it. The schema is
+ * the single source of truth — Mail is its inferred type, so the shape and
+ * its validation cannot drift apart (R2).
+ */
+export const mailSchema = z.object({
+  id: z.string().min(1),
+  threadId: z.string().min(1),
+  from: z.string(),
+  sender: z.string(),
+  to: z.array(z.string()),
+  subject: z.string(),
+  body: z.string(),
+  // A malformed Date header falls back to the raw header instead of
+  // vanishing (mapMessage), so the date is a string, not necessarily ISO.
+  date: z.string(),
+  unread: z.boolean(),
+  // Live rows use Inbox/Sent/Trash/Spam/Mail, but sample rows use arbitrary
+  // labels ("School", "Sent · local"), so the label stays a plain string.
+  label: z.string(),
+  attachments: z.array(z.string()),
+});
+export type Mail = z.infer<typeof mailSchema>;
 /**
  * Headers-only mail row: the list/search shape. It carries the snippet, never
  * a body — full bodies come from getThread for a selected message instead.
  * The sample path must return this same shape (S-B9 agrees on it).
  */
-export interface MailMetadata {
-  id: string;
-  threadId: string;
-  from: string;
-  sender: string;
-  to: string[];
-  subject: string;
-  snippet: string;
-  date: string;
-  unread: boolean;
-  label: string;
-  attachments: string[];
-}
+export const mailMetadataSchema = mailSchema.omit({ body: true }).extend({ snippet: z.string() });
+export type MailMetadata = z.infer<typeof mailMetadataSchema>;
 /** Strip a full mail row to its headers-only shape (body becomes the snippet). */
 export function toMailMetadata(mail: Mail): MailMetadata {
   const { body, ...rest } = mail;
   return { ...rest, snippet: body };
 }
-export interface CalendarEvent {
-  id: string;
-  calendarId: string;
-  title: string;
-  start: string;
-  end: string;
-  allDay: boolean;
-  timeZone: string;
-  location: string;
-  description: string;
-  attendees: string[];
-}
+/**
+ * A start/end that mapEvent accepts: a date for all-day events, an ISO
+ * date-time otherwise. mapEvent guarantees both parse — that is the check,
+ * not an ISO shape.
+ */
+const parseableDate = z
+  .string()
+  .refine((value) => Number.isFinite(Date.parse(value)), "must be a parseable date or date-time");
+export const calendarEventSchema = z.object({
+  id: z.string().min(1),
+  calendarId: z.string().min(1),
+  title: z.string(),
+  start: parseableDate,
+  end: parseableDate,
+  allDay: z.boolean(),
+  timeZone: z.string(),
+  location: z.string(),
+  description: z.string(),
+  attendees: z.array(z.string()),
+});
+export type CalendarEvent = z.infer<typeof calendarEventSchema>;
 export const calendarRangeSchema = z
   .object({
     timeMin: z.iso.datetime({ offset: true }),
