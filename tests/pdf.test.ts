@@ -1,13 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { deflateSync } from "node:zlib";
-import { PDFDocument, PDFName, PDFString } from "pdf-lib";
+import {
+  decodePDFRawStream,
+  PDFContext,
+  PDFDocument,
+  PDFName,
+  PDFRawStream,
+  PDFString,
+} from "pdf-lib";
 import {
   createSamplePdf,
   fillPdf,
   inspectPdf,
   PdfError,
 } from "../packages/integrations/src/pdf.ts";
+
+// This test must stay first in this file: it asserts the decode-budget patch
+// is not installed at import time, so no earlier test may have loaded a PDF.
+test("decode-budget patch installs on first PDF load, not at import time", async () => {
+  const decodeStreamPrototype = () => {
+    let proto = Object.getPrototypeOf(
+      decodePDFRawStream(
+        PDFRawStream.of(PDFContext.create().obj({ Filter: "ASCIIHexDecode" }), new Uint8Array()),
+      ),
+    );
+    while (proto && !Object.hasOwn(proto, "ensureBuffer")) proto = Object.getPrototypeOf(proto);
+    return proto;
+  };
+  const before = decodeStreamPrototype().ensureBuffer;
+  await inspectPdf(await createSamplePdf());
+  assert.notEqual(decodeStreamPrototype().ensureBuffer, before);
+});
 
 test("sample is an actual two-page PDF with blank fillable fields", async () => {
   const bytes = await createSamplePdf();
