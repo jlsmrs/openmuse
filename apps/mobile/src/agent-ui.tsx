@@ -1993,6 +1993,12 @@ export function AppsScreen() {
                   Pick a generated image or one of your files, or upload an image. It is served
                   through a short-lived signed link, never bundled into the app.
                 </Text>
+                {!customAvatar && (
+                  <Text style={[s.small, { color: colors.danger }]}>
+                    No image selected yet — saving with Custom and no image silently falls back to
+                    the stock avatar. Pick or upload one first.
+                  </Text>
+                )}
                 <View style={[s.row, { gap: 8 }]}>
                   <Button
                     small
@@ -2091,7 +2097,9 @@ export function AppsScreen() {
             </Text>
             <Button
               busy={busy}
-              disabled={!name.trim()}
+              // Saving Custom with no image selected stores custom with an
+              // undefined custom avatar and silently falls back to stock.
+              disabled={!name.trim() || (avatar === "custom" && !customAvatar)}
               onPress={() =>
                 void save("/identity", {
                   name: name.trim(),

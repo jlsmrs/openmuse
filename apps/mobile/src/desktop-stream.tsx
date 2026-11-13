@@ -1,8 +1,8 @@
-import { ExternalLink } from "lucide-react-native";
-import { memo, useEffect, useState } from "react";
-import { ActivityIndicator, AppState, Linking, Platform, View } from "react-native";
+import { ExternalLink, RefreshCw } from "lucide-react-native";
+import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { ActivityIndicator, AppState, Linking, Platform, Text, View } from "react-native";
 import BrowserConsole from "./BrowserConsole";
-import { Button, colors, ErrorNotice } from "./ui";
+import { Button, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
 
 const message = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -17,15 +17,31 @@ export function useDesktopStream(running: boolean) {
   const { api } = useWorkspace();
   const [url, setUrl] = useState("");
   const [error, setError] = useState("");
+  // True once the one-hour keep-awake cap stops automatic refreshes; the
+  // stream keeps showing the last URL until the user refreshes it.
+  const [capped, setCapped] = useState(false);
+  const sinceRef = useRef(Date.now());
+  const loadRef = useRef<(force?: boolean) => void>(() => {});
+  // Restart the hour and fetch a fresh URL after the cap is hit.
+  const refresh = useCallback(() => {
+    sinceRef.current = Date.now();
+    setCapped(false);
+    loadRef.current(true);
+  }, []);
   useEffect(() => {
     if (!running) return;
     let alive = true,
       loaded = false,
-      retry: ReturnType<typeof setTimeout> | undefined,
-      since = Date.now();
+      retry: ReturnType<typeof setTimeout> | undefined;
     const load = (force = false) => {
-      if (!force && (AppState.currentState !== "active" || Date.now() - since > keepAwakeLimitMs))
+      if (!force && AppState.currentState !== "active") return;
+      if (!force && Date.now() - sinceRef.current > keepAwakeLimitMs) {
+        setCapped(true);
         return;
+      }
+      // The cap lifted (foreground return or manual refresh restarts the hour),
+      // so the stream is refreshing again: the capped notice must go with it.
+      setCapped(false);
       void api
         .request<{ url: string }>("/api/computer/desktop")
         .then((value) => {
@@ -44,12 +60,13 @@ export function useDesktopStream(running: boolean) {
           retry = setTimeout(() => load(true), 5000);
         });
     };
+    loadRef.current = load;
     load(true);
     const interval = setInterval(load, keepAwakeMs);
     // Returning to the app (e.g. from the externally opened desktop) restarts the hour.
     const subscription = AppState.addEventListener("change", (state) => {
       if (state !== "active") return;
-      since = Date.now();
+      sinceRef.current = Date.now();
       load();
     });
     return () => {
@@ -59,7 +76,7 @@ export function useDesktopStream(running: boolean) {
       subscription.remove();
     };
   }, [api, running]);
-  return { url, error, setError };
+  return { url, error, setError, capped, refresh };
 }
 
 /** Web embeds the stream; native opens it in the system browser. Memoized on its
@@ -74,7 +91,7 @@ export const DesktopStream = memo(function DesktopStream({
 }) {
   const embedded = embed && Platform.OS === "web";
   const { api } = useWorkspace();
-  const { url, error, setError } = useDesktopStream(running && embedded);
+  const { url, error, setError, capped, refresh } = useDesktopStream(running && embedded);
   const [opening, setOpening] = useState(false);
   async function open() {
     setOpening(true);
@@ -95,6 +112,17 @@ export const DesktopStream = memo(function DesktopStream({
       {embedded && !url && !error && <ActivityIndicator color={colors.blueDark} />}
       {!!url && embed && Platform.OS === "web" && (
         <BrowserConsole url={url} title="Computer desktop" sandboxed />
+      )}
+      {capped && (
+        <View style={{ gap: 8 }}>
+          <Text style={s.small}>
+            The stream stopped refreshing after an hour. Refresh it to keep watching the live
+            desktop.
+          </Text>
+          <Button icon={RefreshCw} onPress={() => refresh()}>
+            Refresh stream
+          </Button>
+        </View>
       )}
       {running && (!embedded || !!url) && (
         <Button
