@@ -8,3 +8,8 @@
 # tree is safe — and it keeps the 1.3 GB out of the uploaded context.
 node_modules
 .git
+# A local .env must never be copied into the image: it holds provider keys
+# and tokens. No .env file is tracked today (only .env.example, a template),
+# but a clone that picked one up would otherwise ship its secrets in the
+# build context — the same way a stray node_modules once broke the build.
+.env*

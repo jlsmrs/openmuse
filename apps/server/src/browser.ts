@@ -363,6 +363,9 @@ export class BrowserService {
         download.name,
         await readCappedBody(response, MAX_FILE_BYTES),
         `Browser · ${id}`,
+        undefined,
+        undefined,
+        download.mimeType,
       );
       await this.db.put(owner, "browser-downloads", { id: download.id, fileId: file.id });
       saved.push(file);

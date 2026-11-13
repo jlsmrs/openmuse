@@ -1,3 +1,6 @@
+# Browser worker only. The full local stack (worker + API + web app) is
+# documented in docs/LOCAL-STACK.md; the Azure deployment of this service
+# is documented in docs/AZURE-WORKER.md.
 name: openmuse
 services:
   browser-worker:
