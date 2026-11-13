@@ -22,6 +22,23 @@ import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
 import type { GoogleAuth } from "./google-auth.ts";
 
+/**
+ * Words of a sample-mode mail query. An empty query means the inbox, like the
+ * live path's `query || "in:inbox"` default. `in:inbox` matches any message
+ * the inbox filter keeps (the Sent exclusion in the callers), because no mail
+ * row carries the operator as text — without this, an `in:inbox` search in
+ * sample mode returned nothing while live returned the inbox.
+ */
+function sampleQueryWords(query: string): string[] {
+  return (query || "in:inbox").toLowerCase().trim().split(/\s+/).filter(Boolean);
+}
+
+/** Whether one sample-mode mail row matches every query word. */
+function sampleMailMatches(words: string[], haystack: string): boolean {
+  const hay = haystack.toLowerCase();
+  return words.every((word) => word === "in:inbox" || hay.includes(word));
+}
+
 export class WorkspaceService {
   private seeding = new Map<string, Promise<void>>();
   constructor(
@@ -158,15 +175,14 @@ export class WorkspaceService {
         await this.google(owner, connection.id).listMail(query || "in:inbox"),
         connection.id,
       );
-    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const words = sampleQueryWords(query);
     return (await this.db.list<Mail>(owner, "mail"))
       .filter(
         (message) =>
           !/^Sent\b/i.test(message.label) &&
-          words.every((word) =>
-            `${message.sender} ${message.from} ${message.subject} ${message.body}`
-              .toLowerCase()
-              .includes(word),
+          sampleMailMatches(
+            words,
+            `${message.sender} ${message.from} ${message.subject} ${message.body}`,
           ),
       )
       .sort((a, b) => b.date.localeCompare(a.date));
@@ -181,22 +197,23 @@ export class WorkspaceService {
     if (!connection) throw new AppError("Google is disconnected", 409);
     if (this.config.mode === "live")
       return this.google(owner, connection.id).listMailMetadata(query || "in:inbox", pageToken);
-    const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
+    const words = sampleQueryWords(query);
     const all = (await this.db.list<Mail>(owner, "mail"))
       .filter(
         (message) =>
           !/^Sent\b/i.test(message.label) &&
-          words.every((word) =>
-            `${message.sender} ${message.from} ${message.subject} ${message.body}`
-              .toLowerCase()
-              .includes(word),
+          sampleMailMatches(
+            words,
+            `${message.sender} ${message.from} ${message.subject} ${message.body}`,
           ),
       )
       .sort((a, b) => b.date.localeCompare(a.date));
     // Sample mode has no provider page token: the cursor is a decimal offset.
     // Rows are MailMetadata like the live path — body stripped to a snippet.
-    // (Matching on the same fields as live is S-B9's item; the shape is this
-    // batch's item 12 and the two must agree.)
+    // Matching stays on the same fields as live (sender, from, subject,
+    // body — Gmail's full-text search covers the body too, and the
+    // search_mail tool promises words "from the subject, sender or message"):
+    // the headers-only contract governs the returned rows, not the match.
     const offset = decodeMailCursor(pageToken);
     const messages = all
       .slice(offset, offset + 100)
@@ -361,7 +378,9 @@ export class WorkspaceService {
         mail = await this.db.list<Mail>(owner, "mail");
         if (query)
           mail = mail.filter((m) =>
-            `${m.sender} ${m.subject} ${m.body}`.toLowerCase().includes(query.toLowerCase()),
+            `${m.sender} ${m.from} ${m.subject} ${m.body}`
+              .toLowerCase()
+              .includes(query.toLowerCase()),
           );
       }
       if (wantEvents) events = await this.db.list<CalendarEvent>(owner, "events");

@@ -13,6 +13,9 @@ export function computerRoutes(computer: ComputerService, files: Files) {
   app.get("/", async (c) => c.json(await computer.snapshot(c.get("owner"))));
   app.post("/start", async (c) => c.json(await computer.start(c.get("owner"))));
   app.post("/stop", async (c) => c.json(await computer.stop(c.get("owner"))));
+  // Delete the owner's computer after the service re-confirms ownership;
+  // receipts stay, and a later Start recreates it.
+  app.post("/forget", async (c) => c.json(await computer.forget(c.get("owner"))));
   // Live desktop stream (e2b-desktop provider). The URL carries a per-stream VNC
   // password, never the E2B API key; repeated calls return the same stream.
   app.get("/desktop", async (c) => c.json(await computer.desktopUrl(c.get("owner"))));
