@@ -111,6 +111,21 @@ const stateTools = [
 ];
 
 /** A BuiltInAgent in TanStack factory mode with the options of the classic AI SDK mode. */
+
+/** Character budget for the application state JSON embedded in the system prompt. */
+export const MAX_APPLICATION_STATE_CHARS = 20000;
+
+/**
+ * The full application state is stringified into the system prompt with no
+ * size cap; clip it so a large client state cannot blow the context window.
+ */
+export function clipApplicationState(state: unknown): string {
+  const json = JSON.stringify(state, null, 2);
+  return json.length > MAX_APPLICATION_STATE_CHARS
+    ? `${json.slice(0, MAX_APPLICATION_STATE_CHARS)}\n…[application state truncated to ${MAX_APPLICATION_STATE_CHARS} characters]`
+    : json;
+}
+
 export function tanstackAgent(options: {
   model: string;
   maxSteps: number;
@@ -136,7 +151,7 @@ export function tanstackAgent(options: {
         input.state !== null &&
         !(typeof input.state === "object" && Object.keys(input.state).length === 0)
       )
-        system += `\n## Application State\nThis is state from the application that you can edit by calling AGUISendStateSnapshot or AGUISendStateDelta.\n\`\`\`json\n${JSON.stringify(input.state, null, 2)}\n\`\`\`\n`;
+        system += `\n## Application State\nThis is state from the application that you can edit by calling AGUISendStateSnapshot or AGUISendStateDelta.\n\`\`\`json\n${clipApplicationState(input.state)}\n\`\`\`\n`;
       return chat({
         adapter: adapter(options.model),
         messages: converted.messages,

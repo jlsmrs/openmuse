@@ -563,3 +563,63 @@ test("aborting delegated read_web stops before page read and requeues the task",
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("a computer tool checkpoints the task after it runs, like cached tools do", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-model-computer-checkpoint-"));
+  const db = await createStore();
+  const calls: { name: string; arguments: object }[] = [
+    {
+      name: "run_computer_command",
+      arguments: { operationId: "sb1-checkpoint-probe", command: "pwd", cwd: "/workspace" },
+    },
+    { name: "ask_user", arguments: { question: "Done?" } },
+  ];
+  await modelFixture(t, (index) => calls[index]);
+  const server = await createApp(
+    db,
+    {
+      mode: "sample",
+      port: 8787,
+      host: "127.0.0.1",
+      publicUrl: "http://localhost:8787",
+      dataDir: directory,
+      agentBackend: "model",
+      intelligenceApiKey: "test-project-key-never-sent",
+      model: "openai/fixture",
+      googleRedirectUri: "http://localhost:8787/api/google/callback",
+      allowedOrigins: [],
+      computerEnabled: true,
+      computerDeploymentId: "fixture-deployment",
+    },
+    { docker: computerFixture().runner },
+  );
+  try {
+    const task = await server.agent.createTask("owner", {
+      prompt: "Check the working directory",
+      kind: "plan",
+    });
+    const compareAndSwap = db.compareAndSwap.bind(db);
+    const checkpoints: unknown[] = [];
+    t.mock.method(db, "compareAndSwap", async (...args: Parameters<Store["compareAndSwap"]>) => {
+      const patch = args[4] as Partial<AgentTask>;
+      if (
+        args[0] === "owner" &&
+        args[1] === "tasks" &&
+        args[2] === task.id &&
+        patch.state &&
+        "operations" in patch.state
+      )
+        checkpoints.push(patch);
+      return compareAndSwap(...args);
+    });
+    await server.agent.worker.tick();
+    const waiting = await server.agent.getTask("owner", task.id);
+    assert.equal(waiting.status, "waiting_input", waiting.error ?? waiting.question);
+    assert.ok(checkpoints.length >= 1, "expected a checkpoint after the computer tool ran");
+    assert.equal((await server.computer.snapshot("owner")).commands[0]?.status, "succeeded");
+  } finally {
+    await server.agent.stop();
+    await db.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});

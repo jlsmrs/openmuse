@@ -27,3 +27,13 @@ export function providerFailure(phase: string, error: unknown) {
     error: error instanceof Error ? error.name : "Provider request failed",
   });
 }
+
+/** Client tools the agent never receives are logged by name, never by arguments. */
+export function clientToolsDropped(phase: string, toolNames: string[]) {
+  const names = toolNames.filter((name) => /^[A-Za-z0-9_.-]{1,128}$/.test(name));
+  console.warn({
+    timestamp: new Date().toISOString(),
+    context: { phase, droppedTools: names },
+    error: "Client tools dropped",
+  });
+}

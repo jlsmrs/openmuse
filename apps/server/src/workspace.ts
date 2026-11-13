@@ -75,12 +75,20 @@ export class WorkspaceService {
   /** A missing connection is distinct from a connected calendar with no events. */
   async eventsPage(
     owner: string,
-    options: { calendarId?: string; timeMin?: string; timeMax?: string } = {},
+    options: { calendarId?: string; timeMin?: string; timeMax?: string; pageToken?: string } = {},
   ) {
     const connection = await this.connection(owner);
     if (!connection) return null;
-    if (this.config.mode === "live")
-      return this.google(owner, connection.id).listEventsPage(options);
+    if (this.config.mode === "live") {
+      // The chat tool pages 20 events at a time out of the provider's
+      // 100-event page, so the cursor carries both the provider token and
+      // the offset within the current provider page.
+      const { googleToken } = decodeCalendarCursor(options.pageToken);
+      return this.google(owner, connection.id).listEventsPage({
+        ...options,
+        pageToken: googleToken,
+      });
+    }
     const lastIncluded = options.timeMax
       ? new Date(Date.parse(options.timeMax) - 1).toISOString()
       : undefined;
@@ -105,7 +113,7 @@ export class WorkspaceService {
         );
       })
       .sort((a, b) => a.start.localeCompare(b.start));
-    return { events, truncated: false };
+    return { events, truncated: false, nextPageToken: undefined };
   }
   private async cacheMail(owner: string, mail: Mail[], connectionId: string) {
     const imports = await this.db.list<{ id: string; artifactId: string; connectionId?: string }>(
@@ -163,13 +171,13 @@ export class WorkspaceService {
    * deliberately skips cacheMail so snippet bodies never overwrite full
    * message bodies stored from thread reads. Full bodies come from thread().
    */
-  async searchMailMetadata(owner: string, query: string) {
+  async searchMailMetadata(owner: string, query: string, pageToken?: string) {
     const connection = await this.connection(owner);
     if (!connection) throw new AppError("Google is disconnected", 409);
     if (this.config.mode === "live")
-      return this.google(owner, connection.id).listMailMetadata(query || "in:inbox");
+      return this.google(owner, connection.id).listMailMetadata(query || "in:inbox", pageToken);
     const words = query.toLowerCase().trim().split(/\s+/).filter(Boolean);
-    return (await this.db.list<Mail>(owner, "mail"))
+    const all = (await this.db.list<Mail>(owner, "mail"))
       .filter(
         (message) =>
           !/^Sent\b/i.test(message.label) &&
@@ -180,6 +188,13 @@ export class WorkspaceService {
           ),
       )
       .sort((a, b) => b.date.localeCompare(a.date));
+    // Sample mode has no provider page token: the cursor is a decimal offset.
+    const offset = decodeMailCursor(pageToken);
+    const messages = all.slice(offset, offset + 100);
+    return {
+      messages,
+      nextPageToken: offset + 100 < all.length ? String(offset + 100) : undefined,
+    };
   }
   async ensureSample(owner: string, actions: ActionService) {
     if (this.config.mode !== "sample") return;
@@ -533,4 +548,44 @@ export class WorkspaceService {
     });
     return file;
   }
+}
+
+export interface CalendarCursor {
+  googleToken?: string;
+  offset: number;
+}
+
+/**
+ * Opaque chat cursor for calendar paging. The chat tool shows 20 events per
+ * call out of the provider's 100-event page, so the cursor carries both the
+ * provider token for the next page and the offset within the current page.
+ */
+export function encodeCalendarCursor(cursor: CalendarCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+export function decodeCalendarCursor(pageToken?: string): CalendarCursor {
+  if (!pageToken) return { offset: 0 };
+  try {
+    const parsed = JSON.parse(Buffer.from(pageToken, "base64url").toString("utf8")) as unknown;
+    if (typeof parsed !== "object" || parsed === null) throw new Error("not an object");
+    const { googleToken, offset } = parsed as { googleToken?: unknown; offset?: unknown };
+    if (googleToken !== undefined && typeof googleToken !== "string") throw new Error("bad token");
+    if (offset !== undefined && (!Number.isInteger(offset) || (offset as number) < 0))
+      throw new Error("bad offset");
+    return {
+      googleToken: typeof googleToken === "string" ? googleToken : undefined,
+      offset: typeof offset === "number" ? offset : 0,
+    };
+  } catch {
+    throw new Error("Invalid calendar page token");
+  }
+}
+
+/** Sample-mode mail cursor: a decimal offset into the stored list. */
+export function decodeMailCursor(pageToken?: string): number {
+  if (!pageToken) return 0;
+  const offset = Number(pageToken);
+  if (!Number.isInteger(offset) || offset < 0) throw new Error("Invalid mail page token");
+  return offset;
 }

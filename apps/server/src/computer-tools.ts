@@ -24,7 +24,12 @@ export function computerTools(
   files: Files,
   owner: string,
   scope: string,
-  options: { before?: () => Promise<void>; signal?: AbortSignal } = {},
+  options: {
+    before?: () => Promise<void>;
+    /** Runs after a successful tool execution, e.g. a durable checkpoint. */
+    after?: () => Promise<void>;
+    signal?: AbortSignal;
+  } = {},
 ) {
   const tool = <T extends z.ZodType>(
     name: string,
@@ -39,7 +44,9 @@ export function computerTools(
       execute: async (args) => {
         try {
           await options.before?.();
-          return await action(parameters.parse(args));
+          const result = await action(parameters.parse(args));
+          await options.after?.();
+          return result;
         } catch (error) {
           return { error: error instanceof Error ? error.message : "Computer operation failed" };
         }

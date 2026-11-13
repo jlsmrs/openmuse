@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { Hono } from "hono";
 import { z } from "zod";
 import type {
@@ -6,7 +6,7 @@ import type {
   AgentMemory,
   AgentNotification,
 } from "../../../../packages/domain/src/agent.ts";
-import { createTaskSchema } from "../../../../packages/domain/src/agent.ts";
+import { createTaskSchema, goalInputSchema } from "../../../../packages/domain/src/agent.ts";
 import { AppError } from "../errors.ts";
 import type { AgentService } from "./service.ts";
 
@@ -57,9 +57,21 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
       await service.answer(c.get("owner"), c.req.param("id"), body.answer, body.fields),
     );
   });
-  app.post("/goals", async (c) =>
-    c.json(await service.createGoal(c.get("owner"), await c.req.json()), 201),
-  );
+  app.post("/goals", async (c) => {
+    // Same idempotency-key pattern as POST /tasks: a retried creation with
+    // the same requestId returns the first goal instead of duplicating it.
+    const { requestId, ...input } = goalInputSchema
+      .extend({ requestId: z.string().min(1).max(200).optional() })
+      .parse(await c.req.json());
+    return c.json(
+      await service.createGoal(
+        c.get("owner"),
+        input,
+        requestId ? createHash("sha256").update(`goal:${requestId}`).digest("hex") : undefined,
+      ),
+      201,
+    );
+  });
   app.post("/goals/:id", async (c) => {
     const body = goalPatchSchema.parse(await c.req.json());
     return c.json(await service.updateGoal(c.get("owner"), c.req.param("id"), body));

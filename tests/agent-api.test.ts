@@ -588,3 +588,26 @@ test("a change watch alerts on a change past the saved lines", async () => {
     await read(`/monitors/${monitor.id}/control`, { action: "stop" });
   }
 });
+
+test("a retried goal creation with the same requestId returns the first goal", async () => {
+  const before = await read<AgentWorkspace>("");
+  const first = await read<Goal>(
+    "/goals",
+    { title: "Learn the cello", milestones: ["Rent an instrument"], requestId: "sb1-goal-retry" },
+    201,
+  );
+  const retried = await read<Goal>(
+    "/goals",
+    { title: "Learn the cello", milestones: ["Rent an instrument"], requestId: "sb1-goal-retry" },
+    201,
+  );
+  assert.equal(retried.id, first.id);
+  const after = await read<AgentWorkspace>("");
+  assert.equal(after.goals.length, before.goals.length + 1);
+  const distinct = await read<Goal>(
+    "/goals",
+    { title: "Learn the cello", milestones: ["Rent an instrument"], requestId: "sb1-goal-other" },
+    201,
+  );
+  assert.notEqual(distinct.id, first.id);
+});

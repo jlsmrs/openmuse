@@ -104,6 +104,8 @@ export interface ListEventsOptions {
   calendarId?: string;
   timeMin?: string;
   timeMax?: string;
+  /** Opaque page token from a previous listEventsPage result, if any. */
+  pageToken?: string;
 }
 
 interface GmailPart {
@@ -830,18 +832,24 @@ export class GoogleClient {
    * deadline expiry reports a clear timeout instead of letting the agent
    * runtime kill the call; an oversized or over-nested message is isolated
    * to a note row (M8/M9), while any other single message failure still
-   * fails the list.
+   * fails the list. The provider's next-page token is returned so callers
+   * can page past the first 100 matches instead of silently truncating.
    */
   private async listMessages(
     query: string,
     fetchOne: (id: string, signal: AbortSignal) => Promise<Mail>,
-  ): Promise<Mail[]> {
+    pageToken?: string,
+  ): Promise<{ messages: Mail[]; nextPageToken?: string }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.mailListDeadlineMs);
     try {
       const params = new URLSearchParams({ maxResults: "100", q: query });
+      if (pageToken) params.set("pageToken", pageToken);
       const list = z
-        .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
+        .object({
+          messages: z.array(z.object({ id: z.string() })).default([]),
+          nextPageToken: z.string().min(1).optional(),
+        })
         .parse(
           await this.request(
             `${GMAIL}/messages?${params}`,
@@ -897,7 +905,7 @@ export class GoogleClient {
           ),
         ),
       ]);
-      return results;
+      return { messages: results, nextPageToken: list.nextPageToken };
     } finally {
       clearTimeout(timer);
     }
@@ -905,19 +913,21 @@ export class GoogleClient {
 
   /** The latest 100 matching messages. Permission/read failures propagate visibly. */
   async listMail(query = "in:inbox"): Promise<Mail[]> {
-    return this.listMessages(query, async (id, signal) =>
-      this.mapMessage(
-        messageSchema.parse(
-          await this.request(
-            `${GMAIL}/messages/${idPath(id)}?format=full`,
-            "GET",
-            undefined,
-            {},
-            signal,
+    return (
+      await this.listMessages(query, async (id, signal) =>
+        this.mapMessage(
+          messageSchema.parse(
+            await this.request(
+              `${GMAIL}/messages/${idPath(id)}?format=full`,
+              "GET",
+              undefined,
+              {},
+              signal,
+            ),
           ),
         ),
-      ),
-    );
+      )
+    ).messages;
   }
 
   /**
@@ -925,23 +935,30 @@ export class GoogleClient {
    * Full bodies are slow (100 large fetches exceed the agent runtime's window)
    * and too large for one reply, so lists, counts and tables use this path
    * and full bodies come from getThread for a selected message instead.
-   * Permission/read failures propagate visibly.
+   * Permission/read failures propagate visibly. Pass the previous page's
+   * nextPageToken to read the next 100 matches.
    */
-  async listMailMetadata(query = "in:inbox"): Promise<Mail[]> {
+  async listMailMetadata(
+    query = "in:inbox",
+    pageToken?: string,
+  ): Promise<{ messages: Mail[]; nextPageToken?: string }> {
     const meta = new URLSearchParams({ format: "metadata" });
     for (const header of ["From", "Subject", "Date", "To"]) meta.append("metadataHeaders", header);
-    return this.listMessages(query, async (id, signal) =>
-      this.mapMessage(
-        messageSchema.parse(
-          await this.request(
-            `${GMAIL}/messages/${idPath(id)}?${meta}`,
-            "GET",
-            undefined,
-            {},
-            signal,
+    return this.listMessages(
+      query,
+      async (id, signal) =>
+        this.mapMessage(
+          messageSchema.parse(
+            await this.request(
+              `${GMAIL}/messages/${idPath(id)}?${meta}`,
+              "GET",
+              undefined,
+              {},
+              signal,
+            ),
           ),
         ),
-      ),
+      pageToken,
     );
   }
 
@@ -972,6 +989,7 @@ export class GoogleClient {
       timeMin,
       timeMax,
     });
+    if (options.pageToken) params.set("pageToken", options.pageToken);
     const result = z
       .object({
         items: z.array(z.unknown()).default([]),
@@ -982,6 +1000,7 @@ export class GoogleClient {
     return {
       events: result.items.slice(0, 100).map((item) => mapEvent(item, calendarId, result.timeZone)),
       truncated: Boolean(result.nextPageToken) || result.items.length > 100,
+      nextPageToken: result.nextPageToken,
     };
   }
 
