@@ -48,7 +48,10 @@ test("main chat is provisioned for the authenticated owner before the first run"
   );
   const first = await (await app.request("/api/main-thread", { headers: headers() })).json();
   const reopened = await (await app.request("/api/main-thread", { headers: headers() })).json();
-  assert.equal(first.existing, true);
+  // S-B4 item 6: the first call creates the thread, so it did not exist
+  // before; the reopened call reports the thread that was already there.
+  assert.equal(first.existing, false);
+  assert.equal(reopened.existing, true);
   assert.equal(reopened.threadId, first.threadId);
   assert.ok(
     calls.every(

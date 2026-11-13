@@ -285,3 +285,120 @@ test("a rotated refresh token survives a second refresh", async (t) => {
     "the rotated token survives a refresh that returns none",
   );
 });
+
+// S-B4 item 2: revocation is attempted before the credential is cleared, so
+// a failed revocation keeps the grant and can be retried instead of leaving
+// Google holding a grant we can no longer revoke.
+test("a failed Google revocation keeps the credential so disconnect can be retried", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const config = oauthConfig();
+  const key = config.encryptionKey;
+  assert.ok(key);
+  await db.put("revoke-owner", "credentials", {
+    id: "google",
+    connectionId: "connection-1",
+    secret: encryptSecret(
+      JSON.stringify({
+        connectionId: "connection-1",
+        accessToken: "access-1",
+        refreshToken: "refresh-1",
+        expiresAt: Date.now() + 3600_000,
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        account: "me@example.com",
+      }),
+      key,
+    ),
+  });
+  const auth = new GoogleAuth(db, config);
+  let revokeStatus = 500;
+  t.mock.method(globalThis, "fetch", async () => new Response(null, { status: revokeStatus }));
+  await assert.rejects(auth.disconnect("revoke-owner"), /revocation failed/);
+  assert.notEqual(await auth.tokens("revoke-owner"), null);
+  revokeStatus = 200;
+  await auth.disconnect("revoke-owner");
+  assert.equal(await auth.tokens("revoke-owner"), null);
+});
+
+// S-B4 item 3: reconnecting unions previously granted scopes into the new
+// request, unless the caller asks for a scope reset.
+test("reconnect unions previously granted scopes unless reset", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const config = oauthConfig();
+  const key = config.encryptionKey;
+  assert.ok(key);
+  const driveScope = "https://www.googleapis.com/auth/drive.readonly";
+  await db.put("scope-owner", "credentials", {
+    id: "google",
+    connectionId: "connection-1",
+    secret: encryptSecret(
+      JSON.stringify({
+        connectionId: "connection-1",
+        accessToken: "access-1",
+        refreshToken: "refresh-1",
+        expiresAt: Date.now() + 3600_000,
+        scopes: [driveScope],
+        account: "me@example.com",
+      }),
+      key,
+    ),
+  });
+  const auth = new GoogleAuth(db, config);
+  const kept =
+    new URL((await auth.connect("scope-owner", false)).url).searchParams.get("scope") ?? "";
+  assert.ok(kept.split(" ").includes(driveScope));
+  const reset =
+    new URL((await auth.connect("scope-owner", false, { resetScopes: true })).url).searchParams.get(
+      "scope",
+    ) ?? "";
+  assert.ok(!reset.split(" ").includes(driveScope));
+  assert.ok(reset.split(" ").includes("https://www.googleapis.com/auth/gmail.readonly"));
+});
+
+// S-B4 item 4: when Google omits the scope field, the stored scopes are
+// what Google returned (none) — not the requested scopes — and the grant is
+// marked uncertain.
+test("a callback without a scope field stores no scopes and marks the grant uncertain", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const auth = new GoogleAuth(db, oauthConfig());
+  const { url } = await auth.connect("scope-uncertain", true);
+  const state = new URL(url).searchParams.get("state");
+  assert.ok(state);
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    if (String(input).includes("/token"))
+      return Response.json({ access_token: "token-access", expires_in: 3600 });
+    return Response.json({ emailAddress: "me@example.com" });
+  });
+  await auth.callback(state, "synthetic-code");
+  const tokens = await auth.tokens("scope-uncertain");
+  assert.deepEqual(tokens?.scopes, []);
+  assert.equal(tokens?.scopesUncertain, true);
+});
+
+test("a callback with a scope field stores exactly the returned scopes", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const auth = new GoogleAuth(db, oauthConfig());
+  const { url } = await auth.connect("scope-certain", true);
+  const state = new URL(url).searchParams.get("state");
+  assert.ok(state);
+  const returned = [
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/calendar.events.readonly",
+  ];
+  t.mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+    if (String(input).includes("/token"))
+      return Response.json({
+        access_token: "token-access",
+        expires_in: 3600,
+        scope: returned.join(" "),
+      });
+    return Response.json({ emailAddress: "me@example.com" });
+  });
+  await auth.callback(state, "synthetic-code");
+  const tokens = await auth.tokens("scope-certain");
+  assert.deepEqual(tokens?.scopes, returned);
+  assert.equal(tokens?.scopesUncertain, false);
+});

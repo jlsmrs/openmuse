@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import {
   browserWorkerUrl,
@@ -193,4 +196,89 @@ test("oversized standing instructions warn at startup; a sane size stays quiet",
   delete process.env.OPENMUSE_INSTRUCTIONS;
   readConfig();
   assert.equal(warnings.length, 0);
+});
+
+// S-B4 item 11: PORT is validated and fails fast instead of silently
+// producing NaN or an out-of-range port.
+test("PORT must be a valid integer port", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  for (const bad of ["0", "65536", "abc", "1.5", "-1", ""]) {
+    process.env.PORT = bad;
+    assert.throws(() => readConfig(), { message: /PORT must be an integer between 1 and 65535/ });
+  }
+  process.env.PORT = "8080";
+  assert.equal(readConfig().port, 8080);
+  delete process.env.PORT;
+  assert.equal(readConfig().port, 8787);
+});
+
+// S-B4 item 12: a trailing slash on the public URL does not double the
+// Google redirect path.
+test("a trailing slash on the public URL does not double the redirect path", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  process.env.PUBLIC_API_URL = "https://example.com/";
+  assert.equal(readConfig().googleRedirectUri, "https://example.com/api/google/callback");
+  process.env.PUBLIC_API_URL = "https://example.com///";
+  assert.equal(readConfig().googleRedirectUri, "https://example.com/api/google/callback");
+});
+
+// S-B4 item 13: ALLOWED_ORIGINS entries are trimmed and empty entries dropped.
+test("ALLOWED_ORIGINS entries are trimmed and empty entries dropped", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "sample";
+  process.env.HOST = "127.0.0.1";
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  process.env.ALLOWED_ORIGINS = " https://a.example , ,https://b.example ";
+  assert.deepEqual(readConfig().allowedOrigins, ["https://a.example", "https://b.example"]);
+});
+
+// S-B4 item 14: live mode enforces the 32-byte base64 encryption key its
+// error message claims, instead of only checking presence.
+test("live mode rejects an encryption key that is not 32-byte base64", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "live";
+  process.env.AGENT_BACKEND = "model";
+  process.env.HOST = "127.0.0.1";
+  process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
+  process.env.OPENMUSE_ACCESS_KEY = "test-access-key-24-chars!!";
+  for (const bad of ["short", Buffer.alloc(16).toString("base64"), "not-base64!!!"]) {
+    process.env.TOKEN_ENCRYPTION_KEY = bad;
+    assert.throws(() => readConfig(), { message: /32-byte base64/ });
+  }
+  process.env.TOKEN_ENCRYPTION_KEY = Buffer.alloc(32).toString("base64");
+  assert.equal(readConfig().mode, "live");
+});
+
+// S-B4 item 10: the .env path is resolved from the server file, not the
+// process working directory — a .env in the CWD must not be picked up.
+test("the .env path is resolved from the server file, not the working directory", async (t) => {
+  const { resolveDotEnvPath } = await import("../apps/server/src/config.ts");
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-dotenv-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(join(directory, ".env"), "CPK_INTELLIGENCE_API_KEY=from-cwd\n");
+  const previousCwd = process.cwd();
+  process.chdir(directory);
+  t.after(() => process.chdir(previousCwd));
+  assert.equal(resolveDotEnvPath(), undefined);
 });
