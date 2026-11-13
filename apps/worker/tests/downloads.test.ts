@@ -1,11 +1,15 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createBrowserManager } from "../src/browser.ts";
-import { readDownloadFailures } from "../src/downloads.ts";
+import {
+  enforceDownloadQuota,
+  parseDownloadQuotaBytes,
+  readDownloadFailures,
+} from "../src/downloads.ts";
 
 async function seedOutcome(directory: string, name: string, body: string) {
   const folder = join(directory, "download-outcomes");
@@ -222,4 +226,84 @@ test("the worker starts with a corrupt outcome file and lists the healthy downlo
     listed.failures.map((failure) => failure.id),
     [healthyId],
   );
+});
+
+async function seedPdf(dataDir: string, sessionId: string, id: string, size: number, mtime: Date) {
+  const folder = join(dataDir, sessionId, "downloads");
+  await mkdir(folder, { recursive: true, mode: 0o700 });
+  const pdfPath = join(folder, `${id}.pdf`);
+  await writeFile(pdfPath, Buffer.alloc(size, 37), { mode: 0o600 });
+  await writeFile(
+    join(folder, `${id}.json`),
+    JSON.stringify({ id, name: "document.pdf", size, mimeType: "application/pdf" }),
+    { mode: 0o600 },
+  );
+  await utimes(pdfPath, mtime, mtime);
+}
+
+test("download quota evicts the oldest PDFs first across sessions", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-download-quota-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const sessionA = randomUUID();
+  const sessionB = randomUUID();
+  const oldId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const midId = "bbbbbbbb-2222-4222-8222-222222222222";
+  const newId = "cccccccc-3333-4333-8333-333333333333";
+  await seedPdf(dataDir, sessionA, oldId, 100, new Date("2026-01-01T00:00:00.000Z"));
+  await seedPdf(dataDir, sessionB, midId, 100, new Date("2026-01-02T00:00:00.000Z"));
+  await seedPdf(dataDir, sessionA, newId, 100, new Date("2026-01-03T00:00:00.000Z"));
+
+  // 300 bytes total against a 250-byte quota: only the oldest goes.
+  const result = await enforceDownloadQuota({ dataDir, quotaBytes: 250 });
+  assert.deepEqual(result.evicted, [oldId]);
+  assert.equal(result.totalBytes, 200);
+  await assert.rejects(readFile(join(dataDir, sessionA, "downloads", `${oldId}.pdf`)), {
+    code: "ENOENT",
+  });
+  await assert.rejects(readFile(join(dataDir, sessionA, "downloads", `${oldId}.json`)), {
+    code: "ENOENT",
+  });
+  assert.equal((await readFile(join(dataDir, sessionB, "downloads", `${midId}.pdf`))).length, 100);
+  assert.equal((await readFile(join(dataDir, sessionA, "downloads", `${newId}.pdf`))).length, 100);
+
+  // Under quota, enforcement is a no-op.
+  assert.deepEqual(await enforceDownloadQuota({ dataDir, quotaBytes: 1000 }), {
+    evicted: [],
+    totalBytes: 200,
+  });
+});
+
+test("download quota never evicts the just-published download", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-download-quota-"));
+  t.after(() => rm(dataDir, { recursive: true, force: true }));
+  const session = randomUUID();
+  const oldId = "aaaaaaaa-1111-4111-8111-111111111111";
+  const midId = "bbbbbbbb-2222-4222-8222-222222222222";
+  const newId = "cccccccc-3333-4333-8333-333333333333";
+  await seedPdf(dataDir, session, oldId, 100, new Date("2026-01-01T00:00:00.000Z"));
+  await seedPdf(dataDir, session, midId, 100, new Date("2026-01-02T00:00:00.000Z"));
+  await seedPdf(dataDir, session, newId, 100, new Date("2026-01-03T00:00:00.000Z"));
+
+  // 300 bytes against a 150-byte quota with the oldest protected: the
+  // other two go instead, leaving only the just-published one.
+  const result = await enforceDownloadQuota({
+    dataDir,
+    quotaBytes: 150,
+    exceptId: oldId,
+  });
+  assert.deepEqual(result.evicted, [midId, newId]);
+  assert.equal(result.totalBytes, 100);
+  assert.equal((await readFile(join(dataDir, session, "downloads", `${oldId}.pdf`))).length, 100);
+});
+
+test("download quota parsing accepts bytes and rejects bad values", () => {
+  assert.equal(parseDownloadQuotaBytes(undefined), undefined);
+  assert.equal(parseDownloadQuotaBytes(""), undefined);
+  assert.equal(parseDownloadQuotaBytes("   "), undefined);
+  assert.equal(parseDownloadQuotaBytes("838860800"), 838860800);
+  assert.equal(parseDownloadQuotaBytes("  123  "), 123);
+  assert.throws(() => parseDownloadQuotaBytes("abc"), /WORKER_DOWNLOAD_QUOTA_BYTES/);
+  assert.throws(() => parseDownloadQuotaBytes("0"), /WORKER_DOWNLOAD_QUOTA_BYTES/);
+  assert.throws(() => parseDownloadQuotaBytes("-5"), /WORKER_DOWNLOAD_QUOTA_BYTES/);
+  assert.throws(() => parseDownloadQuotaBytes("1.5"), /WORKER_DOWNLOAD_QUOTA_BYTES/);
 });
