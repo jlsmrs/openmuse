@@ -51,6 +51,16 @@ services:
         sync: false
       # Delete these two entries, and the openmuse-browser service below, to
       # deploy without browsing. The API boots either way.
+      # API-to-worker transport (G3): Render provides no managed TLS for
+      # private-service traffic, and the worker serves plain HTTP only
+      # (apps/worker/src/server.ts uses node:http) — so this hop stays
+      # http:// on Render's workspace-scoped private network, by
+      # deliberate choice, not by omission. The worker token still
+      # travels only as an Authorization: Bearer header, and the worker
+      # rejects every non-health request without it (application-layer
+      # authorization, per Render's own private-networking guidance).
+      # If the browser service is ever made public, switch this to its
+      # https RENDER_EXTERNAL_URL instead.
       - key: BROWSER_WORKER_URL
         value: http://openmuse-browser:8790
       - key: WORKER_TOKEN
@@ -78,6 +88,13 @@ services:
         value: 0.0.0.0
       - key: WORKER_DATA_DIR
         value: /data
+      # Total PDF store quota, bytes (G2): the per-session caps alone
+      # allow 20 profiles × 20 PDFs × 10 MiB (~3.9 GiB), but this disk
+      # is 1 GiB — so the worker enforces this quota, evicting the
+      # oldest PDFs first. 800 MiB leaves room for Chromium profiles,
+      # session state, and temp files on the same disk.
+      - key: WORKER_DOWNLOAD_QUOTA_BYTES
+        value: "838860800"
 
   - type: web
     name: openmuse-web
