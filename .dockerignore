@@ -1,0 +1,10 @@
+# Build context for the API image (Dockerfile.api, context = repo root).
+# A local node_modules in the build context breaks `pnpm install` in the
+# image build: pnpm tries to purge the copied modules directory and aborts
+# with ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY (no TTY in ACR builds).
+# This happened on the S-B8 deploy (Nov 13, 2026) when the Cloud Shell clone
+# had accumulated a 1.3 GB node_modules from the web build's pnpm install.
+# The build reinstalls everything from the lockfile, so excluding the local
+# tree is safe — and it keeps the 1.3 GB out of the uploaded context.
+node_modules
+.git
