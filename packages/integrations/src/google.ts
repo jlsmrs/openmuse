@@ -3,6 +3,7 @@ import { type DefaultTreeAdapterMap, parseFragment } from "parse5";
 import { z } from "zod";
 import {
   type CalendarEvent,
+  calendarEventSchema,
   calendarRangeSchema,
   type EmailDraft,
   type EventDraft,
@@ -10,6 +11,7 @@ import {
   eventDraftSchema,
   type Mail,
   type MailMetadata,
+  mailSchema,
   toMailMetadata,
 } from "../../domain/src/index.ts";
 
@@ -416,6 +418,22 @@ function isAttachedPart(part: GmailPart): boolean {
   );
 }
 
+/**
+ * Validate a mapper's output against its shared domain schema (R2). A shape
+ * failure is a mapping bug, not a per-message content problem: it throws
+ * with the offending fields named. The list path treats it like any other
+ * mapping failure — the list fails visibly — instead of a note row, which
+ * is reserved for oversized/over-nested messages.
+ */
+function parseMapped<T>(schema: z.ZodType<T>, value: unknown, what: string): T {
+  const result = schema.safeParse(value);
+  if (result.success) return result.data;
+  const detail = result.error.issues
+    .map((issue) => `${issue.path.join(".") || "(root)"}: ${issue.message}`)
+    .join("; ");
+  throw new Error(`${what} failed validation: ${detail}`);
+}
+
 function mapMessage(message: z.infer<typeof messageSchema>): Mail {
   const metadata = headers(message.payload);
   const allHeaders = headersAll(message.payload);
@@ -475,7 +493,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
       ? html.join("\n\n")
       : decodeSnippet(message.snippet);
   if (body.length > 1024 * 1024) throw new Error(OVERSIZED_MESSAGE_TEXT);
-  return {
+  const mail: Mail = {
     id: message.id,
     threadId: message.threadId,
     from: address,
@@ -498,6 +516,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
             : "Mail",
     attachments,
   };
+  return parseMapped(mailSchema, mail, "Mapped mail");
 }
 
 function mapEvent(value: unknown, calendarId: string, calendarTimeZone = "UTC"): CalendarEvent {
@@ -507,7 +526,7 @@ function mapEvent(value: unknown, calendarId: string, calendarTimeZone = "UTC"):
   const end = allDay ? event.end.date : event.end.dateTime;
   if (!start || !end || !Number.isFinite(Date.parse(start)) || !Number.isFinite(Date.parse(end)))
     throw new Error("Invalid Google event time range");
-  return {
+  const mapped: CalendarEvent = {
     id: event.id,
     calendarId,
     title: event.summary,
@@ -519,6 +538,7 @@ function mapEvent(value: unknown, calendarId: string, calendarTimeZone = "UTC"):
     description: event.description,
     attendees: event.attendees.map((attendee) => attendee.email),
   };
+  return parseMapped(calendarEventSchema, mapped, "Mapped calendar event");
 }
 function eventBody(draft: EventDraft, patch = false) {
   return {
