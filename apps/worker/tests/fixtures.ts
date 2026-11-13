@@ -35,6 +35,32 @@ export async function createBrowserFixture(options: { host?: string; port?: numb
       response.end(pdf ? fixturePdf : "Unsupported download.");
       return;
     }
+    if (path === "/slow-download.pdf") {
+      // A ~2 MiB PDF streamed slowly so the worker's oversize monitor
+      // ticks several times mid-transfer: the monitor must watch only
+      // this capture's temp file, not a stale oversized file sharing the
+      // session temp dir.
+      response.writeHead(200, {
+        "content-type": "application/pdf",
+        "content-disposition": 'attachment; filename="slow.pdf"',
+      });
+      const total = 2 * 1024 * 1024;
+      let sent = 0;
+      const timer = setInterval(() => {
+        const next = Math.min(sent + 64 * 1024, total);
+        const chunk = Buffer.alloc(next - sent, 0);
+        if (sent < fixturePdf.length)
+          fixturePdf.copy(chunk, 0, sent, Math.min(next, fixturePdf.length));
+        sent = next;
+        response.write(chunk);
+        if (sent >= total) {
+          clearInterval(timer);
+          response.end();
+        }
+      }, 50);
+      response.on("close", () => clearInterval(timer));
+      return;
+    }
     let body: string;
     if (path === "/page") body = fixtureText;
     else if (path === "/other") body = "Another fixture page.";
