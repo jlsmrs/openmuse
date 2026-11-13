@@ -17,6 +17,7 @@ function config(dataDir: string): Config {
     publicUrl: "http://localhost:8787",
     dataDir,
     agentBackend: "sample",
+    intelligenceApiKey: "test-project-key-never-sent",
     allowedOrigins: [],
     googleRedirectUri: "http://localhost:8787/api/google/callback",
   };

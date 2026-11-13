@@ -17,6 +17,7 @@ import {
   isTextReadableMime,
   mimeTypeForFile,
   readabilityNote,
+  sniffMimeType,
 } from "../apps/server/src/files.ts";
 import { createSamplePdf } from "../packages/integrations/src/pdf.ts";
 
@@ -56,7 +57,7 @@ after(async () => {
   await rm(directory, { recursive: true, force: true });
 });
 
-test("mime types resolve from extension, and a provided type wins", () => {
+test("mime types resolve from extension; a provided type is a claim, not evidence", () => {
   assert.equal(mimeTypeForFile("notes.txt"), "text/plain");
   assert.equal(mimeTypeForFile("notes.MD"), "text/markdown");
   assert.equal(mimeTypeForFile("data.csv"), "text/csv");
@@ -73,11 +74,39 @@ test("mime types resolve from extension, and a provided type wins", () => {
   assert.equal(mimeTypeForFile("archive.zip"), "application/zip");
   assert.equal(mimeTypeForFile("mystery.xyz"), "application/octet-stream");
   assert.equal(mimeTypeForFile("noextension"), "application/octet-stream");
-  assert.equal(mimeTypeForFile("notes.txt", "text/csv"), "text/csv");
+  // A provided type that agrees with the extension is accepted; one that
+  // disagrees is not — the stored type follows the filename, never the claim.
+  assert.equal(mimeTypeForFile("notes.txt", "text/plain"), "text/plain");
+  assert.equal(mimeTypeForFile("notes.txt", "text/csv"), "text/plain");
+  assert.equal(mimeTypeForFile("notes.txt", "application/pdf"), "text/plain");
   assert.equal(mimeTypeForFile("notes.txt", "application/octet-stream"), "text/plain");
+  // With no extension to contradict it, a recognised provided type is used.
+  assert.equal(mimeTypeForFile("noextension", "text/csv"), "text/csv");
+  assert.equal(
+    mimeTypeForFile("noextension", "application/x-unknown-type"),
+    "application/octet-stream",
+  );
   assert.equal(extensionOf("a/b/c.DOCX"), "docx");
   assert.equal(extensionOf("noextension"), "");
   assert.equal(extensionOf("trailing."), "");
+});
+
+test("sniffed bytes beat the filename and the claimed type", () => {
+  const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0]);
+  assert.equal(sniffMimeType(png), "image/png");
+  assert.equal(sniffMimeType(new TextEncoder().encode("%PDF-1.7 rest")), "application/pdf");
+  assert.equal(
+    sniffMimeType(new TextEncoder().encode("<!DOCTYPE html><html><body>hi")),
+    "text/html",
+  );
+  assert.equal(sniffMimeType(new TextEncoder().encode("  <html><body>hi")), "text/html");
+  assert.equal(
+    sniffMimeType(new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg">')),
+    "image/svg+xml",
+  );
+  assert.equal(sniffMimeType(new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0])), "application/zip");
+  assert.equal(sniffMimeType(new TextEncoder().encode("plain text, no signature")), undefined);
+  assert.equal(sniffMimeType(new Uint8Array(0)), undefined);
 });
 
 test("readability flags: text readable, PDF via intake, the rest plainly flagged", () => {
@@ -171,5 +200,65 @@ test("upload route accepts a text file and serves it with its real type", async 
   });
   assert.equal(content.status, 200);
   assert.equal(content.headers.get("content-type"), "text/plain");
+  // Stored bytes are served from the API origin: sandboxed, never sniffed.
+  assert.equal(content.headers.get("content-security-policy"), "sandbox");
+  assert.equal(content.headers.get("x-content-type-options"), "nosniff");
   assert.equal(await content.text(), "hello route");
+});
+
+test("an HTML file claimed as plain text is stored and served as HTML, sandboxed", async () => {
+  const html = "<!DOCTYPE html><html><body><script>alert(1)</script></body></html>";
+  const form = new FormData();
+  form.append("file", new File([html], "notes.txt", { type: "text/plain" }));
+  const uploaded = await app.request("/api/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  assert.equal(uploaded.status, 201);
+  const artifact = await uploaded.json();
+  assert.equal(artifact.mimeType, "text/html");
+  const content = await app.request(`/api/files/${artifact.id}/content`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(content.status, 200);
+  assert.equal(content.headers.get("content-type"), "text/html");
+  assert.equal(content.headers.get("content-security-policy"), "sandbox");
+});
+
+test("a ZIP-sniffed office file keeps its office type; a real ZIP stays a ZIP", async () => {
+  const zipBytes = new Uint8Array([0x50, 0x4b, 0x03, 0x04, 0, 0, 0, 0]);
+  const docx = await files.import("upload-anything", "report.docx", zipBytes, "test");
+  assert.equal(
+    docx.mimeType,
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  );
+  const zip = await files.import("upload-anything", "archive.zip", zipBytes, "test");
+  assert.equal(zip.mimeType, "application/zip");
+});
+
+test("a keyed import re-imports when the stored bytes are gone", async () => {
+  const owner = "upload-anything";
+  const key = JSON.stringify(["sb3-keyed-missing-bytes", "v1"]);
+  const first = await files.import(
+    owner,
+    "keyed.txt",
+    new TextEncoder().encode("first"),
+    "test",
+    undefined,
+    key,
+  );
+  assert.equal(new TextDecoder().decode(await files.bytes(owner, first.id)), "first");
+  await rm(join(directory, "files", `${first.id}.txt`));
+  await assert.rejects(files.bytes(owner, first.id), /ENOENT/);
+  const second = await files.import(
+    owner,
+    "keyed.txt",
+    new TextEncoder().encode("second"),
+    "test",
+    undefined,
+    key,
+  );
+  assert.equal(second.id, first.id, "the same operation key resolves to the same file");
+  assert.equal(new TextDecoder().decode(await files.bytes(owner, second.id)), "second");
 });

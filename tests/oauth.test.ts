@@ -24,6 +24,7 @@ function oauthConfig(): Config {
     publicUrl: "http://localhost:8787",
     dataDir: "unused",
     agentBackend: "model",
+    intelligenceApiKey: "test-project-key-never-sent",
     allowedOrigins: [],
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     googleClientId: "synthetic-client",
@@ -43,6 +44,7 @@ test("old refresh cannot overwrite a newly connected Google account", async (t) 
     publicUrl: "http://localhost:8787",
     dataDir: "unused",
     agentBackend: "model",
+    intelligenceApiKey: "test-project-key-never-sent",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
     encryptionKey: key,
@@ -102,6 +104,7 @@ test("OAuth callbacks require a known, single-use state", async (t) => {
     publicUrl: "http://localhost:8787",
     dataDir: "unused",
     agentBackend: "model",
+    intelligenceApiKey: "test-project-key-never-sent",
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: [],
   };
@@ -238,4 +241,47 @@ test("an in-flight refresh cannot restore credentials after disconnect", async (
   release.resolve();
   await assert.rejects(refresh, /disconnected/i);
   assert.equal(await auth.tokens("refresh-disconnect"), null);
+});
+
+test("a rotated refresh token survives a second refresh", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const key = randomBytes(32).toString("base64");
+  const config: Config = { ...oauthConfig(), encryptionKey: key };
+  const seed = async (tokens: Record<string, unknown>) => {
+    await db.put("owner", "credentials", {
+      id: "google",
+      connectionId: tokens.connectionId,
+      secret: encryptSecret(JSON.stringify(tokens), key),
+    });
+  };
+  await seed({
+    connectionId: "connection-1",
+    accessToken: "old-access",
+    refreshToken: "old-refresh",
+    expiresAt: 0,
+    scopes: [],
+    account: "owner@example.com",
+  });
+  const auth = new GoogleAuth(db, config);
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls += 1;
+    // First refresh rotates the refresh token; the second returns none.
+    return calls === 1
+      ? Response.json({ access_token: "access-1", refresh_token: "new-refresh", expires_in: 3600 })
+      : Response.json({ access_token: "access-2", expires_in: 3600 });
+  });
+  assert.equal(await auth.accessToken("owner"), "access-1");
+  assert.equal((await auth.tokens("owner"))?.refreshToken, "new-refresh");
+  // Expire the stored tokens again so the next call refreshes a second time.
+  const stored = await auth.tokens("owner");
+  assert.ok(stored);
+  await seed({ ...stored, expiresAt: 0 });
+  assert.equal(await auth.accessToken("owner"), "access-2");
+  assert.equal(
+    (await auth.tokens("owner"))?.refreshToken,
+    "new-refresh",
+    "the rotated token survives a refresh that returns none",
+  );
 });
