@@ -31,6 +31,25 @@ const READ_RETRY_BASE_MS = 200;
 const READ_RETRY_MAX_DELAY_MS = 5_000;
 const MAIL_LIST_TIMEOUT_MESSAGE =
   "Mail list timed out before Google finished; narrow the search and try again";
+/** The 1 MiB cap on one message's visible text; the limit itself never moves. */
+const OVERSIZED_MESSAGE_TEXT = "Gmail message text exceeds the 1 MiB limit";
+/** Body carried by a list row whose message was too large to include (M8). */
+const OVERSIZED_MESSAGE_NOTE =
+  "This message exceeds the 1 MiB limit, so its text was not included in this list.";
+/**
+ * True only for the size errors one message's text can throw while mapping:
+ * the 1 MiB body cap, and the per-part decode cap (a single text part over
+ * 1 MiB). In the list path the decode helper only runs on message text, so
+ * these mean "this message is too big" — anything else still fails the list.
+ */
+function isOversizedMessageError(error: unknown): boolean {
+  return (
+    error instanceof Error &&
+    (error.message === OVERSIZED_MESSAGE_TEXT ||
+      error.message === "Attachment or message body exceeds the size limit" ||
+      error.message === "Attachment or message body is too large")
+  );
+}
 
 export class OutcomeUnknownError extends Error {
   readonly code = "outcome_unknown";
@@ -399,7 +418,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
     : html.length
       ? html.join("\n\n")
       : decodeSnippet(message.snippet);
-  if (body.length > 1024 * 1024) throw new Error("Gmail message text exceeds the 1 MiB limit");
+  if (body.length > 1024 * 1024) throw new Error(OVERSIZED_MESSAGE_TEXT);
   return {
     id: message.id,
     threadId: message.threadId,
@@ -562,11 +581,9 @@ export class GoogleClient {
         part.body?.data === undefined &&
         part.body?.attachmentId
       ) {
-        if ((part.body.size ?? 0) > 1024 * 1024)
-          throw new Error("Gmail message text exceeds the 1 MiB limit");
+        if ((part.body.size ?? 0) > 1024 * 1024) throw new Error(OVERSIZED_MESSAGE_TEXT);
         const bytes = await this.getAttachment(message.id, part.body.attachmentId);
-        if (bytes.length > 1024 * 1024)
-          throw new Error("Gmail message text exceeds the 1 MiB limit");
+        if (bytes.length > 1024 * 1024) throw new Error(OVERSIZED_MESSAGE_TEXT);
         part.body.data = Buffer.from(bytes).toString("base64url");
       }
       for (const child of part.parts ?? []) await hydrate(child, depth + 1);
@@ -751,11 +768,47 @@ export class GoogleClient {
   }
 
   /**
+   * Best-effort row for a message whose text exceeds the 1 MiB limit: keep
+   * its real sender/subject/date from a headers-only re-fetch and carry a
+   * note instead of the body, so one oversized message cannot fail the list.
+   * The re-fetch is mapped with the module-level mapMessage only — no
+   * hydration — so a metadata response cannot throw the oversized error
+   * again. If even the headers cannot be read, fall back to a bare row.
+   */
+  private async oversizedNote(id: string, signal: AbortSignal): Promise<Mail> {
+    try {
+      const meta = new URLSearchParams({ format: "metadata" });
+      for (const header of ["From", "Subject", "Date", "To"])
+        meta.append("metadataHeaders", header);
+      const parsed = messageSchema.parse(
+        await this.request(`${GMAIL}/messages/${idPath(id)}?${meta}`, "GET", undefined, {}, signal),
+      );
+      const mail = mapMessage(parsed);
+      return { ...mail, body: OVERSIZED_MESSAGE_NOTE };
+    } catch {
+      return {
+        id,
+        threadId: "",
+        from: "",
+        sender: "",
+        to: [],
+        subject: "(No subject)",
+        body: OVERSIZED_MESSAGE_NOTE,
+        date: "",
+        unread: false,
+        label: "Mail",
+        attachments: [],
+      };
+    }
+  }
+
+  /**
    * Fetch one page of message IDs, then fetch each message with bounded
    * concurrency under one overall deadline. Results keep list order. A
    * deadline expiry reports a clear timeout instead of letting the agent
-   * runtime kill the call; a single message failure still fails the list
-   * (per-message isolation is M8/M9).
+   * runtime kill the call; an oversized message is isolated to a note row
+   * (M8), while any other single message failure still fails the list
+   * (nesting isolation is M9).
    */
   private async listMessages(
     query: string,
@@ -785,7 +838,14 @@ export class GoogleClient {
           while (next < ids.length) {
             if (controller.signal.aborted) return;
             const index = next++;
-            results[index] = await fetchOne(ids[index], controller.signal);
+            try {
+              results[index] = await fetchOne(ids[index], controller.signal);
+            } catch (error) {
+              // One oversized message must not fail the whole list (M8):
+              // keep its row with a note. Any other failure still fails it.
+              if (!isOversizedMessageError(error)) throw error;
+              results[index] = await this.oversizedNote(ids[index], controller.signal);
+            }
           }
         },
       );
