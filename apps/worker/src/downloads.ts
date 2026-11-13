@@ -5,9 +5,22 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { Download } from "playwright";
-import { pdfMarkerAtStart } from "../../../packages/integrations/src/pdf.ts";
 
 export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+
+/**
+ * The "%PDF-" marker must start within the first 5 bytes of the file
+ * (offset 0, or after a 3-byte UTF-8 BOM with an optional line feed).
+ * Defined locally, not imported: the worker image contains only
+ * apps/worker, so a cross-package import (packages/...) resolves in the
+ * repo-root test run but crash-loops the deployed worker with
+ * ERR_MODULE_NOT_FOUND (S-B7 did exactly that). Keep in agreement with
+ * pdfMarkerAtStart() in packages/integrations/src/pdf.ts — the
+ * browser-pdf-prefix tests pin both paths to the same cases.
+ */
+function pdfMarkerAtStart(bytes: Uint8Array): boolean {
+  return Buffer.from(bytes.subarray(0, 9)).indexOf("%PDF-") >= 0;
+}
 export interface PdfDownload {
   id: string;
   name: string;
