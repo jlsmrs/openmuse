@@ -50,6 +50,19 @@ function isOversizedMessageError(error: unknown): boolean {
       error.message === "Attachment or message body is too large")
   );
 }
+/** The 30-deep cap on one message's MIME nesting; the limit itself never moves. */
+const OVER_NESTED_MESSAGE_TEXT = "Gmail message MIME nesting exceeds the limit";
+/** Body carried by a list row whose message is nested too deeply to include (M9). */
+const OVER_NESTED_MESSAGE_NOTE =
+  "This message is nested too deeply to display, so its text was not included in this list.";
+/**
+ * True only for the nesting error one message's MIME tree can throw while
+ * mapping: the >30 depth guard in the body walk and in hydration. Anything
+ * else still fails the list.
+ */
+function isOverNestedMessageError(error: unknown): boolean {
+  return error instanceof Error && error.message === OVER_NESTED_MESSAGE_TEXT;
+}
 
 export class OutcomeUnknownError extends Error {
   readonly code = "outcome_unknown";
@@ -373,7 +386,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
   const html: string[] = [];
   const attachments: string[] = [];
   const visit = (part: GmailPart, depth: number) => {
-    if (depth > 30) throw new Error("Gmail message MIME nesting exceeds the limit");
+    if (depth > 30) throw new Error(OVER_NESTED_MESSAGE_TEXT);
     // Attachments carry their own content (or an attached message); never merge
     // their parts into the parent text. Unattached remote text is hydrated above
     // and still counts as message text.
@@ -572,7 +585,7 @@ export class GoogleClient {
 
   private async mapMessage(message: z.infer<typeof messageSchema>): Promise<Mail> {
     const hydrate = async (part: GmailPart, depth: number): Promise<void> => {
-      if (depth > 30) throw new Error("Gmail message MIME nesting exceeds the limit");
+      if (depth > 30) throw new Error(OVER_NESTED_MESSAGE_TEXT);
       // Attached MIME trees are not part of the parent body. Leave their content
       // lazy, matching the module-level mapMessage visible-text extractor.
       if (isAttachedPart(part)) return;
@@ -768,14 +781,22 @@ export class GoogleClient {
   }
 
   /**
-   * Best-effort row for a message whose text exceeds the 1 MiB limit: keep
-   * its real sender/subject/date from a headers-only re-fetch and carry a
-   * note instead of the body, so one oversized message cannot fail the list.
-   * The re-fetch is mapped with the module-level mapMessage only — no
-   * hydration — so a metadata response cannot throw the oversized error
-   * again. If even the headers cannot be read, fall back to a bare row.
+   * Best-effort row for a message whose text cannot be listed: keep its
+   * real sender/subject/date from a headers-only re-fetch and carry a note
+   * instead of the body, so one bad message cannot fail the list. The
+   * re-fetch is mapped with the module-level mapMessage only — no
+   * hydration. When stripParts is set (M9), the re-fetched part tree is
+   * dropped before mapping, so the note path itself can never throw the
+   * nesting error again (a metadata response carries the same deep part
+   * tree that failed the list fetch). If even the headers cannot be read,
+   * fall back to a bare row.
    */
-  private async oversizedNote(id: string, signal: AbortSignal): Promise<Mail> {
+  private async noteRow(
+    id: string,
+    signal: AbortSignal,
+    note: string,
+    stripParts: boolean,
+  ): Promise<Mail> {
     try {
       const meta = new URLSearchParams({ format: "metadata" });
       for (const header of ["From", "Subject", "Date", "To"])
@@ -783,8 +804,9 @@ export class GoogleClient {
       const parsed = messageSchema.parse(
         await this.request(`${GMAIL}/messages/${idPath(id)}?${meta}`, "GET", undefined, {}, signal),
       );
+      if (stripParts && parsed.payload) parsed.payload = { ...parsed.payload, parts: [] };
       const mail = mapMessage(parsed);
-      return { ...mail, body: OVERSIZED_MESSAGE_NOTE };
+      return { ...mail, body: note };
     } catch {
       return {
         id,
@@ -793,7 +815,7 @@ export class GoogleClient {
         sender: "",
         to: [],
         subject: "(No subject)",
-        body: OVERSIZED_MESSAGE_NOTE,
+        body: note,
         date: "",
         unread: false,
         label: "Mail",
@@ -806,9 +828,9 @@ export class GoogleClient {
    * Fetch one page of message IDs, then fetch each message with bounded
    * concurrency under one overall deadline. Results keep list order. A
    * deadline expiry reports a clear timeout instead of letting the agent
-   * runtime kill the call; an oversized message is isolated to a note row
-   * (M8), while any other single message failure still fails the list
-   * (nesting isolation is M9).
+   * runtime kill the call; an oversized or over-nested message is isolated
+   * to a note row (M8/M9), while any other single message failure still
+   * fails the list.
    */
   private async listMessages(
     query: string,
@@ -841,10 +863,26 @@ export class GoogleClient {
             try {
               results[index] = await fetchOne(ids[index], controller.signal);
             } catch (error) {
-              // One oversized message must not fail the whole list (M8):
-              // keep its row with a note. Any other failure still fails it.
-              if (!isOversizedMessageError(error)) throw error;
-              results[index] = await this.oversizedNote(ids[index], controller.signal);
+              // One oversized or over-nested message must not fail the whole
+              // list (M8/M9): keep its row with a note. Any other failure
+              // still fails it.
+              if (isOversizedMessageError(error)) {
+                results[index] = await this.noteRow(
+                  ids[index],
+                  controller.signal,
+                  OVERSIZED_MESSAGE_NOTE,
+                  false,
+                );
+              } else if (isOverNestedMessageError(error)) {
+                results[index] = await this.noteRow(
+                  ids[index],
+                  controller.signal,
+                  OVER_NESTED_MESSAGE_NOTE,
+                  true,
+                );
+              } else {
+                throw error;
+              }
             }
           }
         },
