@@ -981,10 +981,23 @@ export function FilesScreen() {
           mimeType: file.mimeType || "application/octet-stream",
           headers: { Authorization: `Bearer ${api.token}` },
         });
-        const payload = JSON.parse(result.body);
-        if (result.status < 200 || result.status >= 300)
-          throw new Error(payload.error || "Could not import this file.");
-        artifact = payload;
+        // Check the status before parsing: an error body may not be JSON, and
+        // parsing it first turns the server's message into a SyntaxError.
+        if (result.status < 200 || result.status >= 300) {
+          let detail = "Could not import this file.";
+          try {
+            const failed = JSON.parse(result.body) as { error?: unknown };
+            if (typeof failed?.error === "string") detail = failed.error;
+          } catch {
+            // A non-JSON error body keeps the generic message.
+          }
+          throw new Error(detail);
+        }
+        try {
+          artifact = JSON.parse(result.body) as Artifact;
+        } catch {
+          throw new Error("Could not import this file.");
+        }
       }
       await refresh();
       open({ type: "file", file: artifact });

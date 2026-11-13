@@ -1,27 +1,12 @@
 import { Monitor, Play } from "lucide-react-native";
 import { useEffect, useState } from "react";
 import { ActivityIndicator, AppState, Image, Platform, Text, View } from "react-native";
-import { z } from "zod";
 import type { ComputerSnapshot } from "../../../packages/domain/src/computer";
 import { useComputerDraft } from "./computer-drafts";
+import { parseDesktopResult, rawDesktopResult } from "./desktop-result";
 import { DesktopStream } from "./desktop-stream";
 import { Button, Card, colors, ErrorNotice, s } from "./ui";
 import { useWorkspace } from "./workspace";
-
-const resultSchema = z.object({
-  action: z.string().optional(),
-  receiptId: z.string().optional(),
-  error: z.string().optional(),
-});
-function parse(result: unknown) {
-  if (typeof result !== "string") return undefined;
-  try {
-    const parsed = resultSchema.safeParse(JSON.parse(result));
-    return parsed.success ? parsed.data : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 /** Chat card for the agent's use_desktop tool: the live desktop on web, the latest
  * screenshot on native, or an offline notice with Start when the computer is stopped. */
@@ -38,7 +23,7 @@ export function DesktopToolCard({
   const { api, open } = useWorkspace();
   const [, setTab] = useComputerDraft("tab");
   const latest = live;
-  const value = parse(result);
+  const value = parseDesktopResult(result);
   const [snapshot, setSnapshot] = useState<ComputerSnapshot>();
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
@@ -77,6 +62,7 @@ export function DesktopToolCard({
     };
   }, [api, latest, loading, starting, snapshot?.status]);
   const running = snapshot?.status === "running";
+  const raw = !value ? rawDesktopResult(result) : undefined;
   async function start() {
     setStarting(true);
     setError("");
@@ -109,6 +95,11 @@ export function DesktopToolCard({
         {loading && <ActivityIndicator size="small" color={colors.blueDark} />}
       </View>
       <ErrorNotice error={value?.error || error} />
+      {raw ? (
+        <Text selectable numberOfLines={6} style={s.small}>
+          {raw}
+        </Text>
+      ) : null}
       {latest && snapshot && !running ? (
         <View style={{ backgroundColor: "#FAFAFB", borderRadius: 12, padding: 16, gap: 10 }}>
           <Text style={s.small}>

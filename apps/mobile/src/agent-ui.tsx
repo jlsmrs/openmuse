@@ -1832,10 +1832,23 @@ export function AppsScreen() {
           mimeType: file.mimeType || "application/octet-stream",
           headers: { Authorization: `Bearer ${api.token}` },
         });
-        const payload = JSON.parse(uploaded.body);
-        if (uploaded.status < 200 || uploaded.status >= 300)
-          throw new Error(payload.error || "Could not import this file.");
-        artifact = payload;
+        // Same status-before-parse rule as the Files import: an error body may
+        // not be JSON, and parsing it first hides the server's message.
+        if (uploaded.status < 200 || uploaded.status >= 300) {
+          let detail = "Could not import this file.";
+          try {
+            const failed = JSON.parse(uploaded.body) as { error?: unknown };
+            if (typeof failed?.error === "string") detail = failed.error;
+          } catch {
+            // A non-JSON error body keeps the generic message.
+          }
+          throw new Error(detail);
+        }
+        try {
+          artifact = JSON.parse(uploaded.body) as Artifact;
+        } catch {
+          throw new Error("Could not import this file.");
+        }
       }
       setCustomAvatar({ source: "file", id: artifact.id });
       setPreviewUrl(artifact.url || undefined);
@@ -1950,7 +1963,7 @@ export function AppsScreen() {
               >
                 {previewUrl ? (
                   <Image
-                    source={{ uri: previewUrl }}
+                    source={{ uri: api.url(previewUrl) }}
                     resizeMode="cover"
                     style={{ width: 62, height: 62, borderRadius: 31 }}
                     onError={() => setPreviewUrl(undefined)}

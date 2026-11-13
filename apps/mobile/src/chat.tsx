@@ -360,7 +360,9 @@ export function ChatScreen({
           () => copilotkit.runAgent({ agent }),
           (onError) => copilotkit.subscribe({ onError }),
         );
-        await Promise.all([refresh(), refreshAgent()]);
+        // The reply already succeeded: a stale workspace/agent read must not
+        // fail the turn (same rule as AgentWorkspaceProvider.mutate).
+        await Promise.all([refresh(), refreshAgent()]).catch(() => {});
       } catch (e) {
         if (message && e instanceof ConversationTurnError && e.code === threadLocked) {
           // The server refused the turn before running it (another reply holds the thread),
