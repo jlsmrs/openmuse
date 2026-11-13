@@ -12,6 +12,7 @@
     "web": { "bundler": "metro", "name": "OpenMuse — a little room for everything" },
     "plugins": [
       "expo-document-picker",
+      "expo-speech-recognition",
       "@config-plugins/react-native-blob-util",
       "@config-plugins/react-native-pdf"
     ]
