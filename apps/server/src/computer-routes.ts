@@ -40,13 +40,19 @@ export function computerRoutes(computer: ComputerService, files: Files) {
     c.header("Cache-Control", "no-store");
     return c.body(new Uint8Array(bytes));
   });
-  app.post("/commands", async (c) =>
-    c.json(
+  // Terminal commands have side effects (writes, installs, sends), so the
+  // Idempotency-Key header feeds the same receipt-dedup the chat path uses: a
+  // repeat with the same key returns the first receipt without running the
+  // command again. Requests without the header behave exactly as before.
+  app.post("/commands", async (c) => {
+    const idempotencyKey = c.req.header("Idempotency-Key")?.trim() || undefined;
+    return c.json(
       await computer.execute(c.get("owner"), computerCommandSchema.parse(await c.req.json()), {
+        idempotencyKey,
         signal: c.req.raw.signal,
       }),
-    ),
-  );
+    );
+  });
   app.get("/files", async (c) => c.json(await computer.list(c.get("owner"), c.req.query("path"))));
   app.post("/files/read", async (c) => {
     const { path } = computerPathSchema.parse(await c.req.json());
