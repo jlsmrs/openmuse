@@ -17,10 +17,16 @@ export function computerRoutes(computer: ComputerService, files: Files) {
   // password, never the E2B API key; repeated calls return the same stream.
   app.get("/desktop", async (c) => c.json(await computer.desktopUrl(c.get("owner"))));
   // The same actions as the agent's use_desktop tool; the response omits the image.
+  // A retried click can land on a send, submit, sign-in or buy control, so the
+  // Idempotency-Key header feeds the same receipt-dedup the chat path uses: a
+  // repeat with the same key returns the first receipt without sending input
+  // again. Requests without the header behave exactly as before.
   app.post("/desktop/actions", async (c) => {
+    const idempotencyKey = c.req.header("Idempotency-Key")?.trim() || undefined;
     const { receipt, width, height, warning } = await computer.desktopAction(
       c.get("owner"),
       await c.req.json(),
+      { idempotencyKey },
     );
     return c.json({ receipt, width, height, warning });
   });
