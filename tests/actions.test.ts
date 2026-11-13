@@ -286,6 +286,35 @@ test("an expired stale review cannot overwrite a concurrently executing action",
   assert.equal(saved?.status, "executing");
 });
 
+test("a post-claim record failure returns the proposal to awaiting_review", async (t) => {
+  let calls = 0;
+  const service = new ActionService(db, {
+    execute: async () => {
+      calls++;
+      return "sent";
+    },
+    connected: async () => true,
+  });
+  const proposal = await service.propose("record-fail-user", email);
+  const originalPut = db.put.bind(db);
+  let failActivity = true;
+  t.mock.method(db, "put", async (...args: Parameters<Store["put"]>) => {
+    if (failActivity && args[1] === "activity") throw new Error("activity store unavailable");
+    return originalPut(...args);
+  });
+  await assert.rejects(
+    service.decide("record-fail-user", proposal.id, proposal.hash, "approve"),
+    /activity store unavailable/i,
+  );
+  const saved = await db.get<ActionProposal>("record-fail-user", "actions", proposal.id);
+  assert.equal(saved?.status, "awaiting_review");
+  assert.equal(calls, 0);
+  failActivity = false;
+  const result = await service.decide("record-fail-user", proposal.id, proposal.hash, "approve");
+  assert.equal(result.status, "succeeded");
+  assert.equal(calls, 1);
+});
+
 test("a task cancelled between claim and execution never reaches the provider", async (t) => {
   let calls = 0;
   const service = new ActionService(db, {
