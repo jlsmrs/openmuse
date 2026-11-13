@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -8,7 +9,9 @@ import { test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { createDemoModel, demoModel } from "../apps/server/src/demo/model.ts";
-import type { AgentTask } from "../packages/domain/src/agent.ts";
+import { executeModelTask } from "../apps/server/src/engine/model.ts";
+import type { TaskContext } from "../apps/server/src/engine/worker.ts";
+import type { AgentTask, RunEvent } from "../packages/domain/src/agent.ts";
 import type { ActionProposal } from "../packages/domain/src/index.ts";
 import { browserFixture } from "./helpers/browser.ts";
 import { fixture as computerFixture } from "./helpers/computer.ts";
@@ -617,6 +620,77 @@ test("a computer tool checkpoints the task after it runs, like cached tools do",
     assert.equal(waiting.status, "waiting_input", waiting.error ?? waiting.question);
     assert.ok(checkpoints.length >= 1, "expected a checkpoint after the computer tool ran");
     assert.equal((await server.computer.snapshot("owner")).commands[0]?.status, "succeeded");
+  } finally {
+    await server.agent.stop();
+    await db.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+// S-B2: a model run that times out must not discard the text it already
+// produced — the partial text is flushed as an Agent update before the run
+// fails, so it stays visible in the task's run events.
+test("a model run that times out still saves the partial text it produced", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-model-timeout-"));
+  const db = await createStore();
+  await modelFixture(t, () => undefined, { hangAfterText: (index) => index === 0 });
+  const server = await createApp(db, {
+    mode: "sample",
+    port: 8787,
+    host: "127.0.0.1",
+    publicUrl: "http://localhost:8787",
+    dataDir: directory,
+    agentBackend: "model",
+    intelligenceApiKey: "test-project-key-never-sent",
+    model: "openai/fixture",
+    googleRedirectUri: "http://localhost:8787/api/google/callback",
+    allowedOrigins: [],
+  });
+  try {
+    const owner = "model-timeout";
+    const task = await server.agent.createTask(owner, { prompt: "Write a long summary" });
+    const seen: Array<{ kind: string; title: string; detail: string }> = [];
+    const ctx: TaskContext = {
+      signal: new AbortController().signal,
+      guard: async () => {},
+      checkpoint: async (patch) => {
+        const current = await server.agent.getTask(owner, task.id);
+        const next = { ...current, ...patch, updatedAt: new Date().toISOString() };
+        await db.put(owner, "tasks", next);
+        return next;
+      },
+      event: async (kind, title, detail = "") => {
+        seen.push({ kind, title, detail });
+        await db.put(owner, "run-events", {
+          id: randomUUID(),
+          taskId: task.id,
+          date: new Date().toISOString(),
+          kind,
+          title,
+          detail,
+        });
+      },
+    };
+    await assert.rejects(
+      () => executeModelTask(server.agent, owner, task, ctx, { modelTimeoutMs: 500 }),
+      { message: "Model run timed out after five minutes" },
+    );
+    const flushed = seen.filter((e) => e.kind === "step" && e.title === "Agent update");
+    assert.ok(flushed.length >= 1, "expected the partial text to be flushed on timeout");
+    assert.match(flushed.at(-1)?.detail ?? "", /Hello partial /);
+    // The flush is fire-and-forget, so poll the store until the write lands.
+    for (let attempt = 0; attempt < 100; attempt++) {
+      const stored = await db.listByTaskId<RunEvent>(owner, "run-events", task.id);
+      if (
+        stored.some(
+          (e) =>
+            e.kind === "step" && e.title === "Agent update" && e.detail.includes("Hello partial "),
+        )
+      )
+        return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    assert.fail("the partial text never reached the stored run events");
   } finally {
     await server.agent.stop();
     await db.close();

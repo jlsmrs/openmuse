@@ -611,3 +611,33 @@ test("a retried goal creation with the same requestId returns the first goal", a
   );
   assert.notEqual(distinct.id, first.id);
 });
+
+// S-B2: the task-id hash includes the owner, so two owners retrying with the
+// same idempotency key derive different task ids. Without the owner, the
+// worker's global in-flight set (keyed by task id alone) would treat the
+// second owner's task as already running and never start it.
+test("the same task idempotency key derives different ids for different owners", async () => {
+  const first = await server.agent.createTask(
+    "local-user",
+    { prompt: "Do the owner's report" },
+    "sb2-shared-key",
+  );
+  const other = await server.agent.createTask(
+    "other-user",
+    { prompt: "Do the other owner's report" },
+    "sb2-shared-key",
+  );
+  assert.notEqual(other.id, first.id);
+  const retried = await server.agent.createTask(
+    "local-user",
+    { prompt: "Do the owner's report" },
+    "sb2-shared-key",
+  );
+  assert.equal(retried.id, first.id);
+  const otherRetried = await server.agent.createTask(
+    "other-user",
+    { prompt: "Do the other owner's report" },
+    "sb2-shared-key",
+  );
+  assert.equal(otherRetried.id, other.id);
+});
