@@ -3,9 +3,13 @@ import test from "node:test";
 import { monitorInputSchema } from "../packages/domain/src/agent.ts";
 import { localDateTime } from "../packages/domain/src/date-time.ts";
 import {
+  calendarEventSchema,
   emailDraftSchema,
   eventDraftSchema,
+  mailMetadataSchema,
+  mailSchema,
   proposalSchema,
+  toMailMetadata,
 } from "../packages/domain/src/index.ts";
 
 const email = {
@@ -244,4 +248,126 @@ test("localDateTime falls back to the raw timestamp for an unknown zone", () => 
     date: "2026-10-10",
     time: "10:00",
   });
+});
+
+const mail = {
+  id: "msg-1",
+  threadId: "thread-1",
+  from: "museum@example.com",
+  sender: "Community Museum",
+  to: ["guardian@example.com"],
+  subject: "Visit form",
+  body: "Please complete the attached form.",
+  date: "2026-10-10T10:00:00.000Z",
+  unread: true,
+  label: "Inbox",
+  attachments: [],
+};
+const calendarEvent = {
+  id: "event-1",
+  calendarId: "primary",
+  title: "Museum day",
+  start: "2026-10-10T10:00:00-07:00",
+  end: "2026-10-10T14:00:00-07:00",
+  allDay: false,
+  timeZone: "America/Los_Angeles",
+  location: "Museum",
+  description: "Bring tickets.",
+  attendees: ["guardian@example.com"],
+};
+
+test("mail rows accept the shape mapMessage produces", () => {
+  assert.deepEqual(mailSchema.parse(mail), mail);
+  // Sample rows use arbitrary labels, not just the live Inbox/Sent/Trash/
+  // Spam/Mail set — the schema must not narrow the label.
+  assert.equal(mailSchema.safeParse({ ...mail, label: "School" }).success, true);
+  assert.equal(mailSchema.safeParse({ ...mail, label: "Sent · local" }).success, true);
+  // A malformed Date header falls back to the raw header instead of
+  // vanishing, so the date is a string, not necessarily ISO.
+  assert.equal(mailSchema.safeParse({ ...mail, date: "not a date" }).success, true);
+  assert.equal(mailSchema.safeParse({ ...mail, from: "", sender: "" }).success, true);
+});
+
+test("mail rows reject missing fields, empty ids, and wrong types", () => {
+  for (const field of [
+    "id",
+    "threadId",
+    "from",
+    "sender",
+    "to",
+    "subject",
+    "body",
+    "date",
+    "unread",
+    "label",
+    "attachments",
+  ] as const) {
+    const { [field]: _dropped, ...rest } = mail;
+    assert.equal(mailSchema.safeParse(rest).success, false, `${field} is required`);
+  }
+  assert.equal(mailSchema.safeParse({ ...mail, id: "" }).success, false);
+  assert.equal(mailSchema.safeParse({ ...mail, threadId: "" }).success, false);
+  assert.equal(mailSchema.safeParse({ ...mail, unread: "yes" }).success, false);
+  assert.equal(mailSchema.safeParse({ ...mail, to: "guardian@example.com" }).success, false);
+  assert.equal(mailSchema.safeParse({ ...mail, attachments: "file-1" }).success, false);
+});
+
+test("mail metadata is the mail shape without a body, plus a snippet", () => {
+  const metadata = toMailMetadata(mail);
+  const { body: _body, ...withoutBody } = mail;
+  assert.deepEqual(metadata, { ...withoutBody, snippet: mail.body });
+  assert.equal(mailMetadataSchema.safeParse(metadata).success, true);
+  // A full mail row is not metadata: it carries a body and no snippet.
+  assert.equal(mailMetadataSchema.safeParse(mail).success, false);
+  assert.equal(mailMetadataSchema.safeParse({ ...metadata, snippet: undefined }).success, false);
+  // The metadata shape is derived from the mail shape, so it rejects the
+  // same bad rows.
+  assert.equal(mailMetadataSchema.safeParse({ ...metadata, id: "" }).success, false);
+});
+
+test("calendar events accept timed and all-day shapes", () => {
+  assert.deepEqual(calendarEventSchema.parse(calendarEvent), calendarEvent);
+  assert.equal(
+    calendarEventSchema.safeParse({
+      ...calendarEvent,
+      allDay: true,
+      start: "2026-10-10",
+      end: "2026-10-11",
+    }).success,
+    true,
+  );
+});
+
+test("calendar events reject missing fields, empty ids, and unparseable times", () => {
+  for (const field of [
+    "id",
+    "calendarId",
+    "title",
+    "start",
+    "end",
+    "allDay",
+    "timeZone",
+    "location",
+    "description",
+    "attendees",
+  ] as const) {
+    const { [field]: _dropped, ...rest } = calendarEvent;
+    assert.equal(calendarEventSchema.safeParse(rest).success, false, `${field} is required`);
+  }
+  assert.equal(calendarEventSchema.safeParse({ ...calendarEvent, id: "" }).success, false);
+  assert.equal(calendarEventSchema.safeParse({ ...calendarEvent, calendarId: "" }).success, false);
+  assert.equal(
+    calendarEventSchema.safeParse({ ...calendarEvent, start: "not a date" }).success,
+    false,
+  );
+  assert.equal(
+    calendarEventSchema.safeParse({ ...calendarEvent, end: "2026-13-01" }).success,
+    false,
+  );
+  // Feb 30 normalizes under Date.parse, and mapEvent accepts it too — this
+  // schema mirrors the mapper, not the stricter draft schema.
+  assert.equal(
+    calendarEventSchema.safeParse({ ...calendarEvent, end: "2026-02-30" }).success,
+    true,
+  );
 });

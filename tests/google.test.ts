@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { emailDraftSchema, eventDraftSchema } from "../packages/domain/src/index.ts";
+import {
+  calendarEventSchema,
+  emailDraftSchema,
+  eventDraftSchema,
+  mailSchema,
+} from "../packages/domain/src/index.ts";
 import {
   GoogleApiError,
   GoogleClient,
@@ -1323,4 +1328,44 @@ test("a reply without a valid Message-ID still threads by thread and subject", a
     [],
   );
   assert.equal(writes, 1);
+});
+
+test("listed mail rows and calendar events match the shared domain schemas", async () => {
+  const client = clientWith((request) => {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/messages")) return json({ messages: [{ id: "msg1" }] });
+    if (url.pathname.includes("/calendars/")) {
+      return json({
+        timeZone: "UTC",
+        items: [
+          {
+            id: "event-1",
+            summary: "Museum day",
+            start: { date: "2026-10-10" },
+            end: { date: "2026-10-11" },
+          },
+        ],
+      });
+    }
+    return json({
+      id: "msg1",
+      threadId: "thread1",
+      internalDate: "1791658800000",
+      labelIds: ["INBOX"],
+      payload: {
+        headers: [
+          { name: "From", value: "Museum <museum@example.com>" },
+          { name: "Subject", value: "Visit form" },
+        ],
+        mimeType: "text/plain",
+        body: { data: base64url("Hello.") },
+      },
+    });
+  });
+  // The rows the mappers return must satisfy the shared schemas — the
+  // mappers validate their own output, so a shape drift fails here.
+  const [mail] = await client.listMail();
+  assert.equal(mailSchema.safeParse(mail).success, true);
+  const [event] = (await client.listEvents()).events;
+  assert.equal(calendarEventSchema.safeParse(event).success, true);
 });
