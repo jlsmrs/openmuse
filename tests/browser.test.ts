@@ -317,6 +317,7 @@ test("worker persists unsupported, oversized and interrupted download outcomes",
     for (const item of cases) {
       await capturePdfDownload({
         directory,
+        tempFiles: [],
         tempDirectory: directory,
         limitReached: false,
         download: {

@@ -57,9 +57,9 @@ function parseOutcome(text: string): Outcome {
   return value as Outcome;
 }
 
-async function quarantine(path: string) {
-  // Best effort only: never delete a corrupt outcome — move it aside so
-  // the operator can inspect it, and so it stops breaking every read.
+export async function quarantineFile(path: string) {
+  // Best effort only: never delete a corrupt bookkeeping file — move it
+  // aside so the operator can inspect it, and so it stops breaking every read.
   let target = `${path}.corrupt`;
   for (let attempt = 1; await stat(target).catch(() => null); attempt++) {
     target = `${path}.corrupt-${attempt}`;
@@ -100,7 +100,7 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
     } catch {
       // One corrupt bookkeeping file must not fail the whole read (or
       // worker startup): move it aside and keep the healthy outcomes.
-      await quarantine(path);
+      await quarantineFile(path);
     }
   }
   return failures.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
@@ -109,10 +109,20 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
 export async function capturePdfDownload(options: {
   directory: string;
   tempDirectory: string;
+  /**
+   * In-flight temp filenames belonging to this capture (the `.crdownload`
+   * names the browser created for it, established by the caller diffing
+   * the temp dir when the download event fired). Chromium names an
+   * in-flight download `<uuid>.crdownload`, and that UUID is not exposed
+   * by the Download object — so ownership is by event-time diff, never
+   * by scanning the whole directory: a stale leftover or another
+   * concurrent download's file must not cancel this capture.
+   */
+  tempFiles: string[];
   limitReached: boolean;
   download: Pick<Download, "suggestedFilename" | "createReadStream" | "cancel" | "delete">;
 }) {
-  const { directory, tempDirectory, download, limitReached } = options;
+  const { directory, tempDirectory, tempFiles, download, limitReached } = options;
   const folder = join(directory, "downloads");
   const outcomes = join(directory, "download-outcomes");
   await mkdir(folder, { recursive: true, mode: 0o700 });
@@ -147,17 +157,18 @@ export async function capturePdfDownload(options: {
       throw new Error("Download limit reached");
     }
     monitor = setInterval(() => {
-      void readdir(tempDirectory)
-        .then(async (files) => {
-          for (const file of files) {
-            const info = await stat(join(tempDirectory, file)).catch(() => null);
-            if (info?.isFile() && info.size > MAX_DOWNLOAD_BYTES) {
-              oversized = true;
-              await download.cancel();
-            }
+      // Only this capture's in-flight files are watched. The pipeline
+      // byte counter below is the primary cap; the monitor is the backstop
+      // for a stream that stalls while Chromium keeps writing to disk.
+      void (async () => {
+        for (const file of tempFiles) {
+          const info = await stat(join(tempDirectory, file)).catch(() => null);
+          if (info?.isFile() && info.size > MAX_DOWNLOAD_BYTES) {
+            oversized = true;
+            await download.cancel();
           }
-        })
-        .catch(() => {});
+        }
+      })().catch(() => {});
     }, 100);
     const source = await download.createReadStream();
     if (!source) throw new Error("Download unavailable");

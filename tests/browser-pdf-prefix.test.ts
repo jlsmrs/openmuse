@@ -16,6 +16,7 @@ test("browser PDF downloads accept the same bounded header prefix as PDF imports
     assert.equal((await inspectPdf(bytes)).pageCount, 2);
     await capturePdfDownload({
       directory,
+      tempFiles: [],
       tempDirectory: directory,
       limitReached: false,
       download: {
@@ -52,6 +53,7 @@ test("browser PDF downloads and imports reject a marker buried past the first by
   t.after(() => rm(directory, { recursive: true, force: true }));
   await capturePdfDownload({
     directory,
+    tempFiles: [],
     tempDirectory: directory,
     limitReached: false,
     download: {
@@ -75,6 +77,7 @@ test("browser PDF sniffing rejects late markers and non-ASCII lookalikes", async
     t.after(() => rm(directory, { recursive: true, force: true }));
     await capturePdfDownload({
       directory,
+      tempFiles: [],
       tempDirectory: directory,
       limitReached: false,
       download: {

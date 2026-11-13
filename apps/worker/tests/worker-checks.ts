@@ -67,8 +67,8 @@ export async function checkBrowserWorker(
       method: "POST",
       body: JSON.stringify({ url: `${fixtureOrigin}/redirect-private` }),
     });
-    assert.equal(redirect.status, 502);
-    assert.equal((await redirect.json()).error.code, "NAVIGATION_FAILED");
+    assert.equal(redirect.status, 400);
+    assert.equal((await redirect.json()).error.code, "BLOCKED_URL");
     assert.equal(
       (await requests()).filter((path) => path === "/redirect-private").length,
       redirects + 1,

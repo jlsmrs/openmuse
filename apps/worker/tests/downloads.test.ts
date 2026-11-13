@@ -77,6 +77,109 @@ test("a corrupt outcome JSON is quarantined and the healthy failures still list"
   );
 });
 
+async function seedDownload(directory: string, name: string, body: string) {
+  const folder = join(directory, "downloads");
+  await mkdir(folder, { recursive: true, mode: 0o700 });
+  await writeFile(join(folder, name), body, { mode: 0o600 });
+}
+
+function downloadMetadata(id: string) {
+  return JSON.stringify({
+    id,
+    name: "document.pdf",
+    size: 1234,
+    mimeType: "application/pdf",
+  });
+}
+
+test("a corrupt download metadata file is quarantined and the healthy downloads still list", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-sb12-"));
+  const id = randomUUID();
+  const sessionDir = join(dataDir, id);
+  await mkdir(sessionDir, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(sessionDir, "session.json"),
+    JSON.stringify({
+      id,
+      title: "Fixture",
+      url: "about:blank",
+      status: "closed",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    }),
+    { mode: 0o600 },
+  );
+  const healthyId = randomUUID();
+  await seedDownload(sessionDir, `${healthyId}.json`, downloadMetadata(healthyId));
+  await seedDownload(sessionDir, `${randomUUID()}.json`, "{corrupt");
+  await seedDownload(
+    sessionDir,
+    `${randomUUID()}.json`,
+    JSON.stringify({ id: "x", name: "bad.pdf", size: "not-a-number", mimeType: "application/pdf" }),
+  );
+
+  // The proxy is stubbed: listing never touches it.
+  const browser = await createBrowserManager({ dataDir }, async () => ({
+    url: "http://127.0.0.1:1",
+    close: async () => {},
+  }));
+  t.after(async () => {
+    await browser.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  const listed = await browser.downloads(id);
+  assert.deepEqual(
+    listed.downloads.map((item) => item.id),
+    [healthyId],
+  );
+  const remaining = await readdir(join(sessionDir, "downloads"));
+  assert.equal(remaining.filter((name) => name.endsWith(".json")).length, 1);
+  assert.equal(remaining.filter((name) => name.endsWith(".corrupt")).length, 2);
+
+  // A second list is stable: quarantined files are never re-read.
+  assert.deepEqual(
+    (await browser.downloads(id)).downloads.map((item) => item.id),
+    [healthyId],
+  );
+});
+
+test("a malformed stored session is quarantined and never listed", async (t) => {
+  const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-sb12-"));
+  const badId = randomUUID();
+  const badDir = join(dataDir, badId);
+  await mkdir(badDir, { recursive: true, mode: 0o700 });
+  await writeFile(
+    join(badDir, "session.json"),
+    JSON.stringify({
+      id: badId,
+      title: 42,
+      url: "about:blank",
+      status: "closed",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    }),
+    { mode: 0o600 },
+  );
+  const arrayId = randomUUID();
+  const arrayDir = join(dataDir, arrayId);
+  await mkdir(arrayDir, { recursive: true, mode: 0o700 });
+  await writeFile(join(arrayDir, "session.json"), "[]", { mode: 0o600 });
+
+  const browser = await createBrowserManager({ dataDir }, async () => ({
+    url: "http://127.0.0.1:1",
+    close: async () => {},
+  }));
+  t.after(async () => {
+    await browser.close();
+    await rm(dataDir, { recursive: true, force: true });
+  });
+
+  assert.deepEqual(browser.list(), []);
+  const badRemaining = await readdir(badDir);
+  assert.deepEqual(badRemaining, ["session.json.corrupt"]);
+  const arrayRemaining = await readdir(arrayDir);
+  assert.deepEqual(arrayRemaining, ["session.json.corrupt"]);
+});
+
 test("the worker starts with a corrupt outcome file and lists the healthy downloads", async (t) => {
   const dataDir = await mkdtemp(join(tmpdir(), "openmuse-browser-mb3-"));
   const id = randomUUID();
