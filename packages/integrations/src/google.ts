@@ -17,6 +17,21 @@ export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const MAX_TOTAL_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_JSON_BYTES = Math.ceil((MAX_ATTACHMENT_BYTES * 4) / 3) + 1024 * 1024;
 
+/** At most this many Gmail message fetches run at once inside a mail list. */
+export const MAIL_LIST_CONCURRENCY = 10;
+/**
+ * Overall deadline for one mail-list fetch, just inside the agent runtime's
+ * ~5-second window: a slow list fails with a clear timeout instead of being
+ * killed opaquely by the runtime.
+ */
+export const MAIL_LIST_DEADLINE_MS = 4_500;
+/** Quota (429) and transient 5xx responses back off on reads only, never writes. */
+const READ_RETRY_ATTEMPTS = 3;
+const READ_RETRY_BASE_MS = 200;
+const READ_RETRY_MAX_DELAY_MS = 5_000;
+const MAIL_LIST_TIMEOUT_MESSAGE =
+  "Mail list timed out before Google finished; narrow the search and try again";
+
 export class OutcomeUnknownError extends Error {
   readonly code = "outcome_unknown";
   constructor(
@@ -475,6 +490,21 @@ function validateAttachments(attachments: MailAttachment[]): void {
     throw new Error("Total attachment size exceeds the 20 MiB limit");
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Backoff for a failed read: honor Retry-After when present, else exponential. */
+function readRetryDelayMs(response: Response, attempt: number): number {
+  const raw = response.headers.get("retry-after");
+  if (raw !== null) {
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0)
+      return Math.min(seconds * 1000, READ_RETRY_MAX_DELAY_MS);
+  }
+  return Math.min(READ_RETRY_BASE_MS * 2 ** attempt, READ_RETRY_MAX_DELAY_MS);
+}
+
 async function readJson(response: Response): Promise<unknown> {
   if (Number(response.headers.get("content-length")) > MAX_JSON_BYTES) {
     await response.body?.cancel();
@@ -504,9 +534,21 @@ async function readJson(response: Response): Promise<unknown> {
 export class GoogleClient {
   private readonly fetcher: typeof fetch;
   private readonly getAccessToken: () => Promise<string>;
-  constructor(options: { getAccessToken: () => Promise<string>; fetch?: typeof fetch }) {
+  private readonly mailListConcurrency: number;
+  private readonly mailListDeadlineMs: number;
+  constructor(options: {
+    getAccessToken: () => Promise<string>;
+    fetch?: typeof fetch;
+    mailListConcurrency?: number;
+    mailListDeadlineMs?: number;
+  }) {
     this.fetcher = options.fetch ?? fetch;
     this.getAccessToken = options.getAccessToken;
+    this.mailListConcurrency = Math.max(
+      1,
+      Math.floor(options.mailListConcurrency ?? MAIL_LIST_CONCURRENCY),
+    );
+    this.mailListDeadlineMs = options.mailListDeadlineMs ?? MAIL_LIST_DEADLINE_MS;
   }
 
   private async mapMessage(message: z.infer<typeof messageSchema>): Promise<Mail> {
@@ -631,73 +673,152 @@ export class GoogleClient {
     method = "GET",
     body?: unknown,
     conditionalHeaders: Record<string, string> = {},
+    signal?: AbortSignal,
   ): Promise<unknown> {
     const write = method !== "GET";
     // Credential failures happen before dispatch, so their outcome is definite.
     const token = await this.getAccessToken();
     if (!token || /[\r\n]/.test(token))
       throw new Error("Google access token is missing or invalid; reconnect Google");
-    let response: Response;
-    try {
-      response = await this.fetcher(url, {
-        method,
-        headers: {
-          Authorization: `Bearer ${token}`,
-          Accept: "application/json",
-          ...(body === undefined ? {} : { "Content-Type": "application/json" }),
-          ...conditionalHeaders,
-        },
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(30000),
-        redirect: "error",
-      });
-    } catch {
-      if (write) throw new OutcomeUnknownError();
-      throw new Error("Could not reach Google; check the connection and try again");
-    }
-    if (write && (response.status >= 500 || response.status === 408)) {
+    // Reads back off on quota (429) and transient 5xx responses; writes are
+    // never retried, so a repeated send cannot duplicate an action.
+    const attempts = write ? 1 : READ_RETRY_ATTEMPTS;
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      let response: Response;
       try {
-        await response.body?.cancel();
+        response = await this.fetcher(url, {
+          method,
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: "application/json",
+            ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+            ...conditionalHeaders,
+          },
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: signal
+            ? AbortSignal.any([signal, AbortSignal.timeout(30000)])
+            : AbortSignal.timeout(30000),
+          redirect: "error",
+        });
       } catch {
+        if (signal?.aborted) throw new Error(MAIL_LIST_TIMEOUT_MESSAGE);
+        if (write) throw new OutcomeUnknownError();
+        throw new Error("Could not reach Google; check the connection and try again");
+      }
+      if (write && (response.status >= 500 || response.status === 408)) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          throw new OutcomeUnknownError();
+        }
         throw new OutcomeUnknownError();
       }
-      throw new OutcomeUnknownError();
-    }
-    if (!response.ok) {
-      let detail = response.statusText || "Request failed";
-      try {
-        const result = z
-          .object({ error: z.object({ message: z.string() }) })
-          .safeParse(await readJson(response));
-        if (result.success) detail = result.data.error.message.slice(0, 500);
-      } catch {
-        /* Preserve the definite HTTP rejection even if its body is not JSON. */
+      if (!response.ok) {
+        if (
+          !write &&
+          (response.status === 429 || response.status >= 500) &&
+          attempt < attempts - 1
+        ) {
+          try {
+            await response.body?.cancel();
+          } catch {
+            /* A failed body drain must not mask the retry. */
+          }
+          await sleep(readRetryDelayMs(response, attempt));
+          continue;
+        }
+        let detail = response.statusText || "Request failed";
+        try {
+          const result = z
+            .object({ error: z.object({ message: z.string() }) })
+            .safeParse(await readJson(response));
+          if (result.success) detail = result.data.error.message.slice(0, 500);
+        } catch {
+          /* Preserve the definite HTTP rejection even if its body is not JSON. */
+        }
+        throw new GoogleApiError(response.status, detail);
       }
-      throw new GoogleApiError(response.status, detail);
+      if (method === "DELETE" && response.status === 204) return undefined;
+      try {
+        return await readJson(response);
+      } catch {
+        if (write) throw new OutcomeUnknownError();
+        throw new Error("Google returned an invalid or oversized response");
+      }
     }
-    if (method === "DELETE" && response.status === 204) return undefined;
+    // Unreachable: every path above returns or throws.
+    throw new Error("Could not reach Google; check the connection and try again");
+  }
+
+  /**
+   * Fetch one page of message IDs, then fetch each message with bounded
+   * concurrency under one overall deadline. Results keep list order. A
+   * deadline expiry reports a clear timeout instead of letting the agent
+   * runtime kill the call; a single message failure still fails the list
+   * (per-message isolation is M8/M9).
+   */
+  private async listMessages(
+    query: string,
+    fetchOne: (id: string, signal: AbortSignal) => Promise<Mail>,
+  ): Promise<Mail[]> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.mailListDeadlineMs);
     try {
-      return await readJson(response);
-    } catch {
-      if (write) throw new OutcomeUnknownError();
-      throw new Error("Google returned an invalid or oversized response");
+      const params = new URLSearchParams({ maxResults: "100", q: query });
+      const list = z
+        .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
+        .parse(
+          await this.request(
+            `${GMAIL}/messages?${params}`,
+            "GET",
+            undefined,
+            {},
+            controller.signal,
+          ),
+        );
+      const ids = list.messages.slice(0, 100).map(({ id }) => id);
+      const results: Mail[] = new Array(ids.length);
+      let next = 0;
+      const workers = Array.from(
+        { length: Math.min(this.mailListConcurrency, ids.length) },
+        async () => {
+          while (next < ids.length) {
+            if (controller.signal.aborted) return;
+            const index = next++;
+            results[index] = await fetchOne(ids[index], controller.signal);
+          }
+        },
+      );
+      await Promise.race([
+        Promise.all(workers),
+        new Promise<never>((_, reject) =>
+          controller.signal.addEventListener(
+            "abort",
+            () => reject(new Error(MAIL_LIST_TIMEOUT_MESSAGE)),
+            { once: true },
+          ),
+        ),
+      ]);
+      return results;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
   /** The latest 100 matching messages. Permission/read failures propagate visibly. */
   async listMail(query = "in:inbox"): Promise<Mail[]> {
-    const params = new URLSearchParams({ maxResults: "100", q: query });
-    const list = z
-      .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
-      .parse(await this.request(`${GMAIL}/messages?${params}`));
-    return Promise.all(
-      list.messages
-        .slice(0, 100)
-        .map(async ({ id }) =>
-          this.mapMessage(
-            messageSchema.parse(await this.request(`${GMAIL}/messages/${idPath(id)}?format=full`)),
+    return this.listMessages(query, async (id, signal) =>
+      this.mapMessage(
+        messageSchema.parse(
+          await this.request(
+            `${GMAIL}/messages/${idPath(id)}?format=full`,
+            "GET",
+            undefined,
+            {},
+            signal,
           ),
         ),
+      ),
     );
   }
 
@@ -709,20 +830,20 @@ export class GoogleClient {
    * Permission/read failures propagate visibly.
    */
   async listMailMetadata(query = "in:inbox"): Promise<Mail[]> {
-    const params = new URLSearchParams({ maxResults: "100", q: query });
-    const list = z
-      .object({ messages: z.array(z.object({ id: z.string() })).default([]) })
-      .parse(await this.request(`${GMAIL}/messages?${params}`));
     const meta = new URLSearchParams({ format: "metadata" });
     for (const header of ["From", "Subject", "Date", "To"]) meta.append("metadataHeaders", header);
-    return Promise.all(
-      list.messages
-        .slice(0, 100)
-        .map(async ({ id }) =>
-          this.mapMessage(
-            messageSchema.parse(await this.request(`${GMAIL}/messages/${idPath(id)}?${meta}`)),
+    return this.listMessages(query, async (id, signal) =>
+      this.mapMessage(
+        messageSchema.parse(
+          await this.request(
+            `${GMAIL}/messages/${idPath(id)}?${meta}`,
+            "GET",
+            undefined,
+            {},
+            signal,
           ),
         ),
+      ),
     );
   }
 
