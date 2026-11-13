@@ -92,6 +92,27 @@ export class Store {
     );
     return value;
   }
+  /**
+   * Guarded upsert (optimistic concurrency) for contested rows: inserts a
+   * new row, or overwrites only when the existing row still equals `expected`
+   * — the full row the caller read before editing. Returns null when the
+   * guard refuses the overwrite, so the caller can report a 409 instead of
+   * silently discarding another writer's change. Use it wherever a
+   * read-modify-write on one row can race; plain put stays last-write-wins
+   * for rows only one writer touches.
+   */
+  async putIfMatches<T extends { id: string }>(
+    owner: string,
+    kind: string,
+    value: T,
+    expected: T,
+  ): Promise<T | null> {
+    const result = await this.db.query(
+      "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb) ON CONFLICT(owner,kind,id) DO UPDATE SET data=excluded.data,updated_at=now() WHERE records.data = $5::jsonb RETURNING data",
+      [owner, kind, value.id, JSON.stringify(value), JSON.stringify(expected)],
+    );
+    return (result.rows[0]?.data as T | undefined) ?? null;
+  }
   async remove(owner: string, kind: string, id: string): Promise<void> {
     await this.db.query("DELETE FROM records WHERE owner=$1 AND kind=$2 AND id=$3", [
       owner,
@@ -208,6 +229,17 @@ export async function createStore(
   }
   await database.query(
     "CREATE TABLE IF NOT EXISTS records(owner text NOT NULL,kind text NOT NULL,id text NOT NULL,data jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now(),PRIMARY KEY(owner,kind,id))",
+  );
+  // Expression indexes for the fields the list queries filter on — without
+  // them every listByGoalId/listByTaskId/listByStatus call scans the table.
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_goal_idx ON records(owner,kind,(data->>'goalId'))",
+  );
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_task_idx ON records(owner,kind,(data->>'taskId'))",
+  );
+  await database.query(
+    "CREATE INDEX IF NOT EXISTS records_status_idx ON records(owner,kind,(data->>'status'))",
   );
   return new Store(database);
 }

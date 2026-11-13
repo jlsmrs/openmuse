@@ -28,6 +28,46 @@ const failureSchema = z.object({
   message: z.string(),
   createdAt: z.string(),
 });
+
+/**
+ * Console input, validated at the API boundary before it reaches the
+ * worker. Mirrors the worker's own input rules (apps/worker/src/browser.ts)
+ * so a malformed payload is rejected here with a 422 instead of travelling
+ * to the worker and failing there.
+ */
+export const browserInputSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("click"),
+    x: z.number().finite().min(0).max(1279),
+    y: z.number().finite().min(0).max(799),
+  }),
+  z.object({ type: z.literal("text"), text: z.string().max(10_000) }),
+  z.object({
+    type: z.literal("key"),
+    key: z.enum([
+      "Enter",
+      "Tab",
+      "Escape",
+      "Backspace",
+      "Delete",
+      "ArrowUp",
+      "ArrowDown",
+      "ArrowLeft",
+      "ArrowRight",
+      "Home",
+      "End",
+      "PageUp",
+      "PageDown",
+      "Control+a",
+      "Meta+a",
+      "Shift+Tab",
+    ]),
+  }),
+  z.object({
+    type: z.literal("scroll"),
+    deltaY: z.number().finite().min(-5000).max(5000),
+  }),
+]);
 type ChatBrowser = { id: string; sessionId: string };
 
 const BROWSER_SESSION_ID =
@@ -275,13 +315,12 @@ export class BrowserService {
     return this.request(`/sessions/${encodeURIComponent(id)}/screenshot`);
   }
   async input(owner: string, id: string, value: unknown) {
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      throw new AppError("A JSON object is required for browser input", 422);
+    const input = browserInputSchema.parse(value);
     return this.serial(id, async () => {
       await this.get(owner, id);
       return this.save(
         owner,
-        await (await this.request(`/sessions/${encodeURIComponent(id)}/input`, value)).json(),
+        await (await this.request(`/sessions/${encodeURIComponent(id)}/input`, input)).json(),
         id,
       );
     });

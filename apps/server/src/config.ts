@@ -1,6 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
+import { isValidEncryptionKey } from "../../../packages/integrations/src/vault.ts";
 
 /** .env keys whose file value loses to a different value already set in the environment. */
 export function shadowedEnvKeys(
@@ -10,11 +12,31 @@ export function shadowedEnvKeys(
   return Object.keys(file).filter((key) => env[key] !== undefined && env[key] !== file[key]);
 }
 
-if (existsSync(".env")) {
+/**
+ * The .env file lives at the repo root, not relative to the process working
+ * directory — which depends on how the server was launched and silently
+ * yields no config when it is wrong. In source this file sits at
+ * apps/server/src (two levels below the root); in the built image it sits
+ * at dist/apps/server/src (three). Returns undefined when no .env exists,
+ * which is normal in production where config comes from the environment.
+ */
+export function resolveDotEnvPath(): string | undefined {
+  const here = dirname(fileURLToPath(import.meta.url));
+  for (const candidate of [
+    resolve(here, "..", "..", ".env"),
+    resolve(here, "..", "..", "..", ".env"),
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
+const envPath = resolveDotEnvPath();
+if (envPath) {
   // loadEnvFile never overrides existing variables. A stale shell or system-wide value
   // (for example OPENAI_API_KEY) would otherwise silently replace the .env setting.
-  const shadowed = shadowedEnvKeys(parseEnv(readFileSync(".env", "utf8")));
-  process.loadEnvFile(".env");
+  const shadowed = shadowedEnvKeys(parseEnv(readFileSync(envPath, "utf8")));
+  process.loadEnvFile(envPath);
   if (shadowed.length)
     console.warn(
       `[OpenMuse] Using ${shadowed.join(", ")} from the environment instead of .env. ` +
@@ -147,6 +169,8 @@ export function readConfig(): Config {
       );
   }
   const port = Number(process.env.PORT ?? 8787);
+  if (!Number.isInteger(port) || port < 1 || port > 65535)
+    throw new Error("PORT must be an integer between 1 and 65535");
   const publicUrl = process.env.PUBLIC_API_URL ?? `http://localhost:${port}`;
   const config: Config = {
     mode,
@@ -167,7 +191,7 @@ export function readConfig(): Config {
     intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
-    googleRedirectUri: `${publicUrl}/api/google/callback`,
+    googleRedirectUri: `${publicUrl.replace(/\/+$/, "")}/api/google/callback`,
     workerUrl: browserWorkerUrl(process.env.BROWSER_WORKER_URL),
     workerToken: process.env.WORKER_TOKEN,
     taskWorkerEnabled: process.env.TASK_WORKER_ENABLED !== "false",
@@ -179,16 +203,20 @@ export function readConfig(): Config {
     computerProvider,
     computerE2bTemplate: process.env.COMPUTER_E2B_TEMPLATE?.trim() || "desktop",
     e2bApiKey,
-    allowedOrigins: (
-      process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081"
-    ).split(","),
+    allowedOrigins: (process.env.ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081")
+      .split(",")
+      .map((origin) => origin.trim())
+      .filter(Boolean),
     // Only trust X-Forwarded-For/X-Real-IP when the deployment is known to sit
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
   };
   if (
     mode === "live" &&
-    (!config.accessKey || config.accessKey.length < 24 || !config.encryptionKey)
+    (!config.accessKey ||
+      config.accessKey.length < 24 ||
+      !config.encryptionKey ||
+      !isValidEncryptionKey(config.encryptionKey))
   )
     throw new Error(
       "Live mode requires OPENMUSE_ACCESS_KEY (24+ characters) and TOKEN_ENCRYPTION_KEY (32-byte base64)",
