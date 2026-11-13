@@ -319,7 +319,7 @@ test("calendar ranges and complete sample mail threads survive navigation", asyn
     body: JSON.stringify({ capability: "read" }),
   });
   const calendars = await app.request("/api/calendars", { headers: headers() });
-  assert.equal((await calendars.json())[0].id, "primary");
+  assert.equal((await calendars.json()).calendars[0].id, "primary");
   const tomorrow = new Date();
   tomorrow.setDate(tomorrow.getDate() + 1);
   tomorrow.setHours(0, 0, 0, 0);

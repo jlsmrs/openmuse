@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { monitorInputSchema } from "../packages/domain/src/agent.ts";
+import { localDateTime } from "../packages/domain/src/date-time.ts";
 import {
   emailDraftSchema,
   eventDraftSchema,
@@ -15,6 +17,7 @@ const event = {
   title: "Museum visit",
   start: "2026-10-10T10:00:00-07:00",
   end: "2026-10-10T14:00:00-07:00",
+  timeZone: "America/Los_Angeles",
 };
 
 test("email drafts default cc, bcc, and attachmentIds to empty arrays", () => {
@@ -51,8 +54,18 @@ test("email drafts reject malformed addresses", () => {
   assert.equal(emailDraftSchema.safeParse({ ...email, to: ["not-an-email"] }).success, false);
 });
 
-test("timed events require an explicit UTC offset", () => {
+test("timed events require an explicit UTC offset and a time zone", () => {
   assert.equal(eventDraftSchema.parse(event).timeZone, "America/Los_Angeles");
+  // There is no user-configured zone to fall back to: omitting timeZone
+  // rejects instead of silently defaulting to America/Los_Angeles.
+  assert.equal(
+    eventDraftSchema.safeParse({
+      title: "Museum visit",
+      start: "2026-10-10T10:00:00-07:00",
+      end: "2026-10-10T14:00:00-07:00",
+    }).success,
+    false,
+  );
   assert.equal(
     eventDraftSchema.safeParse({ ...event, start: "2026-10-10T10:00:00" }).success,
     false,
@@ -190,4 +203,45 @@ test("drafts drop invisible characters so the review card shows what is sent", (
 test("drafts keep joiners and directional marks that real text uses", () => {
   const body = "Family 👨\u200D👩\u200D👧, می\u200Cخواهم, \u200Fשלום\u200E";
   assert.equal(emailDraftSchema.parse({ ...email, body }).body, body);
+});
+
+test("calendar.delete proposals reject an empty calendar id or title", () => {
+  const base = { calendarId: "primary", eventId: "event-1", title: "Museum visit" };
+  assert.equal(proposalSchema.safeParse({ kind: "calendar.delete", data: base }).success, true);
+  assert.equal(
+    proposalSchema.safeParse({ kind: "calendar.delete", data: { ...base, calendarId: "" } })
+      .success,
+    false,
+  );
+  assert.equal(
+    proposalSchema.safeParse({ kind: "calendar.delete", data: { ...base, title: "" } }).success,
+    false,
+  );
+});
+
+test("monitor URLs are restricted to http, https, and the sample fixture scheme", () => {
+  const base = { title: "Price watch", url: "https://example.com/item" };
+  assert.equal(monitorInputSchema.safeParse(base).success, true);
+  assert.equal(
+    monitorInputSchema.safeParse({ ...base, url: "http://example.com/item" }).success,
+    true,
+  );
+  assert.equal(
+    monitorInputSchema.safeParse({ ...base, url: "sample://availability" }).success,
+    true,
+  );
+  for (const url of ["ftp://example.com/item", "javascript:alert(1)", "file:///etc/passwd"]) {
+    assert.equal(monitorInputSchema.safeParse({ ...base, url }).success, false);
+  }
+});
+
+test("localDateTime falls back to the raw timestamp for an unknown zone", () => {
+  assert.deepEqual(localDateTime("2026-10-10T10:00:00-07:00", "America/Chicago"), {
+    date: "2026-10-10",
+    time: "12:00",
+  });
+  assert.deepEqual(localDateTime("2026-10-10T10:00:00-07:00", "Not/AZone"), {
+    date: "2026-10-10",
+    time: "10:00",
+  });
 });

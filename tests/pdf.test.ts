@@ -60,6 +60,40 @@ test("filling changes only the new PDF and round-trips text and checkbox values"
   );
 });
 
+test("PDF marker must sit at the start of the file, not buried inside it", async () => {
+  const sample = await createSamplePdf();
+  // A UTF-8 BOM before the marker is tolerated.
+  const bom = new Uint8Array([0xef, 0xbb, 0xbf, ...sample]);
+  assert.equal((await inspectPdf(bom)).pageCount, 2);
+  // The same marker 500 bytes in is not a PDF header.
+  const buried = new Uint8Array(500 + sample.length);
+  buried.set(sample, 500);
+  await assert.rejects(inspectPdf(buried), /invalid|malformed/i);
+  await assert.rejects(fillPdf(buried, {}), /invalid|malformed/i);
+});
+
+test("filling one field leaves an untouched field's appearance alone", async () => {
+  // A form with no appearance streams at all: every field needs one, so the
+  // old render-everything pass re-rendered all of them in Helvetica.
+  const doc = await PDFDocument.create();
+  const page = doc.addPage([612, 792]);
+  const form = doc.getForm();
+  form.createTextField("filled_name").addToPage(page, { x: 40, y: 700, width: 200, height: 24 });
+  const untouched = form.createTextField("untouched_name");
+  untouched.addToPage(page, { x: 40, y: 650, width: 200, height: 24 });
+  // An untouched field holding characters Helvetica cannot render: the old
+  // pass failed the whole fill on it.
+  untouched.setText("漢字");
+  for (const field of form.getFields()) {
+    for (const widget of field.acroField.getWidgets()) widget.dict.delete(PDFName.of("AP"));
+  }
+  const bytes = await doc.save({ updateFieldAppearances: false });
+  const filled = await fillPdf(bytes, { filled_name: "Test Participant" });
+  const result = await PDFDocument.load(filled);
+  assert.equal(result.getForm().getTextField("filled_name").getText(), "Test Participant");
+  assert.equal(result.getForm().getTextField("untouched_name").getText(), "漢字");
+});
+
 test("PDF operations reject invalid bytes, encrypted input, unknown names, and wrong field types", async () => {
   for (const bytes of [new Uint8Array(), Buffer.from("not a PDF")]) {
     await assert.rejects(inspectPdf(bytes), /invalid|malformed|empty/i);
