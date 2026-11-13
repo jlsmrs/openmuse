@@ -30,6 +30,7 @@ const navigation = {
   truncated: false,
   elapsedMs: 50,
 };
+const approval = { proposalToken: "proposal-1" };
 
 test("OpenBot is disabled by default and cannot call a supplied transport", async () => {
   const { transport, calls } = fixture(() => Response.json({}));
@@ -129,7 +130,7 @@ test("channel creation preserves separate channel, thread and agent identities",
       channel: { id: "channel-2", threadId: "thread-3", agentIds: ["bot-1"], active: true },
     });
   });
-  assert.deepEqual(await adapter.createConversation("bot-1"), {
+  assert.deepEqual(await adapter.createConversation("bot-1", undefined, approval), {
     channelId: "channel-2",
     threadId: "thread-3",
     agentIds: ["bot-1"],
@@ -178,6 +179,7 @@ test("navigation uses the policy gateway, preserves cancellation and never creat
       "bot-1",
       { url: "https://example.com/", toolCallId: "call-1" },
       controller.signal,
+      approval,
     ),
     navigation,
   );
@@ -197,9 +199,12 @@ test("navigation uses the policy gateway, preserves cancellation and never creat
 test("human control reads and transitions use the exact audited gateway routes", async () => {
   const { adapter, calls } = fixture(() => Response.json(control));
   assert.deepEqual(await adapter.computerControl("bot-1"), control);
-  assert.deepEqual(await adapter.requestControl("bot-1", "Complete sign in"), control);
-  assert.deepEqual(await adapter.takeControl("bot-1"), control);
-  assert.deepEqual(await adapter.releaseControl("bot-1"), control);
+  assert.deepEqual(
+    await adapter.requestControl("bot-1", "Complete sign in", undefined, approval),
+    control,
+  );
+  assert.deepEqual(await adapter.takeControl("bot-1", undefined, approval), control);
+  assert.deepEqual(await adapter.releaseControl("bot-1", undefined, approval), control);
   assert.deepEqual(
     calls.map(({ path, init }) => [path, init.method]),
     [
@@ -216,14 +221,17 @@ test("policy refusals preserve status and rule and are never retried", async () 
   const { adapter, calls } = fixture(() =>
     Response.json({ error: "Navigation blocked.", rule: "deny-private" }, { status: 403 }),
   );
-  await assert.rejects(adapter.navigate("bot-1", { url: "https://example.com" }), (error) => {
-    assert.ok(error instanceof OpenBotError);
-    assert.equal(error.code, "refused");
-    assert.equal(error.status, 403);
-    assert.equal(error.rule, "deny-private");
-    assert.equal(error.outcomeUnknown, false);
-    return true;
-  });
+  await assert.rejects(
+    adapter.navigate("bot-1", { url: "https://example.com" }, undefined, approval),
+    (error) => {
+      assert.ok(error instanceof OpenBotError);
+      assert.equal(error.code, "refused");
+      assert.equal(error.status, 403);
+      assert.equal(error.rule, "deny-private");
+      assert.equal(error.outcomeUnknown, false);
+      return true;
+    },
+  );
   assert.equal(calls.length, 1);
 });
 
@@ -236,11 +244,85 @@ test("uncertain mutations require reconciliation after transport, server or inva
     () => Response.json({ unexpected: true }),
   ]) {
     const { adapter, calls } = fixture(handler);
-    await assert.rejects(adapter.navigate("bot-1", { url: "https://example.com" }), (error) => {
-      assert.ok(error instanceof OpenBotError);
-      assert.equal(error.outcomeUnknown, true);
-      return true;
-    });
+    await assert.rejects(
+      adapter.navigate("bot-1", { url: "https://example.com" }, undefined, approval),
+      (error) => {
+        assert.ok(error instanceof OpenBotError);
+        assert.equal(error.outcomeUnknown, true);
+        return true;
+      },
+    );
     assert.equal(calls.length, 1);
   }
+});
+
+test("adapter declares the ExecutionBackend shape and reports health", async () => {
+  const { adapter } = fixture((path) =>
+    Response.json(
+      path === "/api/me"
+        ? { user: { id: "person-1" } }
+        : { mode: "intelligence", durableHistory: true, generativeUi: false },
+    ),
+  );
+  assert.equal(adapter.kind, "openbot");
+  assert.deepEqual([...adapter.capabilities], ["intelligence", "computer"]);
+  assert.deepEqual(await adapter.health(), {
+    available: true,
+    detail: "authenticated as person-1",
+  });
+  const disabled = new OpenBotAdapter({ agentId: "bot-1" });
+  assert.deepEqual(await disabled.health(), { available: false, detail: "disabled" });
+});
+
+test("writes without an approved proposal token never reach the transport", async () => {
+  const { adapter, calls } = fixture(() => Response.json(navigation));
+  await assert.rejects(adapter.navigate("bot-1", { url: "https://example.com" }), {
+    code: "refused",
+  });
+  await assert.rejects(adapter.createConversation("bot-1"), { code: "refused" });
+  await assert.rejects(adapter.takeControl("bot-1"), { code: "refused" });
+  assert.equal(calls.length, 0);
+  // The same calls with a token go through.
+  await adapter.navigate("bot-1", { url: "https://example.com" }, undefined, approval);
+  assert.equal(calls.length, 1);
+});
+
+test("oversized and non-JSON responses are rejected instead of parsed", async () => {
+  const big = fixture(() =>
+    Response.json({ botId: "bot-1", state: "ready", reason: "x".repeat(2 * 1024 * 1024) }),
+  );
+  await assert.rejects(big.adapter.computerStatus("bot-1"), { code: "invalid_response" });
+  const plain = fixture(
+    () => new Response("not json", { status: 200, headers: { "Content-Type": "text/plain" } }),
+  );
+  await assert.rejects(plain.adapter.computerStatus("bot-1"), { code: "invalid_response" });
+  // A non-JSON error body still surfaces as the HTTP error, not a parse failure.
+  const errorBody = fixture(() => new Response("upstream unavailable", { status: 503 }));
+  await assert.rejects(errorBody.adapter.computerStatus("bot-1"), (error: unknown) => {
+    assert.ok(error instanceof OpenBotError);
+    assert.equal(error.code, "http_error");
+    assert.equal(error.status, 503);
+    return true;
+  });
+});
+
+test("a non-loopback runtime over plain http is refused", () => {
+  const transport = (runtimeUrl: string): OpenBotTransport => ({
+    runtimeUrl,
+    async request() {
+      return Response.json({});
+    },
+  });
+  const plain = new OpenBotAdapter({
+    enabled: true,
+    agentId: "bot-1",
+    transport: transport("http://openbot.example/api/copilotkit"),
+  });
+  assert.throws(() => plain.runtime(), /https outside loopback/);
+  const loopback = new OpenBotAdapter({
+    enabled: true,
+    agentId: "bot-1",
+    transport: transport("http://127.0.0.1:8080/api/copilotkit"),
+  });
+  assert.equal(loopback.runtime().runtimeUrl, "http://127.0.0.1:8080/api/copilotkit");
 });

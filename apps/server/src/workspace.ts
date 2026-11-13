@@ -7,10 +7,12 @@ import type {
   BrowserSession,
   CalendarEvent,
   Mail,
+  MailMetadata,
   ProposalInput,
   Workspace,
 } from "../../../packages/domain/src/index.ts";
-import { GoogleClient } from "../../../packages/integrations/src/google.ts";
+import { toMailMetadata } from "../../../packages/domain/src/index.ts";
+import { type CalendarListEntry, GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
 import type { ActionService } from "./actions.ts";
 import { agentConfigured } from "./agent.ts";
@@ -52,18 +54,21 @@ export class WorkspaceService {
       ? (await this.db.get<{ enabled: boolean }>(owner, "settings", "google"))?.enabled !== false
       : Boolean(await this.googleAuth.tokens(owner));
   }
-  async calendars(owner: string) {
+  async calendars(owner: string): Promise<{ calendars: CalendarListEntry[]; truncated: boolean }> {
     const connection = await this.connection(owner);
-    if (!connection) return [];
+    if (!connection) return { calendars: [], truncated: false };
     if (this.config.mode === "sample")
-      return [
-        {
-          id: "primary",
-          name: "Personal",
-          timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
-          accessRole: "owner",
-        },
-      ];
+      return {
+        calendars: [
+          {
+            id: "primary",
+            name: "Personal",
+            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            accessRole: "owner",
+          },
+        ],
+        truncated: false,
+      };
     return this.google(owner, connection.id).listCalendars();
   }
   async events(
@@ -189,11 +194,17 @@ export class WorkspaceService {
       )
       .sort((a, b) => b.date.localeCompare(a.date));
     // Sample mode has no provider page token: the cursor is a decimal offset.
+    // Rows are MailMetadata like the live path — body stripped to a snippet.
+    // (Matching on the same fields as live is S-B9's item; the shape is this
+    // batch's item 12 and the two must agree.)
     const offset = decodeMailCursor(pageToken);
-    const messages = all.slice(offset, offset + 100);
+    const messages = all
+      .slice(offset, offset + 100)
+      .map((message): MailMetadata => toMailMetadata(message));
     return {
       messages,
       nextPageToken: offset + 100 < all.length ? String(offset + 100) : undefined,
+      truncated: offset + 100 < all.length,
     };
   }
   async ensureSample(owner: string, actions: ActionService) {
@@ -337,7 +348,9 @@ export class WorkspaceService {
       const google = this.google(owner, connection.id);
       const [mailResult, eventResult] = await Promise.all([
         wantMail ? google.listMail(query) : Promise.resolve([] as Mail[]),
-        wantEvents ? google.listEvents() : Promise.resolve([] as CalendarEvent[]),
+        wantEvents
+          ? google.listEvents().then((page) => page.events)
+          : Promise.resolve([] as CalendarEvent[]),
       ]);
       mail = mailResult;
       events = eventResult;

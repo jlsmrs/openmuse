@@ -9,6 +9,8 @@ import {
   emailDraftSchema,
   eventDraftSchema,
   type Mail,
+  type MailMetadata,
+  toMailMetadata,
 } from "../../domain/src/index.ts";
 
 const GMAIL = "https://gmail.googleapis.com/gmail/v1/users/me";
@@ -62,6 +64,23 @@ const OVER_NESTED_MESSAGE_NOTE =
  */
 function isOverNestedMessageError(error: unknown): boolean {
   return error instanceof Error && error.message === OVER_NESTED_MESSAGE_TEXT;
+}
+
+/**
+ * True only for a fetch failure that proves the request never reached
+ * Google: DNS lookup or TCP connect failed (undici surfaces these as a
+ * TypeError whose cause carries the system code; some runtimes put the code
+ * on the error itself). A reset, abort, or timeout after dispatch is not
+ * definite — the write may have landed — so it stays outcome-unknown.
+ */
+function isDefiniteTransportFailure(error: unknown): boolean {
+  const cause = (error as { cause?: unknown } | null)?.cause;
+  const code =
+    (cause as { code?: unknown } | null)?.code ?? (error as { code?: unknown } | null)?.code;
+  return (
+    typeof code === "string" &&
+    ["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH"].includes(code)
+  );
 }
 
 export class OutcomeUnknownError extends Error {
@@ -193,6 +212,21 @@ function decodeBase64url(encoded: string, limit = MAX_ATTACHMENT_BYTES): Buffer 
 }
 function headers(part?: GmailPart): Map<string, string> {
   return new Map((part?.headers ?? []).map(({ name, value }) => [name.toLowerCase(), value]));
+}
+/**
+ * Every value for a header name, in order. headers() above collapses
+ * duplicates last-wins, which drops recipients when a message carries more
+ * than one To header (and hides a second From).
+ */
+function headersAll(part?: GmailPart): Map<string, string[]> {
+  const all = new Map<string, string[]>();
+  for (const { name, value } of part?.headers ?? []) {
+    const key = name.toLowerCase();
+    const values = all.get(key) ?? [];
+    values.push(value);
+    all.set(key, values);
+  }
+  return all;
 }
 function decodeHeader(value: string): string {
   // RFC 2047: ignore linear whitespace, including folding, between encoded words.
@@ -384,15 +418,19 @@ function isAttachedPart(part: GmailPart): boolean {
 
 function mapMessage(message: z.infer<typeof messageSchema>): Mail {
   const metadata = headers(message.payload);
+  const allHeaders = headersAll(message.payload);
   const plain: string[] = [];
   const html: string[] = [];
   const attachments: string[] = [];
-  const visit = (part: GmailPart, depth: number) => {
+  // Recurse into every part's children, including attached ones: a forwarded
+  // message (message/rfc822) carries readable text of its own. Text stays
+  // suppressed under a file attachment — an attached file's children are
+  // file content, never parent text (pinned by google-disposition.test.ts).
+  const visit = (part: GmailPart, depth: number, underFileAttachment = false) => {
     if (depth > 30) throw new Error(OVER_NESTED_MESSAGE_TEXT);
-    // Attachments carry their own content (or an attached message); never merge
-    // their parts into the parent text. Unattached remote text is hydrated above
-    // and still counts as message text.
     const attached = isAttachedPart(part);
+    const fileAttachment = attached && part.mimeType !== "message/rfc822";
+    const suppressed = underFileAttachment || fileAttachment;
     if (attached && part.body?.attachmentId) {
       const name =
         part.filename ||
@@ -402,7 +440,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
       );
     }
     if (
-      !attached &&
+      !suppressed &&
       (part.mimeType === "text/plain" || part.mimeType === "text/html") &&
       part.body?.data
     ) {
@@ -414,10 +452,12 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
       if (part.mimeType === "text/plain") plain.push(text);
       else html.push(htmlToPlainText(text));
     }
-    if (!attached) for (const child of part.parts ?? []) visit(child, depth + 1);
+    for (const child of part.parts ?? []) visit(child, depth + 1, suppressed);
   };
   if (message.payload) visit(message.payload, 0);
-  const rawFrom = metadata.get("from") ?? "";
+  // Duplicate headers: From takes the first value (only one is valid), To
+  // keeps every address across all To headers.
+  const rawFrom = allHeaders.get("from")?.[0] ?? metadata.get("from") ?? "";
   const from = decodeHeader(rawFrom);
   const address = addresses(rawFrom)[0] ?? from;
   const displayName = from.includes("<")
@@ -428,6 +468,7 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
     ? Number(message.internalDate)
     : Date.parse(metadata.get("date") ?? "");
   const date = new Date(time);
+  const rawDate = metadata.get("date") ?? "";
   const body = plain.length
     ? plain.join("\n\n")
     : html.length
@@ -439,19 +480,26 @@ function mapMessage(message: z.infer<typeof messageSchema>): Mail {
     threadId: message.threadId,
     from: address,
     sender,
-    to: addresses(metadata.get("to") ?? ""),
+    to: addresses((allHeaders.get("to") ?? []).join(", ")),
     subject: decodeHeader(metadata.get("subject") ?? "(No subject)"),
     body,
-    date: Number.isFinite(date.getTime()) ? date.toISOString() : "",
+    // A malformed date falls back to the raw header instead of vanishing:
+    // the row stays sortable-by-nothing but still shows when it arrived.
+    date: Number.isFinite(date.getTime()) ? date.toISOString() : rawDate,
     unread: message.labelIds.includes("UNREAD"),
     label: message.labelIds.includes("INBOX")
       ? "Inbox"
       : message.labelIds.includes("SENT")
         ? "Sent"
-        : "Mail",
+        : message.labelIds.includes("TRASH")
+          ? "Trash"
+          : message.labelIds.includes("SPAM")
+            ? "Spam"
+            : "Mail",
     attachments,
   };
 }
+
 function mapEvent(value: unknown, calendarId: string, calendarTimeZone = "UTC"): CalendarEvent {
   const event = googleEventSchema.parse(value);
   const allDay = Boolean(event.start.date);
@@ -590,6 +638,10 @@ export class GoogleClient {
       if (depth > 30) throw new Error(OVER_NESTED_MESSAGE_TEXT);
       // Attached MIME trees are not part of the parent body. Leave their content
       // lazy, matching the module-level mapMessage visible-text extractor.
+      // (Item 8 recurses the *mapping* walk into attached children so a
+      // forwarded message's inline text reads; remote content inside an
+      // attached tree is still never fetched — pinned by the "attached MIME
+      // trees are not fetched" test.)
       if (isAttachedPart(part)) return;
       if (
         (part.mimeType === "text/plain" || part.mimeType === "text/html") &&
@@ -616,10 +668,16 @@ export class GoogleClient {
     return Promise.all(thread.messages.map((message) => this.mapMessage(message)));
   }
 
-  async listCalendars(): Promise<CalendarListEntry[]> {
+  /**
+   * All calendars, page by page. A duplicate page token (the provider looping)
+   * or an 11th page ends the walk and returns what was fetched with
+   * truncated set — it no longer throws the fetched calendars away.
+   */
+  async listCalendars(): Promise<{ calendars: CalendarListEntry[]; truncated: boolean }> {
     const entries: CalendarListEntry[] = [];
     const tokens = new Set<string>();
     let pageToken: string | undefined;
+    let truncated = false;
     do {
       const params = new URLSearchParams({ maxResults: "250" });
       if (pageToken) params.set("pageToken", pageToken);
@@ -650,12 +708,14 @@ export class GoogleClient {
       );
       pageToken = result.nextPageToken;
       if (pageToken) {
-        if (tokens.has(pageToken) || tokens.size >= 10)
-          throw new Error("Google calendar list exceeded the pagination limit");
+        if (tokens.has(pageToken) || tokens.size >= 10) {
+          truncated = true;
+          break;
+        }
         tokens.add(pageToken);
       }
     } while (pageToken);
-    return entries;
+    return { calendars: entries, truncated };
   }
 
   private async readSingleEvent(
@@ -732,9 +792,17 @@ export class GoogleClient {
             : AbortSignal.timeout(30000),
           redirect: "error",
         });
-      } catch {
+      } catch (error) {
         if (signal?.aborted) throw new Error(MAIL_LIST_TIMEOUT_MESSAGE);
-        if (write) throw new OutcomeUnknownError();
+        if (write) {
+          // A write whose fetch throws before dispatch (DNS/connect never
+          // reached Google) is a definite failure, not outcome-unknown:
+          // the request provably never arrived. Anything else — a reset or
+          // timeout after dispatch, a lost response — stays ambiguous.
+          if (isDefiniteTransportFailure(error))
+            throw new Error("Could not reach Google; check the connection and try again");
+          throw new OutcomeUnknownError();
+        }
         throw new Error("Could not reach Google; check the connection and try again");
       }
       if (write && (response.status >= 500 || response.status === 408)) {
@@ -826,6 +894,17 @@ export class GoogleClient {
     }
   }
 
+  /** noteRow for the headers-only path: the note goes in the snippet, never a body. */
+  private async noteRowMetadata(
+    id: string,
+    signal: AbortSignal,
+    note: string,
+    stripParts: boolean,
+  ): Promise<MailMetadata> {
+    const row = await this.noteRow(id, signal, note, stripParts);
+    return toMailMetadata(row);
+  }
+
   /**
    * Fetch one page of message IDs, then fetch each message with bounded
    * concurrency under one overall deadline. Results keep list order. A
@@ -835,11 +914,12 @@ export class GoogleClient {
    * fails the list. The provider's next-page token is returned so callers
    * can page past the first 100 matches instead of silently truncating.
    */
-  private async listMessages(
+  private async listMessages<T>(
     query: string,
-    fetchOne: (id: string, signal: AbortSignal) => Promise<Mail>,
+    fetchOne: (id: string, signal: AbortSignal) => Promise<T>,
+    makeNoteRow: (id: string, signal: AbortSignal, note: string, stripParts: boolean) => Promise<T>,
     pageToken?: string,
-  ): Promise<{ messages: Mail[]; nextPageToken?: string }> {
+  ): Promise<{ messages: T[]; nextPageToken?: string; truncated: boolean }> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), this.mailListDeadlineMs);
     try {
@@ -860,7 +940,7 @@ export class GoogleClient {
           ),
         );
       const ids = list.messages.slice(0, 100).map(({ id }) => id);
-      const results: Mail[] = new Array(ids.length);
+      const results: T[] = new Array(ids.length);
       let next = 0;
       const workers = Array.from(
         { length: Math.min(this.mailListConcurrency, ids.length) },
@@ -875,14 +955,14 @@ export class GoogleClient {
               // list (M8/M9): keep its row with a note. Any other failure
               // still fails it.
               if (isOversizedMessageError(error)) {
-                results[index] = await this.noteRow(
+                results[index] = await makeNoteRow(
                   ids[index],
                   controller.signal,
                   OVERSIZED_MESSAGE_NOTE,
                   false,
                 );
               } else if (isOverNestedMessageError(error)) {
-                results[index] = await this.noteRow(
+                results[index] = await makeNoteRow(
                   ids[index],
                   controller.signal,
                   OVER_NESTED_MESSAGE_NOTE,
@@ -905,7 +985,11 @@ export class GoogleClient {
           ),
         ),
       ]);
-      return { messages: results, nextPageToken: list.nextPageToken };
+      return {
+        messages: results,
+        nextPageToken: list.nextPageToken,
+        truncated: Boolean(list.nextPageToken),
+      };
     } finally {
       clearTimeout(timer);
     }
@@ -914,18 +998,21 @@ export class GoogleClient {
   /** The latest 100 matching messages. Permission/read failures propagate visibly. */
   async listMail(query = "in:inbox"): Promise<Mail[]> {
     return (
-      await this.listMessages(query, async (id, signal) =>
-        this.mapMessage(
-          messageSchema.parse(
-            await this.request(
-              `${GMAIL}/messages/${idPath(id)}?format=full`,
-              "GET",
-              undefined,
-              {},
-              signal,
+      await this.listMessages(
+        query,
+        async (id, signal) =>
+          this.mapMessage(
+            messageSchema.parse(
+              await this.request(
+                `${GMAIL}/messages/${idPath(id)}?format=full`,
+                "GET",
+                undefined,
+                {},
+                signal,
+              ),
             ),
           ),
-        ),
+        (id, signal, note, stripParts) => this.noteRow(id, signal, note, stripParts),
       )
     ).messages;
   }
@@ -936,35 +1023,41 @@ export class GoogleClient {
    * and too large for one reply, so lists, counts and tables use this path
    * and full bodies come from getThread for a selected message instead.
    * Permission/read failures propagate visibly. Pass the previous page's
-   * nextPageToken to read the next 100 matches.
+   * nextPageToken to read the next 100 matches. Rows are MailMetadata: the
+   * snippet, never a body. truncated is true exactly when another page exists.
    */
   async listMailMetadata(
     query = "in:inbox",
     pageToken?: string,
-  ): Promise<{ messages: Mail[]; nextPageToken?: string }> {
+  ): Promise<{ messages: MailMetadata[]; nextPageToken?: string; truncated: boolean }> {
     const meta = new URLSearchParams({ format: "metadata" });
     for (const header of ["From", "Subject", "Date", "To"]) meta.append("metadataHeaders", header);
     return this.listMessages(
       query,
       async (id, signal) =>
-        this.mapMessage(
-          messageSchema.parse(
-            await this.request(
-              `${GMAIL}/messages/${idPath(id)}?${meta}`,
-              "GET",
-              undefined,
-              {},
-              signal,
+        toMailMetadata(
+          await this.mapMessage(
+            messageSchema.parse(
+              await this.request(
+                `${GMAIL}/messages/${idPath(id)}?${meta}`,
+                "GET",
+                undefined,
+                {},
+                signal,
+              ),
             ),
           ),
         ),
+      (id, signal, note, stripParts) => this.noteRowMetadata(id, signal, note, stripParts),
       pageToken,
     );
   }
 
   /** At most 100 occurrences in a bounded window, beginning at local midnight by default. */
-  async listEvents(options: ListEventsOptions = {}): Promise<CalendarEvent[]> {
-    return (await this.listEventsPage(options)).events;
+  async listEvents(
+    options: ListEventsOptions = {},
+  ): Promise<{ events: CalendarEvent[]; truncated: boolean; nextPageToken?: string }> {
+    return this.listEventsPage(options);
   }
 
   /** Retain the provider's completeness marker without fetching additional pages. */
@@ -1045,21 +1138,26 @@ export class GoogleClient {
       threadId = source.threadId;
       const metadata = headers(source.payload);
       const messageId = singleLine(metadata.get("message-id") ?? "", "Message-ID");
-      if (!/^<[^<>\s]+@[^<>\s]+>$/.test(messageId))
-        throw new Error("Source message has no valid Message-ID for reply threading");
       const normalizedSubject = (subject: string) =>
         decodeHeader(subject)
           .replace(/^(?:\s*re:\s*)+/i, "")
           .trim();
       if (normalizedSubject(draft.subject) !== normalizedSubject(metadata.get("subject") ?? ""))
         throw new Error("Reply subject must match the source message subject");
-      const references = singleLine(metadata.get("references") ?? "", "References").trim();
-      if (references && !/^(?:<[^<>\s]+@[^<>\s]+>\s*)+$/.test(references))
-        throw new Error("Source message has invalid References headers");
-      const chain = [...new Set([...(references.match(/<[^<>\s]+>/g) ?? []), messageId])];
-      if (chain.join(" ").length > 950)
-        throw new Error("Reply References header exceeds the supported length");
-      replyHeaders.push(`In-Reply-To: ${messageId}`, `References: ${chain.join(" ")}`);
+      // A source message without a strictly formatted Message-ID still
+      // threads: the send below carries its threadId, and Gmail groups by
+      // thread plus the matching subject. In-Reply-To/References are only
+      // added when the Message-ID is usable — a bad one used to reject the
+      // whole reply.
+      if (/^<[^<>\s]+@[^<>\s]+>$/.test(messageId)) {
+        const references = singleLine(metadata.get("references") ?? "", "References").trim();
+        if (references && !/^(?:<[^<>\s]+@[^<>\s]+>\s*)+$/.test(references))
+          throw new Error("Source message has invalid References headers");
+        const chain = [...new Set([...(references.match(/<[^<>\s]+>/g) ?? []), messageId])];
+        if (chain.join(" ").length > 950)
+          throw new Error("Reply References header exceeds the supported length");
+        replyHeaders.push(`In-Reply-To: ${messageId}`, `References: ${chain.join(" ")}`);
+      }
     }
     const profile = z
       .object({ emailAddress: z.email() })

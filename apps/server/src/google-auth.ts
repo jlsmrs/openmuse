@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { z } from "zod";
-import { decryptSecret, encryptSecret } from "../../../packages/integrations/src/vault.ts";
+import { decryptSecret, encryptSecretV2 } from "../../../packages/integrations/src/vault.ts";
 import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
@@ -47,13 +47,15 @@ export class GoogleAuth {
     );
   }
   async tokens(owner: string): Promise<Tokens | null> {
-    return this.decodeTokens(await this.db.get<Credential>(owner, "credentials", "google"));
+    return this.decodeTokens(await this.db.get<Credential>(owner, "credentials", "google"), owner);
   }
-  private decodeTokens(stored: Credential | null): Tokens | null {
+  private decodeTokens(stored: Credential | null, owner: string): Tokens | null {
     if (!stored?.secret) return null;
     if (!this.config.encryptionKey)
       throw new AppError("TOKEN_ENCRYPTION_KEY is not configured", 503);
-    return JSON.parse(decryptSecret(stored.secret, this.config.encryptionKey));
+    return JSON.parse(
+      decryptSecret(stored.secret, this.config.encryptionKey, { owner, recordId: "google" }),
+    );
   }
   private async save(owner: string, tokens: Tokens, generation: string) {
     if (!this.config.encryptionKey)
@@ -66,7 +68,10 @@ export class GoogleAuth {
       {
         generation: randomUUID(),
         connectionId: tokens.connectionId,
-        secret: encryptSecret(JSON.stringify(tokens), this.config.encryptionKey),
+        secret: encryptSecretV2(JSON.stringify(tokens), this.config.encryptionKey, {
+          owner,
+          recordId: "google",
+        }),
       },
     );
     if (!saved)
@@ -108,7 +113,7 @@ export class GoogleAuth {
     const state = randomBytes(32).toString("base64url"),
       verifier = randomBytes(48).toString("base64url");
     const { generation, previous } = await this.rotateGeneration(owner);
-    const existing = this.decodeTokens(previous);
+    const existing = this.decodeTokens(previous, owner);
     // Reconnecting unions previously granted scopes into the new request, so
     // a scope can never be dropped by reconnecting. Pass resetScopes to start
     // from the base set instead — the previously granted scopes are dropped.
@@ -241,7 +246,10 @@ export class GoogleAuth {
     const updated = await this.db.updateCredential(
       owner,
       tokens.connectionId,
-      encryptSecret(JSON.stringify(refreshed), this.config.encryptionKey),
+      encryptSecretV2(JSON.stringify(refreshed), this.config.encryptionKey, {
+        owner,
+        recordId: "google",
+      }),
     );
     if (!updated)
       throw new AppError("Google account changed or was disconnected during refresh", 409);
@@ -253,7 +261,7 @@ export class GoogleAuth {
     // succeeded: clearing first would leave Google holding a grant we can
     // no longer revoke, with no way to retry.
     const { previous } = await this.rotateGeneration(owner);
-    const tokens = this.decodeTokens(previous);
+    const tokens = this.decodeTokens(previous, owner);
     if (tokens) {
       const response = await fetch("https://oauth2.googleapis.com/revoke", {
         method: "POST",

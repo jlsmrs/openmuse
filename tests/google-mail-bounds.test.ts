@@ -139,12 +139,14 @@ test("mail metadata pages past the first 100 with the provider token", async () 
   assert.equal(first.messages.length, 100);
   assert.equal(first.messages[0].id, "page1-1");
   assert.equal(first.nextPageToken, "token-2");
+  assert.equal(first.truncated, true);
   const second = await client.listMailMetadata("in:inbox", first.nextPageToken);
   assert.deepEqual(
     second.messages.map((m) => m.id),
     secondIds,
   );
   assert.equal(second.nextPageToken, undefined);
+  assert.equal(second.truncated, false);
   assert.equal(listRequests.length, 2);
   assert.equal(new URL(listRequests[1]).searchParams.get("pageToken"), "token-2");
   // listMail keeps its plain-array shape: only the metadata path pages.

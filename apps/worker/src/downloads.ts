@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { Download } from "playwright";
+import { pdfMarkerAtStart } from "../../../packages/integrations/src/pdf.ts";
 
 export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
 export interface PdfDownload {
@@ -154,8 +155,8 @@ export async function capturePdfDownload(options: {
       new Transform({
         transform(chunk: Buffer, _encoding, done) {
           bytes += chunk.length;
-          if (prefix.length < 1024)
-            prefix = Buffer.concat([prefix, chunk.subarray(0, 1024 - prefix.length)]);
+          if (prefix.length < 9)
+            prefix = Buffer.concat([prefix, chunk.subarray(0, 9 - prefix.length)]);
           if (bytes > MAX_DOWNLOAD_BYTES) {
             oversized = true;
             done(new Error("Download too large"));
@@ -164,8 +165,8 @@ export async function capturePdfDownload(options: {
       }),
       createWriteStream(destination, { mode: 0o600, flags: "wx" }),
     );
-    // Match the importer's bounded prefix check, without lossy ASCII decoding.
-    if (prefix.indexOf("%PDF-") < 0) {
+    // Match the importer's marker-at-start check, without lossy ASCII decoding.
+    if (!pdfMarkerAtStart(prefix)) {
       outcome.code = "UNSUPPORTED_DOWNLOAD";
       outcome.message = "Only PDF downloads can be imported. This file was not a PDF.";
       throw new Error("Unsupported download");

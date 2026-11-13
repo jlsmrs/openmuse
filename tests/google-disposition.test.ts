@@ -76,3 +76,47 @@ test("inline remote text remains body content instead of an attachment", async (
     assert.deepEqual(mail.attachments, []);
   }
 });
+
+test("a forwarded message's text reads as parent body; a file attachment's does not", async () => {
+  const message = {
+    id: "outer",
+    threadId: "thread1",
+    payload: {
+      mimeType: "multipart/mixed",
+      parts: [
+        { mimeType: "text/plain", body: { data: encoded("Outer body.") } },
+        {
+          mimeType: "message/rfc822",
+          body: { attachmentId: "forwarded", size: 42 },
+          parts: [
+            { mimeType: "text/plain", body: { data: encoded("Forwarded text.") } },
+            {
+              mimeType: "text/plain",
+              headers: [{ name: "Content-Disposition", value: "attachment" }],
+              body: { attachmentId: "nested-file", size: 9 },
+              parts: [{ mimeType: "text/plain", body: { data: encoded("Nested file text.") } }],
+            },
+          ],
+        },
+      ],
+    },
+  };
+  const client = new GoogleClient({
+    getAccessToken: async () => "synthetic-access-token",
+    fetch: async (input) => {
+      const path = new URL(String(input)).pathname;
+      if (path.endsWith("/messages")) return Response.json({ messages: [{ id: "outer" }] });
+      if (path.includes("/threads/")) return Response.json({ id: "thread1", messages: [message] });
+      return Response.json(message);
+    },
+  });
+  for (const mails of [await client.listMail(), await client.getThread("thread1")]) {
+    // The forwarded message's text joins the parent body; the file nested
+    // inside the forwarded message stays an attachment, never body text.
+    assert.equal(mails[0].body, "Outer body.\n\nForwarded text.");
+    assert.deepEqual(mails[0].attachments, [
+      "outer:forwarded:forwarded-message.eml",
+      "outer:nested-file:attachment",
+    ]);
+  }
+});

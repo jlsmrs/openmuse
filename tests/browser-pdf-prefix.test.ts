@@ -9,11 +9,7 @@ import { createSamplePdf, inspectPdf } from "../packages/integrations/src/pdf.ts
 
 test("browser PDF downloads accept the same bounded header prefix as PDF imports", async (t) => {
   const pdf = await createSamplePdf();
-  for (const prefix of [
-    Buffer.alloc(0),
-    Buffer.from([0xef, 0xbb, 0xbf, 0x0a]),
-    Buffer.alloc(1019, 32),
-  ]) {
+  for (const prefix of [Buffer.alloc(0), Buffer.from([0xef, 0xbb, 0xbf, 0x0a])]) {
     const directory = await mkdtemp(join(tmpdir(), "openmuse-pdf-prefix-"));
     t.after(() => rm(directory, { recursive: true, force: true }));
     const bytes = Buffer.concat([prefix, pdf]);
@@ -46,6 +42,27 @@ test("browser PDF downloads accept the same bounded header prefix as PDF imports
     assert.equal(metadata.size, bytes.length);
     assert.deepEqual(await readFile(join(directory, "downloads", `${metadata.id}.pdf`)), bytes);
   }
+});
+
+test("browser PDF downloads and imports reject a marker buried past the first bytes", async (t) => {
+  const pdf = await createSamplePdf();
+  const bytes = Buffer.concat([Buffer.alloc(1019, 32), pdf]);
+  await assert.rejects(inspectPdf(bytes));
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-pdf-buried-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  await capturePdfDownload({
+    directory,
+    tempDirectory: directory,
+    limitReached: false,
+    download: {
+      suggestedFilename: () => "form.pdf",
+      createReadStream: async () => Readable.from([bytes]),
+      cancel: async () => {},
+      delete: async () => {},
+    },
+  });
+  assert.equal((await readDownloadFailures(directory))[0]?.code, "UNSUPPORTED_DOWNLOAD");
+  assert.deepEqual(await readdir(join(directory, "downloads")), []);
 });
 
 test("browser PDF sniffing rejects late markers and non-ASCII lookalikes", async (t) => {

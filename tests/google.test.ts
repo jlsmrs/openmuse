@@ -27,6 +27,7 @@ const event = () =>
     title: "Community museum",
     start: "2026-10-10T10:00:00-07:00",
     end: "2026-10-10T14:00:00-07:00",
+    timeZone: "America/Los_Angeles",
   });
 const eventResponse = {
   id: "event-1",
@@ -36,6 +37,8 @@ const eventResponse = {
   end: { dateTime: "2026-10-10T14:00:00-07:00" },
 };
 const base64url = (text: string) => Buffer.from(text).toString("base64url");
+const listResponse = (ids: string[]) => ({ messages: ids.map((id) => ({ id })) });
+const isMessageFetch = (request: Request) => /\/messages\/[^/?]+\?/.test(request.url);
 
 test("mail addresses exclude comments, including nested and escaped parentheses", async () => {
   for (const comment of [
@@ -511,7 +514,7 @@ test("calendar reads expanded primary events and maps all-day boundaries", async
       ],
     });
   });
-  assert.deepEqual((await client.listEvents())[0], {
+  assert.deepEqual((await client.listEvents()).events[0], {
     id: "day1",
     calendarId: "primary",
     title: "Museum day",
@@ -856,7 +859,7 @@ test("event reads include earlier today and support selected calendars and bound
     timeMin: "2026-10-01T00:00:00-07:00",
     timeMax: "2026-11-01T00:00:00-07:00",
   });
-  assert.equal(result[0].calendarId, "shared@example.com");
+  assert.equal(result.events[0].calendarId, "shared@example.com");
   assert.equal(queries[1].pathname, "/calendar/v3/calendars/shared%40example.com/events");
   assert.equal(queries[1].searchParams.get("timeMin"), "2026-10-01T00:00:00-07:00");
   assert.equal(queries[1].searchParams.get("timeMax"), "2026-11-01T00:00:00-07:00");
@@ -898,20 +901,23 @@ test("calendar discovery follows pagination and retains names, zones, and access
           ],
         });
   });
-  assert.deepEqual(await client.listCalendars(), [
-    {
-      id: "me@example.com",
-      name: "Personal",
-      timeZone: "America/Los_Angeles",
-      accessRole: "owner",
-    },
-    {
-      id: "shared@example.com",
-      name: "Family",
-      timeZone: "America/Los_Angeles",
-      accessRole: "writer",
-    },
-  ]);
+  assert.deepEqual(await client.listCalendars(), {
+    calendars: [
+      {
+        id: "me@example.com",
+        name: "Personal",
+        timeZone: "America/Los_Angeles",
+        accessRole: "owner",
+      },
+      {
+        id: "shared@example.com",
+        name: "Family",
+        timeZone: "America/Los_Angeles",
+        accessRole: "writer",
+      },
+    ],
+    truncated: false,
+  });
 });
 
 test("calendars without an explicit time zone still list with a UTC fallback", async () => {
@@ -926,14 +932,17 @@ test("calendars without an explicit time zone still list with a UTC fallback", a
       ],
     }),
   );
-  assert.deepEqual(await client.listCalendars(), [
-    {
-      id: "shared@example.com",
-      name: "Family",
-      timeZone: "UTC",
-      accessRole: "reader",
-    },
-  ]);
+  assert.deepEqual(await client.listCalendars(), {
+    calendars: [
+      {
+        id: "shared@example.com",
+        name: "Family",
+        timeZone: "UTC",
+        accessRole: "reader",
+      },
+    ],
+    truncated: false,
+  });
 });
 
 test("event review falls back to UTC when neither the event nor its calendar has a zone", async () => {
@@ -1042,7 +1051,7 @@ test("mail parsing tolerates unknown charsets, RFC 2231 words, and display names
   assert.deepEqual(mail.to, ["real@example.com"]);
 });
 
-test("an attached message is not merged into the parent body", async () => {
+test("a forwarded message's inline text reads as parent body", async () => {
   const client = clientWith((request) =>
     new URL(request.url).pathname.endsWith("/messages")
       ? json({ messages: [{ id: "msg-forward" }] })
@@ -1069,7 +1078,7 @@ test("an attached message is not merged into the parent body", async () => {
         }),
   );
   const [mail] = await client.listMail();
-  assert.equal(mail.body, "Outer body text.");
+  assert.equal(mail.body, "Outer body text.\n\nINNER ATTACHED MESSAGE BODY");
   assert.deepEqual(mail.attachments, ["msg-forward:attach2:forwarded.eml"]);
 });
 
@@ -1156,4 +1165,162 @@ test("attached MIME trees are not fetched while loading the parent message", asy
     assert.deepEqual(threadMail.attachments, mail.attachments);
     assert.equal(reads.length, 3);
   }
+});
+
+test("a write that fails before dispatch is a definite failure, not outcome-unknown", async () => {
+  const definite = Object.assign(new TypeError("fetch failed"), {
+    cause: { code: "ENOTFOUND" },
+  });
+  const client = clientWith((request) => {
+    if (request.url.endsWith("/profile")) return json({ emailAddress: "me@example.com" });
+    throw definite;
+  });
+  await assert.rejects(client.sendEmail(email(), []), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!(error instanceof OutcomeUnknownError));
+    assert.match(error.message, /Could not reach Google/);
+    return true;
+  });
+});
+
+test("duplicate headers keep every recipient and the first sender", async () => {
+  const client = clientWith((request) => {
+    if (!isMessageFetch(request)) return json(listResponse(["dup1"]));
+    return json({
+      id: "dup1",
+      threadId: "thread1",
+      snippet: "",
+      labelIds: ["INBOX"],
+      payload: {
+        mimeType: "text/plain",
+        headers: [
+          { name: "From", value: "First <first@example.com>" },
+          { name: "From", value: "Second <second@example.com>" },
+          { name: "To", value: "a@example.com" },
+          { name: "To", value: "b@example.com, c@example.com" },
+          { name: "Subject", value: "Hello" },
+          { name: "Date", value: "Mon, 10 Nov 2026 10:00:00 -0600" },
+        ],
+        body: { data: base64url("Hi") },
+      },
+    });
+  });
+  const [mail] = await client.listMail();
+  assert.equal(mail.from, "first@example.com");
+  assert.deepEqual(mail.to, ["a@example.com", "b@example.com", "c@example.com"]);
+});
+
+test("trash and spam messages surface their real labels", async () => {
+  const client = clientWith(() =>
+    json({
+      id: "thread1",
+      messages: [
+        {
+          id: "trash1",
+          threadId: "thread1",
+          labelIds: ["TRASH"],
+          payload: { mimeType: "text/plain", body: { data: base64url("Deleted") } },
+        },
+        {
+          id: "spam1",
+          threadId: "thread1",
+          labelIds: ["SPAM"],
+          payload: { mimeType: "text/plain", body: { data: base64url("Junk") } },
+        },
+      ],
+    }),
+  );
+  const messages = await client.getThread("thread1");
+  assert.deepEqual(
+    messages.map(({ id, label }) => ({ id, label })),
+    [
+      { id: "trash1", label: "Trash" },
+      { id: "spam1", label: "Spam" },
+    ],
+  );
+});
+
+test("calendar discovery keeps fetched calendars when the provider loops or pages past the limit", async () => {
+  const looping = clientWith((request) => {
+    const url = new URL(request.url);
+    const page = url.searchParams.get("pageToken");
+    return json({
+      items: [
+        {
+          id: page ? "second@example.com" : "first@example.com",
+          summary: page ? "Second" : "First",
+          accessRole: "reader",
+        },
+      ],
+      nextPageToken: "loop",
+    });
+  });
+  assert.deepEqual(await looping.listCalendars(), {
+    calendars: [
+      { id: "first@example.com", name: "First", timeZone: "UTC", accessRole: "reader" },
+      { id: "second@example.com", name: "Second", timeZone: "UTC", accessRole: "reader" },
+    ],
+    truncated: true,
+  });
+  let pages = 0;
+  const paging = clientWith(() => {
+    pages++;
+    return json({
+      items: [{ id: `cal${pages}@example.com`, summary: `Cal ${pages}`, accessRole: "reader" }],
+      nextPageToken: `token-${pages}`,
+    });
+  });
+  const result = await paging.listCalendars();
+  assert.equal(pages, 11);
+  assert.equal(result.calendars.length, 11);
+  assert.equal(result.truncated, true);
+});
+
+test("listEvents reports truncation instead of silently dropping later pages", async () => {
+  const client = clientWith(() =>
+    json({
+      items: [eventResponse],
+      nextPageToken: "events-next",
+    }),
+  );
+  const page = await client.listEvents();
+  assert.equal(page.events.length, 1);
+  assert.equal(page.truncated, true);
+  assert.equal(page.nextPageToken, "events-next");
+  const single = clientWith(() => json({ items: [eventResponse] }));
+  const only = await single.listEvents();
+  assert.equal(only.truncated, false);
+  assert.equal(only.nextPageToken, undefined);
+});
+
+test("a reply without a valid Message-ID still threads by thread and subject", async () => {
+  let writes = 0;
+  const client = clientWith(async (request) => {
+    const url = new URL(request.url);
+    if (url.pathname.endsWith("/profile")) return json({ emailAddress: "me@example.com" });
+    if (url.pathname.endsWith("/messages/source1")) {
+      return json({
+        id: "source1",
+        threadId: "source-thread",
+        payload: {
+          headers: [
+            { name: "Message-ID", value: "not-a-message-id" },
+            { name: "Subject", value: "Visit form" },
+          ],
+        },
+      });
+    }
+    writes++;
+    const { raw, threadId } = await request.json();
+    const mime = Buffer.from(raw, "base64url").toString("utf8");
+    assert.equal(threadId, "source-thread");
+    assert.doesNotMatch(mime, /In-Reply-To:/);
+    assert.doesNotMatch(mime, /References:/);
+    return json({ id: "reply1", threadId });
+  });
+  await client.sendEmail(
+    { ...email(), subject: "Re: Visit form", replyToMessageId: "source1" },
+    [],
+  );
+  assert.equal(writes, 1);
 });

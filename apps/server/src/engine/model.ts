@@ -293,7 +293,7 @@ export async function executeModelTask(
     ),
     tool(
       "prepare_event",
-      "Prepare an event for a separate user review",
+      "Prepare an event for a separate user review. timeZone is required — an IANA name such as America/Chicago; ask the user when you do not know it, never guess.",
       eventDraftSchema,
       async (data) => {
         const key = createHash("sha256").update(JSON.stringify(data)).digest("hex");

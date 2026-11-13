@@ -130,7 +130,13 @@ test("another service instance sees persisted proposals", async () => {
   );
 });
 test("event validation preserves all-day semantics and rejects missing offsets", () => {
-  const base = { title: "Visit", start: "2026-10-23", end: "2026-10-24", allDay: true };
+  const base = {
+    title: "Visit",
+    start: "2026-10-23",
+    end: "2026-10-24",
+    allDay: true,
+    timeZone: "America/Chicago",
+  };
   assert.equal(eventDraftSchema.parse(base).start, "2026-10-23");
   assert.equal(eventDraftSchema.safeParse({ ...base, allDay: false }).success, false);
   assert.equal(eventDraftSchema.safeParse({ ...base, end: "2026-10-22" }).success, false);
@@ -170,6 +176,7 @@ test("review stores authoritative calendar details and binds execution to their 
       start: "2026-10-23",
       end: "2026-10-24",
       allDay: true,
+      timeZone: "America/Chicago",
     }),
   };
   let version = '"revision-1"';
