@@ -13,12 +13,16 @@
  *
  * What it does, in order: checks the API is down (when --api-health-url
  * is given), copies the whole postgres data directory to a timestamped
- * backup under the same data dir, opens the store, migrates every v1
- * credential record to v2 (verifying each new envelope decrypts to the
- * same plaintext before writing), and prints counts only — record ids
- * and reasons, never secret values or plaintext. Exit 0 when nothing
- * failed, 1 when any record failed. --dry-run reports what would
- * migrate and writes nothing (no backup either).
+ * backup under the same data dir — with a permission-tolerant copy
+ * that never sets a mode (G4.1: the Azure Files mount refuses chmod
+ * with EPERM, which killed the G4 live run's backup step; a failed
+ * backup removes its partial copy and aborts before the store is
+ * opened) — opens the store, migrates every v1 credential record to
+ * v2 (verifying each new envelope decrypts to the same plaintext
+ * before writing), and prints counts only — record ids and reasons,
+ * never secret values or plaintext. Exit 0 when nothing failed, 1
+ * when any record failed. --dry-run reports what would migrate and
+ * writes nothing (no backup either).
  *
  * Rollback: while the API is stopped, delete the postgres directory
  * and move the backup back in its place. The v1 read path stays intact
@@ -29,33 +33,49 @@
  * /app/dist/apps/server/src/scripts/migrate-vault-v2.js — it is
  * compiled by `pnpm build:server`):
  *
- *   1. Stop the API (scale to 0 replicas) and confirm no replica is
+ *   1. Stop the API by DEACTIVATING its current revision. Scale-to-0
+ *      is refused: `az containerapp update --max-replicas 0` fails
+ *      with "--max-replicas must be in the range [1,1000]" and an ARM
+ *      PATCH fails with ContainerAppInvalidScaleSpec (verified Nov 13
+ *      2026). Deactivate the revision, then confirm no replica is
  *      running: `az containerapp replica list --name openmuse-api
- *      --resource-group openmuse-rg` must be empty.
+ *      --resource-group openmuse-rg` must be empty. Scale settings
+ *      stay min 0 / max 10 — nothing to change there.
  *   2. Run this as a one-off Manual Container Apps job from the same
  *      API image, with the openmuse-data Azure Files volume mounted
  *      at /data and env DATA_DIR=/data/openmuse plus
  *      TOKEN_ENCRYPTION_KEY passed as a secret reference (never
- *      printed). Create the job in the portal or with
- *      `az containerapp job create --help` for the exact
- *      volume-mount flags, then start it. Dry-run first:
+ *      printed). A job already exists from the first attempt:
+ *      openmuse-migrate-vault-v2 (Manual trigger, same image, volume
+ *      + secret + AcrPull already configured) — reuse it with
+ *      `az containerapp job start`, updating its args first if
+ *      needed. If a fresh job is ever needed, note that
+ *      `az containerapp job create` has no volume-mount flag — the
+ *      existing job was created via ARM PUT. Dry-run first:
  *
  *      node /app/dist/apps/server/src/scripts/migrate-vault-v2.js \
  *        --data-dir /data/openmuse \
  *        --api-health-url https://openmuse-api.nicedesert-46502a1f.southcentralus.azurecontainerapps.io/api/health \
  *        --dry-run
  *
- *      then the same command without --dry-run.
- *   3. Confirm the job report (migrated count, zero failed), scale
- *      the API back, and check /api/health plus a Google token read
- *      (which decrypts the migrated v2 records with context).
+ *      then the same command without --dry-run. The Nov 13 dry-run
+ *      reported the live store's real contents: examined=1,
+ *      would-migrate 1, already-v2=0, empty=0, failed=0 — exactly
+ *      one credential record, local-user / google, v1. Expect that
+ *      shape on the retry's dry-run; anything else is worth pausing
+ *      over.
+ *   3. Confirm the job report (migrated count, zero failed),
+ *      REACTIVATE the revision, and check /api/health plus a Google
+ *      token read (which decrypts the migrated v2 records with
+ *      context).
  */
 import { randomBytes } from "node:crypto";
-import { cp, stat } from "node:fs/promises";
+import { rm, stat } from "node:fs/promises";
 import { join } from "node:path";
 import { isValidEncryptionKey } from "../../../../packages/integrations/src/vault.ts";
 import { createStore } from "../db.ts";
 import { migrateCredentials } from "../vault-migration.ts";
+import { copyTreeNoPerms } from "./copy-tree.ts";
 
 function fail(message: string): never {
   console.error(`migrate-vault-v2: ${message}`);
@@ -139,7 +159,19 @@ async function main(): Promise<number> {
   let backupDir: string | undefined;
   if (!dryRun) {
     backupDir = join(dataDir, backupName());
-    await cp(postgresDir, backupDir, { recursive: true });
+    try {
+      await copyTreeNoPerms(postgresDir, backupDir);
+    } catch (error) {
+      // A failed backup must leave nothing behind: remove the partial
+      // copy, then fail before the store is opened or any record is
+      // touched. (G4 left a partial backup dir on the live volume
+      // when fs.cp died on chmod — this must not happen again.)
+      await rm(backupDir, { recursive: true, force: true }).catch(() => undefined);
+      fail(
+        `backup failed (${error instanceof Error ? error.message : String(error)}); ` +
+          "no records were touched",
+      );
+    }
     console.log(`backup: ${postgresDir} -> ${backupDir}`);
   }
   const store = await createStore({ dataDir: postgresDir });
