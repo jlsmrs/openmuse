@@ -1,12 +1,18 @@
-/** Lines of page text for comparing two checks of a watched page. */
+/** Maximum characters kept per line: long enough for a full listing line,
+ * short enough that one runaway line cannot bloat the saved baseline. */
+export const PAGE_LINE_MAX_CHARS = 1000;
+
+/** Lines of page text for comparing two checks of a watched page. Repeats
+ * are kept: the same line three times is three lines, so a count change
+ * (three listings becoming two) is a visible diff instead of a blind spot. */
 export function pageLines(text: string, limit = 2000): string[] {
-  const lines = new Set<string>();
+  const lines: string[] = [];
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/\s+/g, " ").trim().slice(0, 300);
-    if (line) lines.add(line);
-    if (lines.size >= limit) break;
+    const line = raw.replace(/\s+/g, " ").trim().slice(0, PAGE_LINE_MAX_CHARS);
+    if (line) lines.push(line);
+    if (lines.length >= limit) break;
   }
-  return [...lines];
+  return lines;
 }
 
 export type PageDiff = { added: string[]; updated: string[]; removed: string[] };
@@ -30,23 +36,29 @@ const numberless = (line: string) =>
 
 /**
  * Pairs each current line with one unused previous line of the same key, so one remaining
- * line can never account for another that was removed.
+ * line can never account for another that was removed. Used lines are tracked
+ * by previous index, not by string: two identical previous lines are two
+ * separate lines, and pairing one must leave the other unmatched.
  */
 function pair(previous: string[], current: string[], key: (line: string) => string) {
-  const open = new Map<string, string[]>();
-  for (const line of previous) open.set(key(line), [...(open.get(key(line)) ?? []), line]);
-  const used = new Set<string>();
+  const open = new Map<string, number[]>();
+  previous.forEach((line, index) => {
+    const bucket = open.get(key(line)) ?? [];
+    bucket.push(index);
+    open.set(key(line), bucket);
+  });
+  const used = new Set<number>();
   const paired: string[] = [];
   const unpaired: string[] = [];
   for (const line of current) {
-    const match = open.get(key(line))?.shift();
-    if (match === undefined) unpaired.push(line);
+    const index = open.get(key(line))?.shift();
+    if (index === undefined) unpaired.push(line);
     else {
-      used.add(match);
+      used.add(index);
       paired.push(line);
     }
   }
-  return { paired, unpaired, left: previous.filter((line) => !used.has(line)) };
+  return { paired, unpaired, left: previous.filter((_, index) => !used.has(index)) };
 }
 
 export function diffPage(previous: string[], current: string[]): PageDiff {

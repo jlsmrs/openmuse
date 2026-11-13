@@ -37,6 +37,30 @@ test("validateDeskEntries rejects entries missing a required string field", () =
   assert.equal(validateDeskEntries([{ ...valid, title: 7 }]).ok, false);
 });
 
+// S-B6 item 6 (already fixed): the excerpt assumes entry.text is a string,
+// so the tool must return the desk error for a malformed index instead of
+// throwing on .slice — this pins the validation that landed after the audit.
+test("the tool returns the desk error for an entry with a non-string text", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-desk-"));
+  const previousDataDir = process.env.DATA_DIR;
+  process.env.DATA_DIR = dir;
+  t.after(async () => {
+    if (previousDataDir === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = previousDataDir;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await mkdir(join(dir, "knowledge-desk"), { recursive: true });
+  await writeFile(
+    join(dir, "knowledge-desk", "index.json"),
+    JSON.stringify([{ ...valid, text: 42 }]),
+  );
+  assert.ok(searchKnowledgeDeskTool.execute);
+  const result = (await searchKnowledgeDeskTool.execute({ query: "notary" })) as {
+    error?: string;
+  };
+  assert.match(result.error ?? "", /Knowledge Desk index is invalid.*entry 0.*"text"/);
+});
+
 test("validateDeskEntries rejects a non-numeric embedding", () => {
   assert.equal(validateDeskEntries([{ ...valid, embedding: [0.1, "x"] }]).ok, false);
   assert.equal(validateDeskEntries([{ ...valid, embedding: "vec" }]).ok, false);
