@@ -26,6 +26,29 @@ export interface Mail {
   label: string;
   attachments: string[];
 }
+/**
+ * Headers-only mail row: the list/search shape. It carries the snippet, never
+ * a body — full bodies come from getThread for a selected message instead.
+ * The sample path must return this same shape (S-B9 agrees on it).
+ */
+export interface MailMetadata {
+  id: string;
+  threadId: string;
+  from: string;
+  sender: string;
+  to: string[];
+  subject: string;
+  snippet: string;
+  date: string;
+  unread: boolean;
+  label: string;
+  attachments: string[];
+}
+/** Strip a full mail row to its headers-only shape (body becomes the snippet). */
+export function toMailMetadata(mail: Mail): MailMetadata {
+  const { body, ...rest } = mail;
+  return { ...rest, snippet: body };
+}
 export interface CalendarEvent {
   id: string;
   calendarId: string;
@@ -93,7 +116,11 @@ export const eventDraftSchema = z
     start: z.string().min(1),
     end: z.string().min(1),
     allDay: z.boolean().default(false),
-    timeZone: z.string().default("America/Los_Angeles"),
+    // Required: there is no user-configured time zone anywhere in the app,
+    // so silently defaulting to America/Los_Angeles put events in the wrong
+    // zone. Callers must supply the IANA name (the model is told to ask when
+    // it does not know it). Breaking change, flagged in the S-B7 review.
+    timeZone: z.string().min(1),
     location: visibleText().max(2000).default(""),
     description: visibleText().max(10000).default(""),
     attendees: z.array(z.email()).max(50).default([]),
@@ -138,13 +165,17 @@ export const proposalSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("calendar.delete"),
-    data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
+    data: z.object({
+      calendarId: z.string().min(1),
+      eventId: z.string().min(1),
+      title: z.string().min(1),
+    }),
   }),
 ]);
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
 export type ProposalInput = z.infer<typeof proposalSchema>;
-export interface ActionProposal {
+export type ActionProposal = {
   target?: CalendarEvent;
   targetVersion?: string;
   taskId?: string;
@@ -152,8 +183,6 @@ export interface ActionProposal {
   connectionId?: string;
   id: string;
   title: string;
-  kind: ProposalInput["kind"];
-  data: Record<string, unknown>;
   status:
     | "awaiting_review"
     | "executing"
@@ -168,7 +197,7 @@ export interface ActionProposal {
   expiresAt: string;
   result?: string;
   error?: string;
-}
+} & ProposalInput;
 export interface ActivityEntry {
   id: string;
   title: string;
