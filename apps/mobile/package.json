@@ -21,6 +21,8 @@
     "expo-document-picker": "~14.0.8",
     "expo-file-system": "~19.0.17",
     "expo-sharing": "~14.0.8",
+    "expo-speech": "~14.0.8",
+    "expo-speech-recognition": "~3.1.3",
     "expo-status-bar": "~3.0.0",
     "lucide-react-native": "^0.468.0",
     "markdown-it": "14.1.0",

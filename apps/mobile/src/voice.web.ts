@@ -203,3 +203,16 @@ export function stopSpeaking(env: SpeechEnv): void {
     // Nothing speaking; nothing to do.
   }
 }
+
+/**
+ * Native-only support probe, resolved from voice.native.ts on iOS and
+ * Android. This web stub always reports unavailable and is never
+ * called on web — chat.tsx only calls it on native, where Metro
+ * resolves "./voice" to voice.native.ts instead.
+ */
+export async function resolveNativeVoiceSupport(): Promise<{
+  dictation: boolean;
+  readback: boolean;
+}> {
+  return { dictation: false, readback: false };
+}

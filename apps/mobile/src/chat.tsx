@@ -56,6 +56,7 @@ import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
 import {
   type DictationHandle,
   defaultSpeechEnv,
+  resolveNativeVoiceSupport,
   type SpeechHandle,
   speakText,
   startDictation,
@@ -480,13 +481,27 @@ export function ChatScreen({
       setError(`Could not stop response: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  // Voice v1 is web-only: the browser's own speech recognition for input and
-  // the device voice for readback. The voice is the browser's default, not
-  // Charlie's persona voice, and native apps get no voice buttons.
-  const voice =
-    Platform.OS === "web"
-      ? voiceSupport(defaultSpeechEnv())
-      : { dictation: false, readback: false };
+  // Voice: the browser's own speech recognition for input and the
+  // device voice for readback on web; on-device dictation
+  // (expo-speech-recognition) and read-aloud (expo-speech) on native.
+  // Native support is resolved on mount because the native modules load
+  // asynchronously — and dictation is absent in Expo Go, where the
+  // recognition module cannot load, so the mic button stays hidden
+  // there instead of crashing. The voice is the device's default, not
+  // Charlie's persona voice — Azure is primary when configured (see
+  // voice-selection.ts) and local is the fallback.
+  const [nativeVoice, setNativeVoice] = useState({ dictation: false, readback: false });
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    let live = true;
+    void resolveNativeVoiceSupport().then((support) => {
+      if (live) setNativeVoice(support);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const voice = Platform.OS === "web" ? voiceSupport(defaultSpeechEnv()) : nativeVoice;
   function toggleDictation() {
     if (dictating) {
       dictationRef.current?.stop();
