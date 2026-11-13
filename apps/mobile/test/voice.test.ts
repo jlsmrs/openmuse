@@ -82,6 +82,31 @@ test("transcripts join every result alternative in order", () => {
   assert.equal(joinTranscript(event), "hello world");
 });
 
+test("dictation uses the device locale with en-US as fallback", () => {
+  const holder: { current: FakeRecognition | null } = { current: null };
+  class CapturingRecognition extends FakeRecognition {
+    constructor() {
+      super();
+      holder.current = this;
+    }
+  }
+  const handle = startDictation(
+    {
+      SpeechRecognition: CapturingRecognition as unknown as RecognitionConstructor,
+      language: "fr-FR",
+    },
+    { onTranscript: () => {}, onError: () => {}, onEnd: () => {} },
+  );
+  assert.ok(handle);
+  assert.equal(holder.current?.lang, "fr-FR");
+  const fallback = startDictation(
+    { SpeechRecognition: CapturingRecognition as unknown as RecognitionConstructor },
+    { onTranscript: () => {}, onError: () => {}, onEnd: () => {} },
+  );
+  assert.ok(fallback);
+  assert.equal(holder.current?.lang, "en-US");
+});
+
 test("dictation streams transcripts, ends cleanly, and stop suppresses onEnd", () => {
   const holder: { current: FakeRecognition | null } = { current: null };
   class CapturingRecognition extends FakeRecognition {

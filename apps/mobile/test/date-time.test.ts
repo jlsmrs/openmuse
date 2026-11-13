@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  calendarRange,
   isCompleteInstant,
   localDateTime,
+  plusDays,
   startOfZonedDay,
   zonedInstant,
 } from "../src/date-time.ts";
@@ -50,4 +52,29 @@ test("partial native date edits never normalize from Date.parse", () => {
     assert.equal(isCompleteInstant(value), false);
   assert.equal(isCompleteInstant("2026-09-15T17:30:00.000Z"), true);
   assert.equal(isCompleteInstant("2026-09-15T10:30:00-07:00"), true);
+});
+
+test("plusDays shifts a calendar date by whole days", () => {
+  assert.equal(plusDays("2026-11-13", 30), "2026-12-13");
+  assert.equal(plusDays("2026-11-13", -7), "2026-11-06");
+  assert.equal(plusDays("2026-12-31", 1), "2027-01-01");
+});
+
+test("the Next 30 days window is anchored at today, not the selected week", () => {
+  const zone = "America/Chicago";
+  const today = localDateTime(new Date().toISOString(), zone).date;
+  const range = calendarRange("2026-11-20", zone, true);
+  assert.equal(range.timeMin, startOfZonedDay(today, zone));
+  assert.equal(range.timeMax, startOfZonedDay(plusDays(today, 30), zone));
+  // A selected week date in the past or future must not move the window.
+  assert.deepEqual(
+    calendarRange("2026-01-05", zone, true),
+    calendarRange("2026-12-25", zone, true),
+  );
+});
+
+test("the single-day window stays on the selected day", () => {
+  const range = calendarRange("2026-11-20", "America/Chicago", false);
+  assert.equal(range.timeMin, startOfZonedDay("2026-11-20", "America/Chicago"));
+  assert.equal(range.timeMax, startOfZonedDay("2026-11-21", "America/Chicago"));
 });
