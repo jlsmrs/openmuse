@@ -14,7 +14,10 @@ const tsxUrl = import.meta.resolve("tsx");
 
 // A fresh process exercises config loading before the SDK creates its telemetry singleton.
 // Replace fetch before importing the runtime so no test can send production telemetry.
-const probe = `
+// Stubbing Math.random to 0 makes the SDK's 0.05 default sample every event, so the
+// default rate is observable deterministically instead of ~5% of the time.
+const probe = (stubRandomZero = false) => `
+${stubRandomZero ? "globalThis.Math.random = () => 0;" : ""}
 const requests = [];
 globalThis.fetch = async (url, options) => {
   requests.push({ url: String(url), headers: options.headers, body: JSON.parse(options.body) });
@@ -33,7 +36,10 @@ await new Promise(resolve => setImmediate(resolve));
 console.log(JSON.stringify(requests));
 `;
 
-async function captureRuntime(envOverrides: Record<string, string> = {}) {
+async function captureRuntime(
+  envOverrides: Record<string, string> = {},
+  options: { stubRandomZero?: boolean } = {},
+) {
   const directory = await mkdtemp(join(tmpdir(), "openmuse-telemetry-test-"));
   const env = { ...process.env };
   for (const key of [
@@ -47,7 +53,7 @@ async function captureRuntime(envOverrides: Record<string, string> = {}) {
   try {
     const { stdout } = await run(
       process.execPath,
-      ["--import", tsxUrl, "--input-type=module", "--eval", probe],
+      ["--import", tsxUrl, "--input-type=module", "--eval", probe(options.stubRandomZero)],
       {
         cwd: directory,
         env: { ...env, CPK_TELEMETRY_ID: "test-project-identity", ...envOverrides },
@@ -61,7 +67,10 @@ async function captureRuntime(envOverrides: Record<string, string> = {}) {
 }
 
 test("runtime telemetry carries OpenMuse attribution and the CLI-issued project identity", async () => {
-  const events = await captureRuntime();
+  // Explicit full sampling: with the config override dropped, an unset rate
+  // falls back to the SDK default (covered by the next test), so this test
+  // sets the rate explicitly to keep the attribution assertions deterministic.
+  const events = await captureRuntime({ COPILOTKIT_TELEMETRY_SAMPLE_RATE: "1" });
   assert.equal(events.length, 1);
   const event = events[0];
   assert.equal(event.url, "https://telemetry.copilotkit.ai/ingest");
@@ -70,6 +79,13 @@ test("runtime telemetry carries OpenMuse attribution and the CLI-issued project 
   assert.equal(event.body.global_properties.accessibility_title, "OpenMuse");
   assert.equal(event.body.global_properties.sampleRate, 1);
   assert.equal(JSON.stringify(event).includes("test-project-key-never-sent"), false);
+});
+
+test("an unset sample rate falls back to the SDK default", async () => {
+  const events = await captureRuntime({}, { stubRandomZero: true });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].body.event, "oss.runtime.instance_created");
+  assert.equal(events[0].body.global_properties.sampleRate, 0.05);
 });
 
 test("each SDK opt-out prevents telemetry with a configured project identity", async () => {
