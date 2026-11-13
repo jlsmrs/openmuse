@@ -810,8 +810,17 @@ export class AgentService {
     );
     if (task.actionId) {
       const action = await this.db.get<ActionProposal>(owner, "actions", task.actionId);
-      if (!action) throw new Error("The linked review could not be found");
-      if (action.status === "succeeded") {
+      if (!action) {
+        // The linked review is gone, so the task can never observe its
+        // outcome. Clear the link and let the task prepare the action again
+        // through the normal review gate instead of failing on every retry.
+        await context.event(
+          "status",
+          "Linked review missing",
+          "The linked review could not be found; it will be prepared again.",
+        );
+        task = await context.checkpoint({ actionId: null });
+      } else if (action.status === "succeeded") {
         await context.event("result", "Approved action completed", action.result);
         if (task.kind === "document")
           return this.finish(task, context, action.result ?? "Reply completed");
@@ -973,6 +982,36 @@ export class AgentService {
         { status: "paused" },
       );
   }
+  /**
+   * The document flow works from a PDF. Attachment references are either a
+   * stored file ID or a Gmail `messageId:attachmentId:filename` reference;
+   * the first PDF in order wins, and the caller reports which one it was.
+   */
+  private async findPdfAttachment(
+    owner: string,
+    mail: Mail,
+  ): Promise<{ ref: string; index: number } | null> {
+    for (let index = 0; index < mail.attachments.length; index++) {
+      const ref = mail.attachments[index];
+      if (ref.includes(":")) {
+        let filename = ref.split(":")[2] ?? "";
+        try {
+          filename = decodeURIComponent(filename);
+        } catch {
+          // Keep the raw segment; a malformed name simply fails the PDF check.
+        }
+        if (/\.pdf$/i.test(filename)) return { ref, index };
+      } else {
+        try {
+          const file = await this.files.get(owner, ref);
+          if (file.mimeType === "application/pdf") return { ref, index };
+        } catch (error) {
+          if (!(error instanceof AppError && error.status === 404)) throw error;
+        }
+      }
+    }
+    return null;
+  }
   private async document(
     owner: string,
     task: AgentTask,
@@ -983,8 +1022,9 @@ export class AgentService {
       const w = await this.workspace.snapshot(owner);
       const mail = w.mail.find((m) => m.id === task.input.messageId);
       if (!mail) throw new Error("Choose a current email with a PDF attachment to start this task");
-      const ref = mail.attachments[0];
-      if (!ref) throw new Error("This email has no PDF attachment");
+      const found = await this.findPdfAttachment(owner, mail);
+      if (!found) throw new Error("This email has no PDF attachment");
+      const { ref, index } = found;
       await ctx.guard();
       let file: Artifact;
       try {
@@ -993,13 +1033,26 @@ export class AgentService {
         if (!(error instanceof AppError && error.status === 404)) throw error;
         file = await this.workspace.importAttachment(owner, ref);
       }
+      // The resolved file must be a PDF even when the reference already
+      // pointed at a stored file, so a stale or mislabelled import cannot
+      // reach the fill step as a non-PDF.
+      if (file.mimeType !== "application/pdf")
+        throw new Error(
+          `Attachment ${index + 1} of ${mail.attachments.length} (${file.name}) is not a PDF`,
+        );
       source = { mail, fileId: file.id };
       task = await ctx.checkpoint({
         state: { ...task.state, source },
         evidence: [this.mailEvidence(mail)],
         plan: task.plan.map((s, i) => ({ ...s, status: i === 0 ? "succeeded" : "pending" })),
       });
-      await ctx.event("step", "Found the document", file.name);
+      await ctx.event(
+        "step",
+        "Found the document",
+        mail.attachments.length > 1
+          ? `Attachment ${index + 1} of ${mail.attachments.length}: ${file.name}`
+          : file.name,
+      );
     }
     const fields = z
       .record(z.string(), z.union([z.string(), z.boolean()]))
