@@ -242,3 +242,90 @@ test("a failed run record does not leave the task stuck in the worker", async ()
     await db.close();
   }
 });
+
+test("a transient database error in the lease heartbeat does not abort a healthy run", async () => {
+  const db = await createStore();
+  try {
+    await db.put("owner", "tasks", task());
+    const flaky = Object.create(db) as typeof db;
+    const realCompareAndSwap = db.compareAndSwap.bind(db);
+    let heartbeatErrors = 0;
+    flaky.compareAndSwap = (async (
+      owner: string,
+      kind: string,
+      id: string,
+      expected: Record<string, unknown>,
+      patch: Record<string, unknown>,
+    ) => {
+      // The heartbeat renewal is the only compare-and-swap whose patch is
+      // exactly { leaseUntil }.
+      const keys = Object.keys(patch);
+      if (
+        kind === "tasks" &&
+        keys.length === 1 &&
+        keys[0] === "leaseUntil" &&
+        heartbeatErrors < 3
+      ) {
+        heartbeatErrors++;
+        throw new Error("database unavailable");
+      }
+      return realCompareAndSwap(owner, kind, id, expected, patch);
+    }) as typeof db.compareAndSwap;
+    let aborted = false;
+    const worker = new TaskWorker(
+      flaky,
+      async (_owner, _value, ctx) => {
+        await new Promise((resolve) => setTimeout(resolve, 150));
+        aborted = ctx.signal.aborted;
+        return { status: "succeeded" };
+      },
+      { leaseMs: 30 },
+    );
+    await worker.tick();
+    assert.equal(heartbeatErrors, 3);
+    assert.equal(aborted, false);
+    assert.equal((await db.get<AgentTask>("owner", "tasks", "task1"))?.status, "succeeded");
+  } finally {
+    await db.close();
+  }
+});
+
+test("a confirmed lease loss in the lease heartbeat still aborts the run", async () => {
+  const db = await createStore();
+  try {
+    await db.put("owner", "tasks", task());
+    const flaky = Object.create(db) as typeof db;
+    flaky.compareAndSwap = (async (
+      owner: string,
+      kind: string,
+      id: string,
+      expected: Record<string, unknown>,
+      patch: Record<string, unknown>,
+    ) => {
+      // The heartbeat renewal is the only compare-and-swap whose patch is
+      // exactly { leaseUntil }: answer "no row" so the lease reads as lost.
+      const keys = Object.keys(patch);
+      if (kind === "tasks" && keys.length === 1 && keys[0] === "leaseUntil") return null;
+      return db.compareAndSwap(owner, kind, id, expected, patch);
+    }) as typeof db.compareAndSwap;
+    let aborted = false;
+    const worker = new TaskWorker(
+      flaky,
+      async (_owner, _value, ctx) => {
+        await new Promise<void>((resolve) => {
+          if (ctx.signal.aborted) return resolve();
+          ctx.signal.addEventListener("abort", () => resolve(), { once: true });
+          setTimeout(resolve, 2000);
+        });
+        aborted = ctx.signal.aborted;
+        return { status: "succeeded" };
+      },
+      { leaseMs: 30 },
+    );
+    await worker.tick();
+    assert.equal(aborted, true);
+    assert.equal((await db.get<AgentTask>("owner", "tasks", "task1"))?.status, "queued");
+  } finally {
+    await db.close();
+  }
+});
