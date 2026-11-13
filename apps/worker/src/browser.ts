@@ -59,10 +59,16 @@ export async function createBrowserManager(
     dataDir: string;
     maxSessions?: number;
     idleTimeoutMs?: number;
+    /**
+     * Total-download quota in bytes, enforced by evicting the oldest
+     * PDFs first after each publish (G2). Undefined means no total
+     * quota is enforced.
+     */
+    downloadQuotaBytes?: number;
   },
   createProxy = startEgressProxy,
 ) {
-  const { dataDir, maxSessions = 3, idleTimeoutMs = 30 * 60_000 } = options;
+  const { dataDir, maxSessions = 3, idleTimeoutMs = 30 * 60_000, downloadQuotaBytes } = options;
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const sessions = new Map<string, Session>();
   const running = new Map<string, Running>();
@@ -367,6 +373,8 @@ export async function createBrowserManager(
         const pending = downloads(id).then((saved) =>
           capturePdfDownload({
             directory: directory(id),
+            dataDir,
+            quotaBytes: downloadQuotaBytes,
             tempDirectory,
             tempFiles: captureFiles,
             download,
