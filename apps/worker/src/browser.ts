@@ -1,6 +1,6 @@
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { BrowserContext, Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import {
   capturePdfDownload,
   MAX_DOWNLOAD_BYTES,
@@ -24,8 +24,146 @@ type Running = {
   touched: number;
   pending: Set<Promise<void>>;
   downloadError?: boolean;
+  // Set in Obscura mode: the CDP connection behind the context. Closing the
+  // context alone does not drop it, so closeSession closes both.
+  browser?: Browser;
+  // True in Obscura mode. Drives the cookie workarounds below: Obscura
+  // 0.2.6 cannot send a request to a domain once a cookie exists for it
+  // (see the createSession restore note), so Obscura mode never restores
+  // cookies and clears the store before every navigation.
+  obscura: boolean;
 };
 const SESSION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export interface ObscuraConfig {
+  endpoint: string;
+  token: string;
+  // Host header sent on the CDP connection. Defaults to the endpoint's
+  // host and port; override it when the connection goes through an
+  // ingress whose port differs from the CDP server's port. Azure:
+  // connect to ws://obscura-browser (ingress port 80) but send Host
+  // obscura-browser:9222, because the ingress IP listens on 80/443
+  // only — connecting to :9222 times out, and deriving the Host from
+  // the port-80 endpoint would give :80, which Obscura refuses.
+  host: string;
+}
+
+const OBSCURA_CDP_URL_ENV = "OBSCURA_CDP_URL";
+const OBSCURA_CDP_TOKEN_ENV = "OBSCURA_CDP_TOKEN";
+const OBSCURA_CDP_HOST_ENV = "OBSCURA_CDP_HOST";
+
+// Obscura mode is env-gated and default-off: both variables must be set.
+// A half-configured state falls back to the local Chromium path exactly as
+// today. A malformed endpoint fails loudly at startup instead of silently
+// launching Chromium when the operator clearly intended Obscura mode.
+// The token is read from the environment only and is never logged.
+export function resolveObscuraConfig(env: NodeJS.ProcessEnv = process.env): ObscuraConfig | null {
+  const endpoint = env[OBSCURA_CDP_URL_ENV]?.trim();
+  const token = env[OBSCURA_CDP_TOKEN_ENV]?.trim();
+  if (!endpoint || !token) return null;
+  // Reject backslashes, control characters, and fragments before WHATWG
+  // parsing normalizes them: for ws:/wss: URLs a backslash is a path
+  // separator, so "ws://\\host/path" would acquire a phantom host, and a
+  // WebSocket endpoint must not carry a fragment at all. (Biome forbids
+  // control-character escapes in regexes, so the C0/DEL check below is a
+  // code-point test; \s already covers the whitespace controls.)
+  if (
+    /[\s\\#]/.test(endpoint) ||
+    [...endpoint].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)
+  )
+    throw new WorkerError(
+      "INVALID_OBSCURA_CONFIG",
+      "OBSCURA_CDP_URL must not contain whitespace, backslashes, control characters, or a fragment.",
+      500,
+    );
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new WorkerError(
+      "INVALID_OBSCURA_CONFIG",
+      "OBSCURA_CDP_URL must be a valid WebSocket URL.",
+      500,
+    );
+  }
+  if (
+    (url.protocol !== "ws:" && url.protocol !== "wss:") ||
+    // WHATWG parsing accepts "ws:///path" with a phantom host, so require
+    // an explicit authority section in the configured string itself.
+    // The scheme is case-insensitive: new URL() normalizes it, so "WS://"
+    // is a valid endpoint and must not be rejected here.
+    !/^wss?:\/\/[^/\s]+/i.test(endpoint) ||
+    !url.hostname ||
+    url.username ||
+    url.password
+  )
+    throw new WorkerError(
+      "INVALID_OBSCURA_CONFIG",
+      "OBSCURA_CDP_URL must be a ws:// or wss:// URL with a host and no username or password.",
+      500,
+    );
+  const hostOverride = env[OBSCURA_CDP_HOST_ENV]?.trim();
+  let host: string;
+  if (hostOverride) {
+    // An explicit Host override is a bare host:port value — no scheme,
+    // path, userinfo, or fragment. The port is required: the whole point
+    // of the override is a Host port that differs from the connection
+    // port, so a portless value cannot express it.
+    if (/[\s\\/#@]/.test(hostOverride) || hostOverride.includes("://"))
+      throw new WorkerError(
+        "INVALID_OBSCURA_CONFIG",
+        "OBSCURA_CDP_HOST must be a host:port value.",
+        500,
+      );
+    let hostUrl: URL;
+    try {
+      hostUrl = new URL(`ws://${hostOverride}`);
+    } catch {
+      throw new WorkerError(
+        "INVALID_OBSCURA_CONFIG",
+        "OBSCURA_CDP_HOST must be a host:port value.",
+        500,
+      );
+    }
+    if (
+      !hostUrl.hostname ||
+      !hostUrl.port ||
+      hostUrl.username ||
+      hostUrl.password ||
+      hostUrl.pathname !== "/"
+    )
+      throw new WorkerError(
+        "INVALID_OBSCURA_CONFIG",
+        "OBSCURA_CDP_HOST must be a host:port value.",
+        500,
+      );
+    host = `${hostUrl.hostname}:${hostUrl.port}`;
+  } else {
+    host = deriveObscuraHost(url.href);
+  }
+  return { endpoint: url.href, token, host };
+}
+
+// Obscura's CDP server refuses control requests unless the Host header's
+// port equals the server's own port (crates/obscura-cdp/src/server.rs,
+// host_matches_bind). A direct connection must therefore send
+// Host: <endpoint host>:<endpoint port> itself; the public gateway absorbs
+// this quirk, but the worker connects directly and must not rely on it.
+// An endpoint without an explicit port falls back to the scheme default
+// (ws: 80, wss: 443); in practice the URL always carries the Obscura port.
+// The endpoint is expected to have passed resolveObscuraConfig already;
+// the protocol check here keeps this exported helper self-defending.
+export function deriveObscuraHost(endpoint: string): string {
+  const url = new URL(endpoint);
+  if (url.protocol !== "ws:" && url.protocol !== "wss:")
+    throw new WorkerError(
+      "INVALID_OBSCURA_CONFIG",
+      "OBSCURA_CDP_URL must be a ws:// or wss:// URL.",
+      500,
+    );
+  const port = url.port || (url.protocol === "wss:" ? "443" : "80");
+  return `${url.hostname}:${port}`;
+}
 
 export function validateSessionId(id: unknown): string {
   if (typeof id !== "string" || !SESSION_ID.test(id))
@@ -46,7 +184,13 @@ export async function createBrowserManager(
   const sessions = new Map<string, Session>();
   const running = new Map<string, Running>();
   const queues = new Map<string, Promise<unknown>>();
-  const proxy = await createProxy();
+  const obscura = resolveObscuraConfig();
+  // In Obscura mode the remote browser egresses from Azure directly, so the
+  // worker's loopback egress proxy is unreachable from it and is not
+  // started. Remote-side SSRF enforcement is Obscura's own guard (see the
+  // note at the CDP attach site); the worker-side URL-validation layer
+  // still guards every navigation and subrequest on top of it.
+  const proxy = obscura ? { url: "", close: async () => {} } : await createProxy();
   for (const id of await readdir(dataDir)) {
     if (!SESSION_ID.test(id)) continue;
     try {
@@ -123,8 +267,27 @@ export async function createBrowserManager(
   }
   async function navigate(id: string, url: string) {
     const target = await validatePublicUrl(url);
-    const { page } = active(id);
+    const instance = active(id);
+    const { page } = instance;
     try {
+      // Obscura 0.2.6 cookie bug (verified by local probes, Nov 13, 2026):
+      // once a cookie exists for a domain, every later request to that
+      // domain hangs past Obscura's internal 30s deadline — whether the
+      // cookie came from context.addCookies or a server Set-Cookie header,
+      // and even when the cookie was set on an earlier navigation of the
+      // same context. Other domains keep working. Clearing the store
+      // before each navigation keeps repeat same-domain navigation working.
+      // The price is that cookie-based state cannot survive a navigation
+      // in Obscura mode at all: logins, OAuth redirects, and CSRF-token
+      // flows that depend on a cookie set by an earlier page do not work
+      // there. That is the engine's limitation, not the clearing — without
+      // clearing, the next request to the cookie's domain hangs instead
+      // of succeeding without the cookie. Clearing the whole store (rather
+      // than just the target domain) also protects redirect targets: a
+      // redirect to any domain with a stored cookie would hang the same
+      // way. The one case this cannot rescue is a cookie set
+      // mid-navigation followed by a same-domain redirect.
+      if (instance.obscura) await instance.context.clearCookies();
       await page.goto(target.url.href, { waitUntil: "domcontentloaded", timeout: 20_000 });
       // Chromium can follow redirects outside Playwright's initial route hook.
       // The proxy blocks those sockets, but its 403 is still an HTTP response:
@@ -157,6 +320,7 @@ export async function createBrowserManager(
         // unreachable browser must still release its context and session slot.
       }
       await instance.context.close().catch(() => {});
+      await instance.browser?.close().catch(() => {});
       await Promise.allSettled(instance.pending);
       running.delete(id);
     }
@@ -183,41 +347,103 @@ export async function createBrowserManager(
     const previous = sessions.get(id);
     const profileDir = join(directory(id), "profile");
     const tempDirectory = join("/tmp", `openmuse-downloads-${id}`);
-    await mkdir(profileDir, { recursive: true, mode: 0o700 });
-    await mkdir(tempDirectory, { recursive: true, mode: 0o700 });
+    // Obscura is zero-state: no profile directory is created. The session
+    // directory itself is still needed for session.json and storage.json.
+    // The temp directory is only used by the oversized-download monitor,
+    // which watches the browser's downloadsPath — in Obscura mode the
+    // remote browser downloads elsewhere, so nothing ever lands there.
+    await mkdir(obscura ? directory(id) : profileDir, { recursive: true, mode: 0o700 });
+    if (!obscura) await mkdir(tempDirectory, { recursive: true, mode: 0o700 });
     let context: BrowserContext;
+    let remoteBrowser: Browser | null = null;
     try {
       const { chromium } = await import("playwright");
-      context = await chromium.launchPersistentContext(profileDir, {
-        // Chromium does not need the worker API credential in its environment.
-        env: {
-          HOME: process.env.HOME ?? "/tmp",
-          PATH: process.env.PATH ?? "/usr/bin:/bin",
-          LANG: "C.UTF-8",
-        },
-        headless: true,
-        viewport: { width: 1280, height: 800 },
-        proxy: { server: proxy.url, bypass: "<-loopback>" },
-        serviceWorkers: "block",
-        acceptDownloads: true,
-        downloadsPath: tempDirectory,
-        timeout: 25_000,
-        args: [
-          "--disable-quic",
-          "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-          "--disable-extensions",
-          // /dev/shm is 64 MB by default on Render and Azure Container Apps
-          // with no size control; without this flag heavy pages crash tabs.
-          "--disable-dev-shm-usage",
-          "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
-        ],
-      });
+      if (obscura) {
+        // Direct CDP attach. No profile directory, no launch args, and no
+        // proxy option: the worker's egress proxy is unreachable from the
+        // remote browser, so traffic egresses from Azure directly. The
+        // remote-side SSRF enforcement is Obscura's own guard, verified
+        // in the 0.2.6 source: its fetch layer validates every URL
+        // (validate_url on the initial URL and on each redirect target,
+        // crates/obscura-net/src/wreq_client.rs) and resolves every
+        // request through SsrfGuardResolver, which refuses any hostname
+        // resolving to a forbidden address (loopback, RFC1918,
+        // link-local incl. 169.254.169.254, CGNAT, and IPv4-in-IPv6
+        // forms; crates/obscura-ssrf/src/lib.rs). The guard is active
+        // in Azure because the deployment sets neither
+        // --allow-private-network nor OBSCURA_ALLOW_PRIVATE_NETWORK.
+        // The worker-side URL validation (validatePublicUrl plus the
+        // route hook below) is a second layer on top of it, and the
+        // post-navigation check catches a redirect that lands on a
+        // blocked destination — it cannot prevent the contact, the
+        // SSRF guard is what prevents it.
+        const browser = await chromium.connectOverCDP(obscura.endpoint, {
+          headers: {
+            Host: obscura.host,
+            Authorization: `Bearer ${obscura.token}`,
+          },
+          timeout: 25_000,
+        });
+        remoteBrowser = browser;
+        // A shared CDP server must support isolated context creation: the
+        // fallback to the server's default context is not used, because
+        // every session would share that one context — a later session
+        // would close the earlier session's pages, share its cookies, and
+        // share its route hooks. Obscura 0.2.6 supports newContext, so a
+        // failure here is a hard BROWSER_UNAVAILABLE, not a shared
+        // context.
+        context = await browser.newContext({
+          viewport: { width: 1280, height: 800 },
+          serviceWorkers: "block",
+          acceptDownloads: true,
+          // No downloadsPath: it is a launchPersistentContext-only
+          // option, not a BrowserContext option. The remote browser
+          // keeps its default download location, so an oversized file
+          // is written in full to the remote container's disk before
+          // the worker-side stream cap (10 MiB in capturePdfDownload)
+          // stops the worker's own copy — the cap bounds what the
+          // worker writes, not what the remote browser writes, and
+          // the temp-directory oversized monitor cannot observe the
+          // remote file growing, so nothing cancels the transfer
+          // mid-download. The remote file is deleted after the
+          // transfer (download.delete), so the exposure is transient
+          // disk use on the Obscura container, not worker disk use.
+        });
+      } else {
+        context = await chromium.launchPersistentContext(profileDir, {
+          // Chromium does not need the worker API credential in its environment.
+          env: {
+            HOME: process.env.HOME ?? "/tmp",
+            PATH: process.env.PATH ?? "/usr/bin:/bin",
+            LANG: "C.UTF-8",
+          },
+          headless: true,
+          viewport: { width: 1280, height: 800 },
+          proxy: { server: proxy.url, bypass: "<-loopback>" },
+          serviceWorkers: "block",
+          acceptDownloads: true,
+          downloadsPath: tempDirectory,
+          timeout: 25_000,
+          args: [
+            "--disable-quic",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-extensions",
+            // /dev/shm is 64 MB by default on Render and Azure Container Apps
+            // with no size control; without this flag heavy pages crash tabs.
+            "--disable-dev-shm-usage",
+            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+          ],
+        });
+      }
     } catch {
+      await remoteBrowser?.close().catch(() => {});
       if (!previous) await rm(directory(id), { recursive: true, force: true });
       await rm(tempDirectory, { recursive: true, force: true });
       throw new WorkerError(
         "BROWSER_UNAVAILABLE",
-        "Chromium could not start. Rebuild the browser-worker image and check its resource limits.",
+        obscura
+          ? "The remote browser could not be reached. Check the Obscura endpoint and token configuration."
+          : "Chromium could not start. Rebuild the browser-worker image and check its resource limits.",
         503,
       );
     }
@@ -227,7 +453,12 @@ export async function createBrowserManager(
         const state = JSON.parse(await readFile(statePath, "utf8")) as Awaited<
           ReturnType<BrowserContext["storageState"]>
         >;
-        await context.addCookies(state.cookies);
+        // Cookie restore is skipped in Obscura mode: Obscura 0.2.6 hangs
+        // every later request to a domain once a cookie exists for it
+        // (verified by local probes, Nov 13, 2026), so restoring cookies
+        // would break the session's first navigation to its own domain.
+        // storage.json is still written on close for a future fixed engine.
+        if (!obscura) await context.addCookies(state.cookies);
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
       }
@@ -243,7 +474,14 @@ export async function createBrowserManager(
       for (const old of context.pages()) await old.close();
       const page = await context.newPage();
       page.setDefaultTimeout(10_000);
-      const instance: Running = { context, page, touched: Date.now(), pending: new Set() };
+      const instance: Running = {
+        context,
+        page,
+        touched: Date.now(),
+        pending: new Set(),
+        browser: remoteBrowser ?? undefined,
+        obscura: obscura !== null,
+      };
       running.set(id, instance);
       context.on("page", (popup) => {
         void popup.close();
@@ -281,6 +519,7 @@ export async function createBrowserManager(
       return await navigate(id, url);
     } catch (error) {
       await context.close().catch(() => {});
+      await remoteBrowser?.close().catch(() => {});
       await Promise.allSettled(running.get(id)?.pending ?? []);
       running.delete(id);
       if (previous) {
