@@ -386,7 +386,9 @@ export class ConversationAgent extends AbstractAgent {
                 subject,
                 date,
               })),
-              truncated: Boolean(page.nextPageToken),
+              // The flag comes from the client's page, not the list length:
+              // exactly 100 matches with no further page is not truncated.
+              truncated: page.truncated,
               ...(page.nextPageToken ? { nextPageToken: page.nextPageToken } : {}),
             };
           } catch (error) {
