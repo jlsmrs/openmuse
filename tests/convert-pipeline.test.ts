@@ -115,7 +115,7 @@ function buildGrayTiff(width: number, height: number, gray: number[]): Buffer {
 }
 
 // --- TAR builder ------------------------------------------------------------
-function tarEntry(name: string, content: Buffer): Buffer {
+function tarEntry(name: string, content: Buffer, typeflag = "0"): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0);
   header.write("0000644\0", 100);
@@ -123,7 +123,7 @@ function tarEntry(name: string, content: Buffer): Buffer {
   header.write("0000000\0", 116);
   header.write(content.length.toString(8).padStart(11, "0") + "\0", 124);
   header.write("00000000000\0", 136);
-  header[156] = "0".charCodeAt(0);
+  header[156] = typeflag.charCodeAt(0);
   header.write("ustar\0", 257);
   header.write("00", 263);
   let checksum = 0;
@@ -178,6 +178,22 @@ test("TIFFs declaring over 50 megapixels are refused before decoding", async () 
   assert.ok("error" in result);
   assert.match(result.error, /too large to view in chat/);
   assert.match(result.error, /50 megapixels/);
+});
+
+test("PPTX text runs are XML-entity decoded", async () => {
+  const zip = new JSZip();
+  zip.file(
+    "ppt/slides/slide1.xml",
+    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>Fish &amp; Chips &lt;tag&gt;</a:t><a:t>&quot;quoted&quot; &apos;apos&apos; &#65;&#x42;</a:t></p:sld>`,
+  );
+  const bytes = await zip.generateAsync({ type: "uint8array" });
+  const extracted = await extractDocumentText(
+    new Uint8Array(bytes),
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  );
+  assert.ok(extracted.ok);
+  assert.match(extracted.text, /Fish & Chips <tag>/);
+  assert.match(extracted.text, /"quoted" 'apos' AB/);
 });
 
 test("legacy .xls is extracted with the same xlsx reader", async () => {
@@ -258,6 +274,23 @@ test("ZIP members run through the same pipeline, including nested zips", async (
   const imageParts = archive.imageParts.filter((part) => part.type === "image");
   assert.equal(imageParts.length, 1);
   assert.equal(archive.truncated, false);
+});
+
+test("a pending GNU long name does not leak past a non-regular entry", async () => {
+  // GNU longname for a file that never arrives as a regular entry, then a
+  // directory, then a short-named regular file: the short file must keep
+  // its own name, not inherit the pending long name.
+  const tar = Buffer.concat([
+    tarEntry("././@LongLink", Buffer.from("very-long-name.txt\0"), "L"),
+    tarEntry("somedir", Buffer.alloc(0), "5"),
+    tarEntry("short.txt", Buffer.from("short file here")),
+    Buffer.alloc(1024),
+  ]);
+  const archive = await readArchive(new Uint8Array(tar), "bundle.tar", "application/x-tar");
+  assert.ok(archive.ok);
+  assert.match(archive.summary, /== short.txt ==/);
+  assert.match(archive.summary, /short file here/);
+  assert.doesNotMatch(archive.summary, /very-long-name\.txt/);
 });
 
 test("TAR and TAR.GZ members are read", async () => {

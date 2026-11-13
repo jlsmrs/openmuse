@@ -33,6 +33,85 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Overall receipt-poll deadline: the loop used to run 30 polls with a
+ * 60-second per-poll timeout, so its worst-case wall time was ~31 minutes
+ * with no way back. Five minutes bounds one tool call; the timeout result
+ * carries the operation URL so the analysis can be resumed. */
+export const RECEIPT_POLL_DEADLINE_MS = 300_000;
+
+export type ReceiptDocumentFields = {
+  merchant: unknown;
+  date: unknown;
+  total: unknown;
+  tax: unknown;
+  items: Array<{ description: unknown; amount: unknown }> | undefined;
+};
+
+/** Field mapping for one analysed receipt document. */
+export function receiptDocumentFields(doc: {
+  fields?: Record<
+    string,
+    {
+      value?: unknown;
+      content?: unknown;
+      valueArray?: Array<{ valueObject?: Record<string, { value?: unknown }> }>;
+    }
+  >;
+}): ReceiptDocumentFields {
+  const fields = doc?.fields ?? {};
+  const pick = (name: string) => fields[name]?.value ?? fields[name]?.content ?? undefined;
+  return {
+    merchant: pick("MerchantName"),
+    date: pick("TransactionDate"),
+    total: pick("Total"),
+    tax: pick("TotalTax"),
+    items: fields.Items?.valueArray?.map(
+      (it: { valueObject?: Record<string, { value?: unknown }> }) => ({
+        description: it.valueObject?.Description?.value,
+        amount: it.valueObject?.TotalPrice?.value,
+      }),
+    ),
+  };
+}
+
+export type ReceiptPollResult =
+  | { ok: true; documents: ReceiptDocumentFields[] }
+  | { ok: false; error: string; operationUrl?: string };
+
+/** Poll a Document Intelligence operation until it succeeds, fails, or the
+ * overall deadline passes. `deadlineMs` is injectable for tests; the tool
+ * always uses RECEIPT_POLL_DEADLINE_MS. */
+export async function pollReceiptOperation(
+  opUrl: string,
+  key: string,
+  deadlineMs: number = RECEIPT_POLL_DEADLINE_MS,
+): Promise<ReceiptPollResult> {
+  const deadline = Date.now() + deadlineMs;
+  const deadlineLabel =
+    deadlineMs >= 60_000 ? `${deadlineMs / 60_000} minutes` : `${deadlineMs / 1000} seconds`;
+  for (;;) {
+    if (Date.now() >= deadline)
+      return {
+        ok: false,
+        error: `Receipt analysis timed out after ${deadlineLabel}.`,
+        operationUrl: opUrl,
+      };
+    await sleep(2000);
+    const poll = await fetch(opUrl, {
+      headers: { "Ocp-Apim-Subscription-Key": key },
+      signal: AbortSignal.timeout(60_000),
+    });
+    if (!poll.ok) return { ok: false, error: `Receipt poll failed: HTTP ${poll.status}.` };
+    const payload = await poll.json();
+    const status = payload?.status;
+    if (status === "succeeded") {
+      const documents = payload?.analyzeResult?.documents ?? [];
+      return { ok: true, documents: documents.map(receiptDocumentFields) };
+    }
+    if (status === "failed") return { ok: false, error: "Receipt analysis failed." };
+  }
+}
+
 export function captureReceiptTool(files: Files, owner: string) {
   return defineTool({
     name: "capture_receipt",
@@ -64,38 +143,32 @@ export function captureReceiptTool(files: Files, owner: string) {
       if (!start.ok) return { error: `Receipt analysis failed to start: HTTP ${start.status}.` };
       const opUrl = start.headers.get("Operation-Location");
       if (!opUrl) return { error: "Receipt analysis started but returned no operation URL." };
-      for (let i = 0; i < 30; i++) {
-        await sleep(2000);
-        const poll = await fetch(opUrl, {
-          headers: { "Ocp-Apim-Subscription-Key": key },
-          signal: AbortSignal.timeout(60_000),
-        });
-        if (!poll.ok) return { error: `Receipt poll failed: HTTP ${poll.status}.` };
-        const payload = await poll.json();
-        const status = payload?.status;
-        if (status === "succeeded") {
-          const doc = payload?.analyzeResult?.documents?.[0];
-          const fields = doc?.fields ?? {};
-          const pick = (name: string) => fields[name]?.value ?? fields[name]?.content ?? undefined;
-          return {
-            draft: true,
-            file: file.name,
-            merchant: pick("MerchantName"),
-            date: pick("TransactionDate"),
-            total: pick("Total"),
-            tax: pick("TotalTax"),
-            items: fields.Items?.valueArray?.map(
-              (it: { valueObject?: Record<string, { value?: unknown }> }) => ({
-                description: it.valueObject?.Description?.value,
-                amount: it.valueObject?.TotalPrice?.value,
-              }),
-            ),
-            note: "DRAFT expense record — confirm before recording.",
-          };
-        }
-        if (status === "failed") return { error: "Receipt analysis failed." };
-      }
-      return { error: "Receipt analysis timed out." };
+      const polled = await pollReceiptOperation(opUrl, key);
+      if (!polled.ok)
+        return polled.operationUrl
+          ? { error: polled.error, operationUrl: polled.operationUrl }
+          : { error: polled.error };
+      // Every analysed document is returned, not just the first: a scan
+      // with several receipts is several draft expenses, and silently
+      // dropping all but the first would lose the rest. The top-level
+      // fields still describe the first document, as before.
+      const [first, ...rest] = polled.documents;
+      return {
+        draft: true,
+        file: file.name,
+        ...(first ?? {
+          merchant: undefined,
+          date: undefined,
+          total: undefined,
+          tax: undefined,
+          items: undefined,
+        }),
+        documents: polled.documents,
+        note:
+          rest.length > 0
+            ? `DRAFT expense record — ${polled.documents.length} documents found; confirm before recording.`
+            : "DRAFT expense record — confirm before recording.",
+      };
     },
   });
 }
