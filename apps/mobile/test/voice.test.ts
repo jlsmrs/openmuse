@@ -15,7 +15,7 @@ import {
   type UtteranceConstructor,
   type UtteranceInstance,
   voiceSupport,
-} from "../src/voice.ts";
+} from "../src/voice.web.ts";
 
 class FakeRecognition implements RecognitionInstance {
   continuous = false;
