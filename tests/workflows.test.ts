@@ -678,3 +678,100 @@ test("task detail reads only the rows the task names, not the whole workspace", 
   );
   assert.ok(rows < 20, `detail() read ${rows} rows to show one task`);
 });
+
+// A manual tick is a no-op while a timer tick is in flight, so poll for
+// settlement instead of assuming one tick runs the task.
+async function settleTask(id: string, timeoutMs = 5000) {
+  const started = Date.now();
+  for (;;) {
+    await server.agent.worker.tick();
+    const task = await server.agent.getTask(owner, id);
+    if (task.status !== "queued" && task.status !== "running") return task;
+    if (Date.now() - started > timeoutMs) return task;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+test("document job uses the first PDF attachment and names it when several exist", async () => {
+  const files = await server.files.list(owner);
+  const pdf = files.find((file) => file.name === "Field trip permission slip.pdf");
+  assert.ok(pdf);
+  const notes = await server.files.import(
+    owner,
+    "notes.txt",
+    new TextEncoder().encode("plain notes"),
+    "Test",
+  );
+  assert.notEqual(notes.mimeType, "application/pdf");
+  await db.put(owner, "mail", {
+    id: "mail-mixed-sb1",
+    threadId: "mixed-thread-sb1",
+    sender: "Lincoln Middle School",
+    from: "office@lincoln.example",
+    to: ["alex@example.com"],
+    subject: "Form and notes",
+    body: "The form and some notes are attached.",
+    date: "2020-01-01T10:00:00Z",
+    unread: true,
+    label: "School",
+    attachments: [notes.id, pdf.id],
+  });
+  const task = await server.agent.createTask(owner, {
+    title: "Return school form from mixed mail",
+    prompt: "Fill the school form and prepare a reply",
+    kind: "document",
+    input: { messageId: "mail-mixed-sb1" },
+  });
+  const waiting = await settleTask(task.id);
+  assert.equal(waiting.status, "waiting_input", waiting.error ?? waiting.question);
+  assert.ok(Array.isArray(waiting.state.missingFields));
+  const found = (await db.list(owner, "run-events")).find(
+    (event) => event.taskId === task.id && event.title === "Found the document",
+  );
+  assert.equal(found?.detail, `Attachment 2 of 2: ${pdf.name}`);
+});
+
+test("document job fails clearly when no attachment is a PDF", async () => {
+  const files = await server.files.list(owner);
+  const notes = files.find((file) => file.name === "notes.txt");
+  assert.ok(notes);
+  await db.put(owner, "mail", {
+    id: "mail-nopdf-sb1",
+    threadId: "nopdf-thread-sb1",
+    sender: "Lincoln Middle School",
+    from: "office@lincoln.example",
+    to: ["alex@example.com"],
+    subject: "Notes only",
+    body: "Only notes are attached.",
+    date: "2020-01-02T10:00:00Z",
+    unread: true,
+    label: "School",
+    attachments: [notes.id],
+  });
+  const task = await server.agent.createTask(owner, {
+    title: "Return notes-only mail",
+    prompt: "Fill the school form and prepare a reply",
+    kind: "document",
+    input: { messageId: "mail-nopdf-sb1" },
+  });
+  const failed = await settleTask(task.id);
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error ?? "", /no PDF attachment/);
+});
+
+test("a task whose linked review is missing clears the link and recovers", async () => {
+  const task = await server.agent.createTask(owner, {
+    title: "Orphaned review recovery",
+    prompt: "Do some planning",
+    kind: "plan",
+  });
+  await db.put(owner, "tasks", { ...task, actionId: "missing-review-sb1" });
+  const recovered = await settleTask(task.id);
+  assert.equal(recovered.actionId, null);
+  // With no model configured in this fixture, the recovered run waits for input.
+  assert.equal(recovered.status, "waiting_input", recovered.error ?? recovered.question);
+  const notice = (await db.list(owner, "run-events")).find(
+    (event) => event.taskId === task.id && event.title === "Linked review missing",
+  );
+  assert.ok(notice);
+});

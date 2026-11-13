@@ -69,7 +69,7 @@ test("a metadata list isolates an over-nested message the same way", async () =>
     if (id === "deep2") return json(fullMessage(id, [nestedPart(31)]));
     return json(fullMessage(id, [textPart(`Hello ${id}`)]));
   });
-  const mail = await client.listMailMetadata();
+  const { messages: mail } = await client.listMailMetadata();
   assert.deepEqual(
     mail.map((m) => m.id),
     ["ok1", "deep2"],

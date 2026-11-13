@@ -5,6 +5,7 @@ import { EventSchemas, EventType, type RunAgentInput } from "@ag-ui/core";
 import { lastValueFrom, toArray } from "rxjs";
 import { createApp } from "../apps/server/src/app.ts";
 import { ConversationAgent } from "../apps/server/src/engine/conversation.ts";
+import { encodeCalendarCursor } from "../apps/server/src/workspace.ts";
 import type { CalendarEvent } from "../packages/domain/src/index.ts";
 import { encryptSecret } from "../packages/integrations/src/vault.ts";
 import { browserFixture } from "./helpers/browser.ts";
@@ -308,7 +309,9 @@ test("chat reports Google permission, server and network failures without claimi
     assert.match(result.error, expected);
     assert.equal("events" in result, false);
   }
-  assert.equal(reads, 3);
+  // The 503 is retried twice more under the bounded GET backoff (M-B7);
+  // the 403 and the network throw are not retried.
+  assert.equal(reads, 5);
   assert.ok(requests[1].body.includes("Calendar scope denied"));
   assert.ok(requests[3].body.includes("Calendar unavailable"));
   assert.equal((await f.db.list("local-user", "tasks")).length, 0);
@@ -359,6 +362,7 @@ test("live chat validates before dispatch and never substitutes cached or anothe
     calendarId: "primary",
     ...range,
     events: [],
+    nextPageToken: encodeCalendarCursor({ googleToken: "next-page", offset: 0 }),
     truncated: true,
   });
   assert.equal(reads, 2);
@@ -444,4 +448,61 @@ test("all-day sample overlap follows local dates past the last RFC3339 year", as
     timeZone: "Pacific/Kiritimati",
   });
   assert.equal((await read(f.conversation)).events[0]?.id, visit.id);
+});
+
+test("chat pages calendar events past the first 20 with the returned cursor", async (t) => {
+  // Page 1: 25 events plus a provider token; the first tool page is the
+  // newest 20 with a cursor back into the same provider page. Page 2 is
+  // the remaining 5 of that page plus a cursor to the provider's next page.
+  // Page 3 is the provider's next page. All three cursors are deterministic.
+  const firstCursor = encodeCalendarCursor({ offset: 20 });
+  const secondCursor = encodeCalendarCursor({ googleToken: "google-page-2", offset: 0 });
+  await modelFixture(t, (index) =>
+    index === 0
+      ? { name: "read_calendar", arguments: range }
+      : index === 2
+        ? { name: "read_calendar", arguments: { ...range, pageToken: firstCursor } }
+        : index === 4
+          ? { name: "read_calendar", arguments: { ...range, pageToken: secondCursor } }
+          : undefined,
+  );
+  const eventItem = (n: number) => ({
+    id: `paged-${String(n).padStart(2, "0")}`,
+    summary: `Paged event ${n}`,
+    start: { dateTime: "2026-10-10T13:00:00-07:00", timeZone: "America/Los_Angeles" },
+    end: { dateTime: "2026-10-10T14:00:00-07:00" },
+  });
+  const f = await fixture(t, (request) => {
+    const url = new URL(request.url);
+    const token = url.searchParams.get("pageToken");
+    if (token === "google-page-2")
+      return Response.json({
+        timeZone: "America/Los_Angeles",
+        items: [26, 27, 28, 29, 30].map(eventItem),
+      });
+    assert.equal(token, null);
+    return Response.json({
+      timeZone: "America/Los_Angeles",
+      nextPageToken: "google-page-2",
+      items: Array.from({ length: 25 }, (_, i) => eventItem(i + 1)),
+    });
+  });
+  const first = await read(f.conversation);
+  assert.equal(first.events.length, 20);
+  assert.equal(first.events[0].id, "paged-01");
+  assert.equal(first.events.at(-1)?.id, "paged-20");
+  assert.equal(first.nextPageToken, firstCursor);
+  assert.equal(first.truncated, true);
+  const second = await read(f.conversation);
+  assert.equal(second.events.length, 5);
+  assert.equal(second.events[0].id, "paged-21");
+  assert.equal(second.events.at(-1)?.id, "paged-25");
+  assert.equal(second.nextPageToken, secondCursor);
+  assert.equal(second.truncated, true);
+  const third = await read(f.conversation);
+  assert.equal(third.events.length, 5);
+  assert.equal(third.events[0].id, "paged-26");
+  assert.equal(third.events.at(-1)?.id, "paged-30");
+  assert.equal(third.nextPageToken, undefined);
+  assert.equal(third.truncated, false);
 });

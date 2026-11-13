@@ -96,7 +96,7 @@ test("a metadata list isolates an oversized remote text part the same way", asyn
       );
     return json(metadataMessage(id));
   });
-  const mail = await client.listMailMetadata();
+  const { messages: mail } = await client.listMailMetadata();
   assert.deepEqual(
     mail.map((m) => m.id),
     ["ok1", "big3"],

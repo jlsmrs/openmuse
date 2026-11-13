@@ -120,3 +120,34 @@ test("a write is never retried on quota", async () => {
   );
   assert.equal(sendCalls, 1);
 });
+
+test("mail metadata pages past the first 100 with the provider token", async () => {
+  const firstIds = Array.from({ length: 100 }, (_, i) => `page1-${i + 1}`);
+  const secondIds = ["page2-1", "page2-2"];
+  const listRequests: string[] = [];
+  const client = clientWith(async (request) => {
+    if (!isMessageFetch(request)) {
+      listRequests.push(request.url);
+      const token = new URL(request.url).searchParams.get("pageToken");
+      return token === "token-2"
+        ? json({ messages: secondIds.map((id) => ({ id })) })
+        : json({ messages: firstIds.map((id) => ({ id })), nextPageToken: "token-2" });
+    }
+    return json(message(new URL(request.url).pathname.split("/").pop() ?? ""));
+  });
+  const first = await client.listMailMetadata();
+  assert.equal(first.messages.length, 100);
+  assert.equal(first.messages[0].id, "page1-1");
+  assert.equal(first.nextPageToken, "token-2");
+  const second = await client.listMailMetadata("in:inbox", first.nextPageToken);
+  assert.deepEqual(
+    second.messages.map((m) => m.id),
+    secondIds,
+  );
+  assert.equal(second.nextPageToken, undefined);
+  assert.equal(listRequests.length, 2);
+  assert.equal(new URL(listRequests[1]).searchParams.get("pageToken"), "token-2");
+  // listMail keeps its plain-array shape: only the metadata path pages.
+  const plain = await client.listMail();
+  assert.equal(plain.length, 100);
+});
