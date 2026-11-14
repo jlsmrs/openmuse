@@ -69,7 +69,15 @@ used by the automated tests, which generate their own certificates.
 - Worker with a cert/key pair that does not match: startup fails with
   "must be a matching certificate/key pair in PEM format."
 - API with an `https://` worker URL and no `WORKER_TLS_CA`: the API
-  refuses to boot with a clear error.
+  boots and uses default system-CA trust — that is the live Azure shape,
+  where the platform terminates TLS in front of the worker. On Render,
+  where the worker's certificate comes from the private CA, a forgotten
+  `WORKER_TLS_CA` means every worker call fails loudly at the TLS
+  handshake (the private CA is not in the system roots): the worker
+  reports `down` in `/api/health`, and browser calls fail with the usual
+  "Browser worker is unavailable" 503. Verification is never disabled —
+  there is no insecure fallback anywhere in this path, and the API can
+  never connect to the private-CA worker unverified.
 - API with the wrong CA: the TLS handshake fails, the worker reports
   `down` in `/api/health`, and browser calls fail with the usual
   "Browser worker is unavailable" 503. Verification is never disabled —

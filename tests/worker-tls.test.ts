@@ -157,9 +157,13 @@ test("workerFetchInit returns a cached dispatcher for https with a CA", () => {
   );
 });
 
-test("workerFetchInit throws for https without a CA", () => {
-  assert.throws(() => workerFetchInit("https://openmuse-browser:8790", undefined), /WORKER_TLS_CA/);
-  assert.throws(() => workerFetchInit("https://openmuse-browser:8790", "   "), /WORKER_TLS_CA/);
+test("workerFetchInit returns default trust (no dispatcher) for https without a CA", () => {
+  // G3.1: https without a CA is the live Azure shape (platform TLS,
+  // verified against the system roots) — it must not throw and must not
+  // get a dispatcher. The old G3 fail-fast threw here and crashed the API
+  // at startup on Azure (revision 0000058, Nov 13).
+  assert.deepEqual(workerFetchInit("https://openmuse-browser:8790", undefined), {});
+  assert.deepEqual(workerFetchInit("https://openmuse-browser:8790", "   "), {});
 });
 
 test("BrowserService reaches a TLS worker with the right CA, not with the wrong one", async (t) => {
@@ -187,8 +191,13 @@ test("BrowserService reaches a TLS worker with the right CA, not with the wrong 
   const wrongService = await makeService(t, `https://127.0.0.1:${port}`, wrong.ca);
   assert.equal(await wrongService.reachable(), false);
 
+  // G3.1: no CA means default system-CA trust, so the handshake against
+  // this test-CA worker fails and reachable() reports false — it does not
+  // throw. (On live Azure the platform certificate IS system-trusted, so
+  // the same shape reaches the worker; the crash this test guards against
+  // is the startup throw in revision 0000058.)
   const noCaService = await makeService(t, `https://127.0.0.1:${port}`, undefined);
-  assert.throws(() => noCaService.reachable(), /WORKER_TLS_CA/);
+  assert.equal(await noCaService.reachable(), false);
 });
 
 test("BrowserService reaches a plain-http worker with no CA (Azure behavior preserved)", async (t) => {
@@ -197,7 +206,7 @@ test("BrowserService reaches a plain-http worker with no CA (Azure behavior pres
   assert.equal(await service.reachable(), true);
 });
 
-test("readConfig refuses an https worker URL without a CA", (t) => {
+test("readConfig boots with an https worker URL and no CA (Azure shape)", (t) => {
   const saved = { ...process.env };
   t.after(() => {
     for (const key of Object.keys(process.env)) delete process.env[key];
@@ -209,7 +218,10 @@ test("readConfig refuses an https worker URL without a CA", (t) => {
   process.env.CPK_INTELLIGENCE_API_KEY = "test-project-key-never-sent";
   process.env.BROWSER_WORKER_URL = "https://openmuse-browser:8790";
   delete process.env.WORKER_TLS_CA;
-  assert.throws(() => readConfig(), /WORKER_TLS_CA/);
+  // G3.1: the old G3 fail-fast threw here and crashed the API at startup
+  // on Azure (revision 0000058). An https URL with no CA boots, with
+  // workerTlsCa undefined (default system-CA trust).
+  assert.equal(readConfig().workerTlsCa, undefined);
   process.env.WORKER_TLS_CA = "-----BEGIN CERTIFICATE-----\ntest-ca\n-----END CERTIFICATE-----";
   assert.equal(
     readConfig().workerTlsCa,

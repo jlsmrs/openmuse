@@ -73,8 +73,11 @@ export interface Config {
   workerUrl?: string;
   workerToken?: string;
   /**
-   * PEM of the private CA that signed the worker certificate (G3).
-   * Required when workerUrl is https; unused for plain-http workers.
+   * PEM of the private CA that signed the worker certificate (G3, Render
+   * only). Unused for plain-http workers, and unused for https workers
+   * whose TLS is terminated by the platform (live Azure): with no CA set,
+   * the API trusts the system roots, which is what verifies Azure's
+   * platform certificate.
    */
   workerTlsCa?: string;
   taskWorkerEnabled?: boolean;
@@ -213,13 +216,12 @@ export function readConfig(): Config {
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
   };
-  // G3: an https worker URL without the private CA can never verify, so
-  // fail fast at startup instead of failing every worker call at runtime.
-  if (config.workerUrl?.startsWith("https://") && !config.workerTlsCa)
-    throw new Error(
-      "BROWSER_WORKER_URL is https but WORKER_TLS_CA is not set. Set WORKER_TLS_CA to the PEM " +
-        "of the private CA that signed the worker certificate (see docs/RENDER-WORKER-TLS.md).",
-    );
+  // G3.1: no startup throw for a missing WORKER_TLS_CA. An https worker
+  // URL without a CA is the live Azure shape (platform TLS, verified
+  // against the system roots) — the G3 fail-fast that threw here crashed
+  // the API at startup on Azure (revision 0000058, Nov 13). A Render
+  // deploy that forgets the CA boots, then fails loudly at the TLS
+  // handshake on every worker call instead.
   if (
     mode === "live" &&
     (!config.accessKey ||
