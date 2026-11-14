@@ -64,8 +64,9 @@ services:
         value: https://openmuse-browser:8790
       # Private CA that signed the worker certificate (G3): paste the full
       # ca.crt PEM here in the Render dashboard (sync: false — never put
-      # the value in this file). The API refuses an https worker URL
-      # without it, and verification is never disabled.
+      # the value in this file). Without it, the API trusts the system
+      # roots instead, so a Render worker's private-CA certificate fails
+      # the handshake on every call — verification is never disabled.
       - key: WORKER_TLS_CA
         sync: false
       - key: WORKER_TOKEN
