@@ -43,7 +43,9 @@ export default function DateTimeEditor({
     try {
       onChange(zonedInstant(nextDate, nextTime, timeZone));
     } catch (e) {
-      onChange(`${nextDate} ${nextTime}`);
+      // A time that does not exist (a DST gap) must not propagate a malformed
+      // date-plus-time string into event state: the parent keeps its prior
+      // instant, and the error tells the user to pick another time.
       setError(e instanceof Error ? e.message : String(e));
     }
   }

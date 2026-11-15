@@ -74,9 +74,9 @@ test("a metadata list isolates an over-nested message the same way", async () =>
     mail.map((m) => m.id),
     ["ok1", "deep2"],
   );
-  assert.equal(mail[0].body, "Hello ok1");
+  assert.equal(mail[0].snippet, "Hello ok1");
   assert.equal(mail[1].subject, "Subject deep2");
-  assert.match(mail[1].body, /nested too deeply/);
+  assert.match(mail[1].snippet, /nested too deeply/);
 });
 
 test("a message nested exactly to the depth limit still maps normally", async () => {

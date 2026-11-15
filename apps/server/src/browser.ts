@@ -7,6 +7,7 @@ import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 import { type Files, MAX_FILE_BYTES } from "./files.ts";
+import { workerFetchInit } from "./worker-fetch.ts";
 
 const sessionSchema = z.object({
   id: z.string(),
@@ -129,6 +130,7 @@ export class BrowserService {
     if (this.health && now - this.health.checkedAt < 15_000) return this.health.reachable;
     const reachable = fetch(`${this.config.workerUrl}/health`, {
       signal: AbortSignal.timeout(2000),
+      ...workerFetchInit(this.config.workerUrl, this.config.workerTlsCa),
     }).then(
       (response) => response.ok,
       () => false,
@@ -161,6 +163,7 @@ export class BrowserService {
         signal: signal
           ? AbortSignal.any([signal, AbortSignal.timeout(45000)])
           : AbortSignal.timeout(45000),
+        ...workerFetchInit(this.config.workerUrl, this.config.workerTlsCa),
       });
     } catch {
       signal?.throwIfAborted();
@@ -363,6 +366,9 @@ export class BrowserService {
         download.name,
         await readCappedBody(response, MAX_FILE_BYTES),
         `Browser · ${id}`,
+        undefined,
+        undefined,
+        download.mimeType,
       );
       await this.db.put(owner, "browser-downloads", { id: download.id, fileId: file.id });
       saved.push(file);

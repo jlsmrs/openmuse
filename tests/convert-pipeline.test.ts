@@ -115,7 +115,7 @@ function buildGrayTiff(width: number, height: number, gray: number[]): Buffer {
 }
 
 // --- TAR builder ------------------------------------------------------------
-function tarEntry(name: string, content: Buffer): Buffer {
+function tarEntry(name: string, content: Buffer, typeflag = "0"): Buffer {
   const header = Buffer.alloc(512);
   header.write(name, 0);
   header.write("0000644\0", 100);
@@ -123,7 +123,7 @@ function tarEntry(name: string, content: Buffer): Buffer {
   header.write("0000000\0", 116);
   header.write(content.length.toString(8).padStart(11, "0") + "\0", 124);
   header.write("00000000000\0", 136);
-  header[156] = "0".charCodeAt(0);
+  header[156] = typeflag.charCodeAt(0);
   header.write("ustar\0", 257);
   header.write("00", 263);
   let checksum = 0;
@@ -180,6 +180,22 @@ test("TIFFs declaring over 50 megapixels are refused before decoding", async () 
   assert.match(result.error, /50 megapixels/);
 });
 
+test("PPTX text runs are XML-entity decoded", async () => {
+  const zip = new JSZip();
+  zip.file(
+    "ppt/slides/slide1.xml",
+    `<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><a:t>Fish &amp; Chips &lt;tag&gt;</a:t><a:t>&quot;quoted&quot; &apos;apos&apos; &#65;&#x42;</a:t></p:sld>`,
+  );
+  const bytes = await zip.generateAsync({ type: "uint8array" });
+  const extracted = await extractDocumentText(
+    new Uint8Array(bytes),
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+  );
+  assert.ok(extracted.ok);
+  assert.match(extracted.text, /Fish & Chips <tag>/);
+  assert.match(extracted.text, /"quoted" 'apos' AB/);
+});
+
 test("legacy .xls is extracted with the same xlsx reader", async () => {
   const extracted = await extractDocumentText(
     new Uint8Array(fixture("content-test.xls")),
@@ -226,6 +242,53 @@ test("PDF full text is extracted in-process", async () => {
   assert.ok(!broken.ok);
 });
 
+test("PDF fragments on one line are separated instead of running together", async () => {
+  // Two adjacent fragments on the same line are separate text items with no
+  // EOL: without the separator they would read "HelloWorld". (Same font and
+  // size would be merged into one item by pdf.js, so the second fragment
+  // uses a different font — the way real-world PDFs emit per-word runs.)
+  const doc = await PDFDocument.create();
+  const font = await doc.embedFont(StandardFonts.Helvetica);
+  const font2 = await doc.embedFont(StandardFonts.TimesRoman);
+  const page = doc.addPage();
+  page.drawText("Hello", { x: 50, y: 700, font, size: 24 });
+  // "Hello" in Helvetica at 24pt is ~55pt wide: place "World" right after it.
+  page.drawText("World", { x: 105, y: 700, font: font2, size: 24 });
+  const bytes = await doc.save();
+  const extracted = await extractPdfText(new Uint8Array(bytes));
+  assert.ok(extracted.ok);
+  assert.match(extracted.text, /Hello World/);
+  assert.doesNotMatch(extracted.text, /HelloWorld/);
+});
+
+test("a GIF is disclosed as first-frame-only", async () => {
+  // Minimal 1x1 GIF.
+  const gif = Buffer.from("R0lGODlhAQABAIAAAP///wAAACH5BAEAAAAALAAAAAABAAEAAAICRAEAOw==", "base64");
+  const result = await visionParts("anim.gif", "image/gif", new Uint8Array(gif));
+  assert.ok(!("error" in result));
+  const text = result.parts[0];
+  assert.equal(text.type, "text");
+  if (text.type === "text") assert.match(text.content, /Only the first frame/);
+});
+
+test("a plain single-file .gz is read as a one-member archive", async () => {
+  assert.equal(isArchiveMime("application/gzip", "notes.txt.gz"), true);
+  const gzipped = gzipSync(Buffer.from("gzipped note here"));
+  const archive = await readArchive(new Uint8Array(gzipped), "notes.txt.gz", "application/gzip");
+  assert.ok(archive.ok);
+  assert.match(archive.summary, /== notes\.txt ==/);
+  assert.match(archive.summary, /gzipped note here/);
+  // A .tar.gz is still read as a tar archive, not a single file.
+  assert.equal(isArchiveMime("application/gzip", "bundle.tar.gz"), true);
+  const notArchive = await readArchive(
+    new Uint8Array(gzipSync(Buffer.from("not a tar"))),
+    "plain.txt.gz",
+    "application/gzip",
+  );
+  assert.ok(notArchive.ok);
+  assert.match(notArchive.summary, /not a tar/);
+});
+
 test("PDF text extraction accepts a Node Buffer, not just a plain Uint8Array", async () => {
   // Regression: production file bytes arrive as Buffers (fs.readFile),
   // and pdfjs-dist 6 rejects Buffer input. Passing a Buffer here must
@@ -258,6 +321,23 @@ test("ZIP members run through the same pipeline, including nested zips", async (
   const imageParts = archive.imageParts.filter((part) => part.type === "image");
   assert.equal(imageParts.length, 1);
   assert.equal(archive.truncated, false);
+});
+
+test("a pending GNU long name does not leak past a non-regular entry", async () => {
+  // GNU longname for a file that never arrives as a regular entry, then a
+  // directory, then a short-named regular file: the short file must keep
+  // its own name, not inherit the pending long name.
+  const tar = Buffer.concat([
+    tarEntry("././@LongLink", Buffer.from("very-long-name.txt\0"), "L"),
+    tarEntry("somedir", Buffer.alloc(0), "5"),
+    tarEntry("short.txt", Buffer.from("short file here")),
+    Buffer.alloc(1024),
+  ]);
+  const archive = await readArchive(new Uint8Array(tar), "bundle.tar", "application/x-tar");
+  assert.ok(archive.ok);
+  assert.match(archive.summary, /== short.txt ==/);
+  assert.match(archive.summary, /short file here/);
+  assert.doesNotMatch(archive.summary, /very-long-name\.txt/);
 });
 
 test("TAR and TAR.GZ members are read", async () => {
@@ -354,6 +434,7 @@ test("readability notes reflect the pipeline", () => {
   assert.equal(isArchiveMime("application/zip", "a.zip"), true);
   assert.equal(isArchiveMime("application/x-tar", "a.tar"), true);
   assert.equal(isArchiveMime("application/gzip", "a.tgz"), true);
-  assert.equal(isArchiveMime("application/gzip", "a.gz"), false);
+  // S-B6 item 4: a plain .gz is now a one-member archive, not a refusal.
+  assert.equal(isArchiveMime("application/gzip", "a.gz"), true);
   assert.equal(isArchiveMime("image/png", "a.png"), false);
 });

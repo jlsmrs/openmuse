@@ -19,10 +19,32 @@ import { Button, Card, colors, ErrorNotice, Field, LinkRow, Sheet, s } from "./u
 import { useWorkspace } from "./workspace";
 
 export function ComputerEntry() {
-  const { workspace, open } = useWorkspace();
-  const available = workspace.connections.some(
-    (c) => c.id === "browser" && c.status === "connected",
-  );
+  const { workspace, api, open } = useWorkspace();
+  // Availability comes from the Linux desktop state, not the browser
+  // connection: the worker can be connected while the computer itself is
+  // stopped, and the header must say so. Refreshed on mount and when the app
+  // returns to the foreground; a failed read keeps the last known state.
+  const [snapshot, setSnapshot] = useState<ComputerSnapshot>();
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const next = await api.request<ComputerSnapshot>("/api/computer");
+        if (alive) setSnapshot(next);
+      } catch {
+        // Keep the last known state; the entry still opens the computer tab.
+      }
+    };
+    void load();
+    const subscription = AppState.addEventListener("change", (state) => {
+      if (state === "active") void load();
+    });
+    return () => {
+      alive = false;
+      subscription.remove();
+    };
+  }, [api]);
+  const available = snapshot?.status === "running";
   const active = workspace.browsers.filter((b) => b.status === "active").length;
   const status = computerStatus(available, active);
   return (

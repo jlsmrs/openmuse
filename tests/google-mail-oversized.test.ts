@@ -102,7 +102,7 @@ test("a metadata list isolates an oversized remote text part the same way", asyn
     ["ok1", "big3"],
   );
   assert.equal(mail[1].subject, "Subject big3");
-  assert.match(mail[1].body, /exceeds the 1 MiB limit/);
+  assert.match(mail[1].snippet, /exceeds the 1 MiB limit/);
 });
 
 test("a non-oversized message failure still fails the whole list", async () => {

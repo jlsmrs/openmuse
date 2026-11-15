@@ -45,10 +45,6 @@ if (envPath) {
           : "Unset them to use the .env values."),
     );
 }
-// Capture the full setup/activation funnel while preserving explicit SDK opt-outs
-// and any deployment-specific sampling rate. Config loads before runtime imports.
-process.env.COPILOTKIT_TELEMETRY_SAMPLE_RATE ??= "1";
-
 export interface Config {
   mode: "sample" | "live";
   port: number;
@@ -76,6 +72,14 @@ export interface Config {
   googleRedirectUri: string;
   workerUrl?: string;
   workerToken?: string;
+  /**
+   * PEM of the private CA that signed the worker certificate (G3, Render
+   * only). Unused for plain-http workers, and unused for https workers
+   * whose TLS is terminated by the platform (live Azure): with no CA set,
+   * the API trusts the system roots, which is what verifies Azure's
+   * platform certificate.
+   */
+  workerTlsCa?: string;
   taskWorkerEnabled?: boolean;
   webSearchEnabled?: boolean;
   computerEnabled?: boolean;
@@ -194,6 +198,7 @@ export function readConfig(): Config {
     googleRedirectUri: `${publicUrl.replace(/\/+$/, "")}/api/google/callback`,
     workerUrl: browserWorkerUrl(process.env.BROWSER_WORKER_URL),
     workerToken: process.env.WORKER_TOKEN,
+    workerTlsCa: process.env.WORKER_TLS_CA?.trim() || undefined,
     taskWorkerEnabled: process.env.TASK_WORKER_ENABLED !== "false",
     webSearchEnabled: process.env.WEB_SEARCH_ENABLED !== "false",
     computerEnabled: process.env.COMPUTER_ENABLED === "true",
@@ -211,6 +216,12 @@ export function readConfig(): Config {
     // behind a proxy that sets them; otherwise a direct caller can spoof them.
     trustProxy: process.env.TRUST_PROXY === "true",
   };
+  // G3.1: no startup throw for a missing WORKER_TLS_CA. An https worker
+  // URL without a CA is the live Azure shape (platform TLS, verified
+  // against the system roots) — the G3 fail-fast that threw here crashed
+  // the API at startup on Azure (revision 0000058, Nov 13). A Render
+  // deploy that forgets the CA boots, then fails loudly at the TLS
+  // handshake on every worker call instead.
   if (
     mode === "live" &&
     (!config.accessKey ||

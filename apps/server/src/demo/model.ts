@@ -7,7 +7,7 @@ import {
   LLMock,
 } from "@copilotkit/aimock";
 import { z } from "zod";
-import { aquariumFixture, schoolTripFixture } from "./jev-fixture.ts";
+import { aquariumFixture, aquariumFixtureFreshness, schoolTripFixture } from "./jev-fixture.ts";
 
 export const demoModel = "openai/openmuse-browser-demo";
 
@@ -387,6 +387,13 @@ function pageExcerpt(text: string, anchor: RegExp): string {
 }
 
 function demoExhibitResponse(request: ChatCompletionRequest, turn: ChatMessage[]): FixtureResponse {
+  // The aquarium fixture facts were checked once, on a stamped date — warn
+  // when they are stale instead of letting sample mode decide on old facts.
+  const freshness = aquariumFixtureFreshness();
+  if (freshness.stale)
+    console.warn(
+      `[OpenMuse] Sample aquarium fixture facts were checked on ${freshness.checkedAt} (${freshness.ageDays} days ago); re-check the exhibit pages before relying on them.`,
+    );
   const choice = turnResult(turn, "present_choices", "call_openmuse_demo_jev_");
   if (choice) {
     const parsed = z

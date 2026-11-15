@@ -1,6 +1,13 @@
 import assert from "node:assert/strict";
-import { test } from "node:test";
-import { validateDeskEntries } from "../apps/server/src/engine/knowledge-desk.ts";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test from "node:test";
+import {
+  cosine,
+  searchKnowledgeDeskTool,
+  validateDeskEntries,
+} from "../apps/server/src/engine/knowledge-desk.ts";
 
 const valid = { id: "1", source: "sop.md", title: "Title", text: "Some text." };
 
@@ -30,7 +37,87 @@ test("validateDeskEntries rejects entries missing a required string field", () =
   assert.equal(validateDeskEntries([{ ...valid, title: 7 }]).ok, false);
 });
 
+// S-B6 item 6 (already fixed): the excerpt assumes entry.text is a string,
+// so the tool must return the desk error for a malformed index instead of
+// throwing on .slice — this pins the validation that landed after the audit.
+test("the tool returns the desk error for an entry with a non-string text", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-desk-"));
+  const previousDataDir = process.env.DATA_DIR;
+  process.env.DATA_DIR = dir;
+  t.after(async () => {
+    if (previousDataDir === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = previousDataDir;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await mkdir(join(dir, "knowledge-desk"), { recursive: true });
+  await writeFile(
+    join(dir, "knowledge-desk", "index.json"),
+    JSON.stringify([{ ...valid, text: 42 }]),
+  );
+  assert.ok(searchKnowledgeDeskTool.execute);
+  const result = (await searchKnowledgeDeskTool.execute({ query: "notary" })) as {
+    error?: string;
+  };
+  assert.match(result.error ?? "", /Knowledge Desk index is invalid.*entry 0.*"text"/);
+});
+
 test("validateDeskEntries rejects a non-numeric embedding", () => {
   assert.equal(validateDeskEntries([{ ...valid, embedding: [0.1, "x"] }]).ok, false);
   assert.equal(validateDeskEntries([{ ...valid, embedding: "vec" }]).ok, false);
+});
+
+test("cosine rejects a dimension mismatch instead of truncating", () => {
+  assert.throws(() => cosine([1, 0], [1, 0, 0]), /dimension mismatch/);
+  assert.throws(() => cosine([1, 0, 0], [1, 0]), /dimension mismatch/);
+  assert.equal(cosine([1, 0], [1, 0]), 1);
+  assert.equal(cosine([1, 0], [0, 1]), 0);
+});
+
+test("a mismatched entry embedding falls back to keyword scoring with a warning", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "openmuse-desk-"));
+  const previous = {
+    DATA_DIR: process.env.DATA_DIR,
+    FOUNDRY_EMBEDDINGS_ENDPOINT: process.env.FOUNDRY_EMBEDDINGS_ENDPOINT,
+    FOUNDRY_EMBEDDINGS_KEY: process.env.FOUNDRY_EMBEDDINGS_KEY,
+  };
+  process.env.DATA_DIR = dir;
+  process.env.FOUNDRY_EMBEDDINGS_ENDPOINT = "https://example.invalid/embeddings";
+  process.env.FOUNDRY_EMBEDDINGS_KEY = "test-key";
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    Response.json({ data: [{ embedding: [1, 0, 0] }] }, { status: 200 })) as typeof fetch;
+  t.after(async () => {
+    globalThis.fetch = originalFetch;
+    if (previous.DATA_DIR === undefined) delete process.env.DATA_DIR;
+    else process.env.DATA_DIR = previous.DATA_DIR;
+    if (previous.FOUNDRY_EMBEDDINGS_ENDPOINT === undefined)
+      delete process.env.FOUNDRY_EMBEDDINGS_ENDPOINT;
+    else process.env.FOUNDRY_EMBEDDINGS_ENDPOINT = previous.FOUNDRY_EMBEDDINGS_ENDPOINT;
+    if (previous.FOUNDRY_EMBEDDINGS_KEY === undefined) delete process.env.FOUNDRY_EMBEDDINGS_KEY;
+    else process.env.FOUNDRY_EMBEDDINGS_KEY = previous.FOUNDRY_EMBEDDINGS_KEY;
+    await rm(dir, { recursive: true, force: true });
+  });
+  await mkdir(join(dir, "knowledge-desk"), { recursive: true });
+  await writeFile(
+    join(dir, "knowledge-desk", "index.json"),
+    JSON.stringify([
+      {
+        id: "1",
+        source: "a.md",
+        title: "Notary signing",
+        text: "notary signing rules",
+        embedding: [1, 0, 0],
+      },
+      { id: "2", source: "b.md", title: "Notary stamp", text: "notary stamp", embedding: [0, 1] },
+    ]),
+  );
+  assert.ok(searchKnowledgeDeskTool.execute);
+  const result = (await searchKnowledgeDeskTool.execute({ query: "notary" })) as {
+    method?: string;
+    hits?: unknown[];
+    warning?: string;
+  };
+  assert.equal(result.method, "embeddings");
+  assert.equal(result.hits?.length, 2);
+  assert.match(result.warning ?? "", /different dimension.*keyword instead/);
 });

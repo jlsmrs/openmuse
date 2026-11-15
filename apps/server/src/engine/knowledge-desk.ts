@@ -62,11 +62,19 @@ export function validateDeskEntries(
   return { ok: true, entries: data as Entry[] };
 }
 
-function cosine(a: number[], b: number[]): number {
+/** Cosine similarity. A dimension mismatch is a data error, not a low
+ * score: truncating to the shorter vector would silently compare unrelated
+ * coordinates, so it throws and the caller falls back to keyword scoring
+ * for that entry. */
+export function cosine(a: number[], b: number[]): number {
+  if (a.length !== b.length)
+    throw new RangeError(
+      `Embedding dimension mismatch: query has ${a.length} dimensions, entry has ${b.length}`,
+    );
   let dot = 0,
     na = 0,
     nb = 0;
-  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+  for (let i = 0; i < a.length; i++) {
     dot += a[i] * b[i];
     na += a[i] * a[i];
     nb += b[i] * b[i];
@@ -132,13 +140,24 @@ export const searchKnowledgeDeskTool = defineTool({
         /* fall through to keyword */
       }
     }
-    const scored = entries.map((e) => ({
-      entry: e,
-      score:
-        queryEmbedding && e.embedding
-          ? cosine(queryEmbedding, e.embedding)
-          : keywordScore(query, `${e.title} ${e.text}`),
-    }));
+    let dimensionMismatch = false;
+    const scored = entries.map((e) => {
+      if (queryEmbedding && e.embedding) {
+        try {
+          return { entry: e, score: cosine(queryEmbedding, e.embedding) };
+        } catch {
+          // One entry's embedding was built with a different dimension
+          // than the query: score it by keyword instead of failing the
+          // whole search, and say so in the result.
+          dimensionMismatch = true;
+          return { entry: e, score: keywordScore(query, `${e.title} ${e.text}`) };
+        }
+      }
+      return {
+        entry: e,
+        score: keywordScore(query, `${e.title} ${e.text}`),
+      };
+    });
     scored.sort((a, b) => b.score - a.score);
     const hits = scored
       .slice(0, topK)
@@ -154,6 +173,9 @@ export const searchKnowledgeDeskTool = defineTool({
       query,
       entries: entries.length,
       hits,
+      warning: dimensionMismatch
+        ? "Some entries had embeddings with a different dimension than the query; those entries were scored by keyword instead."
+        : undefined,
       note: hits.length ? undefined : "No desk entry matched. Do not answer from memory.",
     };
   },

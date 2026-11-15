@@ -29,6 +29,29 @@ test("invalid Gmail dates do not prevent inbox and thread reads", async () => {
   }
 });
 
+test("a malformed Date header falls back to the raw header instead of vanishing", async () => {
+  const client = new GoogleClient({
+    getAccessToken: async () => "synthetic-access-token",
+    fetch: async () =>
+      Response.json({
+        id: "thread1",
+        messages: [
+          {
+            id: "message1",
+            threadId: "thread1",
+            payload: {
+              headers: [{ name: "Date", value: "Mon, 32 Oct 2026 25:99:99 +0000" }],
+            },
+            snippet: "Still readable",
+          },
+        ],
+      }),
+  });
+  // No internalDate, unparseable Date header: the raw header is kept so the
+  // row still shows when it arrived instead of an empty date.
+  assert.equal((await client.getThread("thread1"))[0].date, "Mon, 32 Oct 2026 25:99:99 +0000");
+});
+
 test("Gmail dates retain valid epoch, date limits and Date-header fallback", async () => {
   for (const [internalDate, expected] of [
     ["0", "1970-01-01T00:00:00.000Z"],

@@ -48,6 +48,7 @@ import { DesktopToolCard } from "./desktop-tool-card";
 import { confirmedJevSelection, displayJevUserMessage, latestJevPanelId } from "./jev-actions";
 import { JevInteractionContext, JevToolCard } from "./jev-tool-card";
 import { MailToolCard } from "./mail-tool-card";
+import { stripMarkdown } from "./plain-text";
 import { SearchToolCard } from "./search-tool-card";
 import { FileThreadCard, TaskThreadCard } from "./thread-artifacts";
 import { type Selection, useMuseThread } from "./threads";
@@ -55,6 +56,7 @@ import { Button, Card, CheckRow, colors, ErrorNotice, s } from "./ui";
 import {
   type DictationHandle,
   defaultSpeechEnv,
+  resolveNativeVoiceSupport,
   type SpeechHandle,
   speakText,
   startDictation,
@@ -360,7 +362,9 @@ export function ChatScreen({
           () => copilotkit.runAgent({ agent }),
           (onError) => copilotkit.subscribe({ onError }),
         );
-        await Promise.all([refresh(), refreshAgent()]);
+        // The reply already succeeded: a stale workspace/agent read must not
+        // fail the turn (same rule as AgentWorkspaceProvider.mutate).
+        await Promise.all([refresh(), refreshAgent()]).catch(() => {});
       } catch (e) {
         if (message && e instanceof ConversationTurnError && e.code === threadLocked) {
           // The server refused the turn before running it (another reply holds the thread),
@@ -477,13 +481,27 @@ export function ChatScreen({
       setError(`Could not stop response: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  // Voice v1 is web-only: the browser's own speech recognition for input and
-  // the device voice for readback. The voice is the browser's default, not
-  // Charlie's persona voice, and native apps get no voice buttons.
-  const voice =
-    Platform.OS === "web"
-      ? voiceSupport(defaultSpeechEnv())
-      : { dictation: false, readback: false };
+  // Voice: the browser's own speech recognition for input and the
+  // device voice for readback on web; on-device dictation
+  // (expo-speech-recognition) and read-aloud (expo-speech) on native.
+  // Native support is resolved on mount because the native modules load
+  // asynchronously — and dictation is absent in Expo Go, where the
+  // recognition module cannot load, so the mic button stays hidden
+  // there instead of crashing. The voice is the device's default, not
+  // Charlie's persona voice — Azure is primary when configured (see
+  // voice-selection.ts) and local is the fallback.
+  const [nativeVoice, setNativeVoice] = useState({ dictation: false, readback: false });
+  useEffect(() => {
+    if (Platform.OS === "web") return;
+    let live = true;
+    void resolveNativeVoiceSupport().then((support) => {
+      if (live) setNativeVoice(support);
+    });
+    return () => {
+      live = false;
+    };
+  }, []);
+  const voice = Platform.OS === "web" ? voiceSupport(defaultSpeechEnv()) : nativeVoice;
   function toggleDictation() {
     if (dictating) {
       dictationRef.current?.stop();
@@ -525,7 +543,7 @@ export function ChatScreen({
       setVoiceError("There is no reply to read aloud yet.");
       return;
     }
-    const handle = speakText(defaultSpeechEnv(), latest.content, {
+    const handle = speakText(defaultSpeechEnv(), stripMarkdown(latest.content), {
       onEnd: () => setSpeaking(false),
       onError: (message) => {
         setVoiceError(message);
@@ -546,11 +564,24 @@ export function ChatScreen({
     setSpeaking(false);
     const text = draft.trim();
     if (!text || !isReady || !loaded) return;
+    // A picked attachment that disappeared from the workspace must not be
+    // sent silently without it: warn, drop the stale picks, and let the user
+    // send again knowingly instead of sending a message missing a file.
+    const files = w.files.filter((f) => attachments.includes(f.id));
+    const missing = attachments.filter((id) => !files.some((f) => f.id === id));
+    if (missing.length) {
+      setAttachments((current) => current.filter((id) => !missing.includes(id)));
+      setError(
+        missing.length === 1
+          ? "One attached file is no longer in your workspace, so it was removed from this message. Send again to send without it."
+          : `${missing.length} attached files are no longer in your workspace, so they were removed from this message. Send again to send without them.`,
+      );
+      return;
+    }
     // A new submission can continue after Stop; held follow-ups still need explicit resume.
     if (!busy && !agent.isRunning && !saveError && !queue.getSnapshot().pending.length)
       queue.resume();
     setShowResults(false);
-    const files = w.files.filter((f) => attachments.includes(f.id));
     enqueue(
       text +
         (files.length
@@ -1052,7 +1083,10 @@ export function ChatScreen({
                 ...noFocusRing,
               }}
               multiline
-              editable
+              // The draft is locked while dictating: dictation rebuilds it
+              // from the text captured when it started, so typing mid-dictation
+              // would be overwritten by the next transcript.
+              editable={!dictating}
               onKeyPress={
                 Platform.OS === "web"
                   ? (event) => {

@@ -13,31 +13,62 @@ export type Section =
   | "ideas"
   | "goals"
   | "apps";
-export interface Mail {
-  id: string;
-  threadId: string;
-  from: string;
-  sender: string;
-  to: string[];
-  subject: string;
-  body: string;
-  date: string;
-  unread: boolean;
-  label: string;
-  attachments: string[];
+/**
+ * Shared shape for a full mail row, as mapMessage produces it. The schema is
+ * the single source of truth — Mail is its inferred type, so the shape and
+ * its validation cannot drift apart (R2).
+ */
+export const mailSchema = z.object({
+  id: z.string().min(1),
+  threadId: z.string().min(1),
+  from: z.string(),
+  sender: z.string(),
+  to: z.array(z.string()),
+  subject: z.string(),
+  body: z.string(),
+  // A malformed Date header falls back to the raw header instead of
+  // vanishing (mapMessage), so the date is a string, not necessarily ISO.
+  date: z.string(),
+  unread: z.boolean(),
+  // Live rows use Inbox/Sent/Trash/Spam/Mail, but sample rows use arbitrary
+  // labels ("School", "Sent · local"), so the label stays a plain string.
+  label: z.string(),
+  attachments: z.array(z.string()),
+});
+export type Mail = z.infer<typeof mailSchema>;
+/**
+ * Headers-only mail row: the list/search shape. It carries the snippet, never
+ * a body — full bodies come from getThread for a selected message instead.
+ * The sample path must return this same shape (S-B9 agrees on it).
+ */
+export const mailMetadataSchema = mailSchema.omit({ body: true }).extend({ snippet: z.string() });
+export type MailMetadata = z.infer<typeof mailMetadataSchema>;
+/** Strip a full mail row to its headers-only shape (body becomes the snippet). */
+export function toMailMetadata(mail: Mail): MailMetadata {
+  const { body, ...rest } = mail;
+  return { ...rest, snippet: body };
 }
-export interface CalendarEvent {
-  id: string;
-  calendarId: string;
-  title: string;
-  start: string;
-  end: string;
-  allDay: boolean;
-  timeZone: string;
-  location: string;
-  description: string;
-  attendees: string[];
-}
+/**
+ * A start/end that mapEvent accepts: a date for all-day events, an ISO
+ * date-time otherwise. mapEvent guarantees both parse — that is the check,
+ * not an ISO shape.
+ */
+const parseableDate = z
+  .string()
+  .refine((value) => Number.isFinite(Date.parse(value)), "must be a parseable date or date-time");
+export const calendarEventSchema = z.object({
+  id: z.string().min(1),
+  calendarId: z.string().min(1),
+  title: z.string(),
+  start: parseableDate,
+  end: parseableDate,
+  allDay: z.boolean(),
+  timeZone: z.string(),
+  location: z.string(),
+  description: z.string(),
+  attendees: z.array(z.string()),
+});
+export type CalendarEvent = z.infer<typeof calendarEventSchema>;
 export const calendarRangeSchema = z
   .object({
     timeMin: z.iso.datetime({ offset: true }),
@@ -68,8 +99,10 @@ export interface BrowserSession {
   previewUrl?: string;
   consoleUrl?: string;
 }
-// Invisible characters that reorder or hide text without showing on the review card. Joiners and
-// directional marks stay because emoji sequences, Persian and Arabic text depend on them.
+// Invisible characters that reorder or hide text without showing on the review card. Joiners
+// (ZWJ/ZWNJ) and directional marks (LRM/RLM) stay because emoji sequences, Persian and Arabic
+// text depend on them; directional embeddings, overrides, and isolates are stripped — they
+// reorder text, which is what this filter exists to prevent.
 const hiddenText = /[\u200B\u202A-\u202E\u2060-\u2064\u2066-\u2069\uFEFF\u{E0000}-\u{E007F}]/gu;
 const visibleText = () => z.string().overwrite((text) => text.replace(hiddenText, ""));
 export const emailDraftSchema = z.object({
@@ -93,7 +126,11 @@ export const eventDraftSchema = z
     start: z.string().min(1),
     end: z.string().min(1),
     allDay: z.boolean().default(false),
-    timeZone: z.string().default("America/Los_Angeles"),
+    // Required: there is no user-configured time zone anywhere in the app,
+    // so silently defaulting to America/Los_Angeles put events in the wrong
+    // zone. Callers must supply the IANA name (the model is told to ask when
+    // it does not know it). Breaking change, flagged in the S-B7 review.
+    timeZone: z.string().min(1),
     location: visibleText().max(2000).default(""),
     description: visibleText().max(10000).default(""),
     attendees: z.array(z.email()).max(50).default([]),
@@ -138,13 +175,17 @@ export const proposalSchema = z.discriminatedUnion("kind", [
   }),
   z.object({
     kind: z.literal("calendar.delete"),
-    data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
+    data: z.object({
+      calendarId: z.string().min(1),
+      eventId: z.string().min(1),
+      title: z.string().min(1),
+    }),
   }),
 ]);
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
 export type ProposalInput = z.infer<typeof proposalSchema>;
-export interface ActionProposal {
+export type ActionProposal = {
   target?: CalendarEvent;
   targetVersion?: string;
   taskId?: string;
@@ -152,8 +193,6 @@ export interface ActionProposal {
   connectionId?: string;
   id: string;
   title: string;
-  kind: ProposalInput["kind"];
-  data: Record<string, unknown>;
   status:
     | "awaiting_review"
     | "executing"
@@ -168,7 +207,7 @@ export interface ActionProposal {
   expiresAt: string;
   result?: string;
   error?: string;
-}
+} & ProposalInput;
 export interface ActivityEntry {
   id: string;
   title: string;

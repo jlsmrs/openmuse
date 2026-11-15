@@ -25,6 +25,7 @@ for (const scenario of [
       title: "Sample walk",
       start: "2026-10-10T10:00:00-07:00",
       end: "2026-10-10T11:00:00-07:00",
+      timeZone: "America/Los_Angeles",
     },
     status: "waiting_approval",
   },

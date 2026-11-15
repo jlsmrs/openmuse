@@ -60,7 +60,11 @@ export function ThreadsProvider({ children }: { children: ReactNode }) {
         setLoading(false);
       })
       .catch((e) => {
-        if (active) setError(e instanceof Error ? e.message : String(e));
+        // A failed fetch must clear loading too, or the thread list spins forever.
+        if (active) {
+          setError(e instanceof Error ? e.message : String(e));
+          setLoading(false);
+        }
       });
     return () => {
       active = false;

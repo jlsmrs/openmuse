@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
+import { computerIdentity } from "../apps/server/src/computer.ts";
 import { createStore } from "../apps/server/src/db.ts";
 import { config, fixture, ok } from "./helpers/computer.ts";
 
@@ -71,6 +72,45 @@ test("computer REST endpoints require session ownership and return persisted rec
     assert.equal(receipt.status, "succeeded");
     assert.deepEqual(await db.get("local-user", "computer-commands", receipt.id), receipt);
     assert.equal(await db.get("attacker", "computer-commands", receipt.id), null);
+  } finally {
+    await db.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/computer/forget deletes the owned computer", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "openmuse-computer-forget-"));
+  const db = await createStore();
+  const owned = fixture({ owner: "local-user" });
+  const server = await createApp(db, { ...config, dataDir: directory }, { docker: owned.runner });
+  try {
+    const session = await server.auth.session();
+    const headers = {
+      Authorization: `Bearer ${session.token}`,
+      "Content-Type": "application/json",
+    };
+    const response = await server.app.request("/api/computer/forget", {
+      method: "POST",
+      headers,
+    });
+    assert.equal(response.status, 200);
+    const identity = computerIdentity(config, "local-user");
+    assert.ok(
+      owned.calls.some(
+        (call) =>
+          call.args[0] === "container" &&
+          call.args[1] === "rm" &&
+          call.args.includes(identity.container),
+      ),
+      "the container is force-removed",
+    );
+    assert.ok(
+      owned.calls.some(
+        (call) =>
+          call.args[0] === "volume" && call.args[1] === "rm" && call.args.includes(identity.volume),
+      ),
+      "the volume is removed",
+    );
   } finally {
     await db.close();
     await rm(directory, { recursive: true, force: true });

@@ -4,7 +4,7 @@ export interface ComputerCommand {
   /** Full input binding for keyed desktop actions; command is only a short display label. */
   actionHash?: string;
   cwd: string;
-  status: "running" | "succeeded" | "failed" | "timed_out" | "interrupted";
+  status: "running" | "succeeded" | "failed" | "timed_out" | "interrupted" | "paused";
   exitCode?: number;
   stdout: string;
   stderr: string;
@@ -21,6 +21,8 @@ export interface ComputerSnapshot {
   network: "disabled" | "enabled";
   message?: string;
   commands: ComputerCommand[];
+  /** Every receipt ever recorded for this provider; commands holds the newest 100. */
+  totalCommands: number;
 }
 export interface ComputerDirectory {
   path: string;

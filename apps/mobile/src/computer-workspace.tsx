@@ -417,6 +417,28 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   const [folder, setFolder] = useState<string>();
   const [importing, setImporting] = useState(false);
   const dirty = !!editor && (editor.text !== editor.saved || editor.path !== editor.savedPath);
+  // The path was changed since the file was opened (a rename); a new file has
+  // no saved path yet, so choosing its name never needs a confirm.
+  const renamed = !!editor && editor.savedPath !== "" && editor.path !== editor.savedPath;
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [confirmRename, setConfirmRename] = useState(false);
+  // The id of a document armed to overwrite a same-name file in this folder;
+  // the first tap arms, the second copies. Cleared when the folder changes.
+  const [confirmImport, setConfirmImport] = useState<string>();
+  // A save clears the dirty flag, which disarms both confirms; any path edit
+  // re-arms the rename confirm.
+  useEffect(() => {
+    if (!dirty) {
+      setConfirmDiscard(false);
+      setConfirmRename(false);
+    }
+  }, [dirty]);
+  useEffect(() => {
+    setConfirmRename(false);
+  }, [editor?.path]);
+  useEffect(() => {
+    setConfirmImport(undefined);
+  }, [path]);
   useEffect(() => {
     if (!active || !running) {
       setLoading(false);
@@ -460,13 +482,25 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   }
   async function importDocument(file: Artifact) {
     if (busy || !running) return;
+    const target = `${path}/${file.name.replace(/[\\/]/g, "_")}`;
+    // Copying over a same-name file must not happen on one tap with warning
+    // text only: the first tap arms the overwrite, the second copies.
+    const exists = directory?.entries.some(
+      (entry) => entry.type === "file" && entry.path === target,
+    );
+    if (exists && confirmImport !== file.id) {
+      setConfirmImport(file.id);
+      setNotice(`A file named ${file.name} already exists here. Tap again to replace it.`);
+      return;
+    }
+    setConfirmImport(undefined);
     setBusy(true);
     setError("");
     setNotice("");
     try {
       await api.request("/api/computer/files/import", {
         fileId: file.id,
-        path: `${path}/${file.name.replace(/[\\/]/g, "_")}`,
+        path: target,
       });
       setImporting(false);
       setNotice("Document copied to your computer.");
@@ -493,6 +527,13 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
   }
   async function save() {
     if (!editor || busy) return;
+    // Saving to a path that changed since the file was opened writes to a new
+    // location (a rename): the first tap arms the confirm, the second saves.
+    if (renamed && !confirmRename) {
+      setConfirmRename(true);
+      setNotice("Tap Save again to write to the new path.");
+      return;
+    }
     const sent = editor;
     setBusy(true);
     setError("");
@@ -571,17 +612,27 @@ function ComputerFiles({ running, active }: { running: boolean; active: boolean 
               disabled={!running || !editor.path.trim()}
               onPress={() => void save()}
             >
-              Save file
+              {renamed && confirmRename ? "Confirm new path" : "Save file"}
             </Button>
             <Button
               disabled={busy}
               icon={ArrowLeft}
               onPress={() => {
+                // One tap must not throw away unsaved edits: the first tap
+                // arms the discard, the second leaves the editor.
+                if (dirty && !confirmDiscard) {
+                  setConfirmDiscard(true);
+                  return;
+                }
                 setEditor(undefined);
                 setNotice("");
               }}
             >
-              {dirty ? "Discard edits" : "Back to files"}
+              {dirty
+                ? confirmDiscard
+                  ? "Tap again to discard"
+                  : "Discard edits"
+                : "Back to files"}
             </Button>
           </View>
         </>

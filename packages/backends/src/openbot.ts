@@ -1,5 +1,70 @@
 import { z } from "zod";
+import type { ExecutionBackend } from "../../domain/src/index.ts";
 
+/** OpenBot responses are small descriptors; cap the read like Google's path does. */
+const MAX_OPENBOT_JSON_BYTES = 1024 * 1024;
+
+/**
+ * Attestation that an approved OpenMuse proposal backs a write call: the
+ * approved proposal's id. The adapter cannot verify the proposal itself (it
+ * holds no store); the token is the caller's proof that approval happened.
+ */
+export interface OpenBotWriteApproval {
+  proposalToken: string;
+}
+
+/**
+ * Read a JSON response with a size cap and a content-type check, like
+ * Google's capped read. A body that cannot be used stays undefined so the
+ * caller's schema/error handling reports it (with outcome-unknown for
+ * writes, as before); only an oversized body or a success response that is
+ * not JSON throws here.
+ */
+async function readCappedJson(response: Response, mutates: boolean): Promise<unknown> {
+  const oversized = () =>
+    new OpenBotError(
+      "invalid_response",
+      "OpenBot response exceeds the size limit.",
+      undefined,
+      undefined,
+      mutates,
+    );
+  const length = Number(response.headers.get("content-length"));
+  if (Number.isFinite(length) && length > MAX_OPENBOT_JSON_BYTES) throw oversized();
+  const contentType = response.headers.get("content-type");
+  if (contentType && !contentType.includes("application/json")) {
+    if (!response.ok) return undefined;
+    throw new OpenBotError(
+      "invalid_response",
+      "OpenBot returned a non-JSON response.",
+      undefined,
+      undefined,
+      mutates,
+    );
+  }
+  if (!response.body) return undefined;
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.length;
+      if (total > MAX_OPENBOT_JSON_BYTES) {
+        await reader.cancel();
+        throw oversized();
+      }
+      chunks.push(value);
+    }
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch (error) {
+    if (error instanceof OpenBotError) throw error;
+    return undefined;
+  } finally {
+    reader.releaseLock();
+  }
+}
 /** Verified against OpenBot a96d88c6 and its public CopilotKit runtime 1.70.1. */
 export const OPENBOT_CONTRACT_REF = "a96d88c6fb75385842529d7db7d463f4a8c4a86e";
 
@@ -98,10 +163,13 @@ export type OpenBotProbe =
 
 /**
  * Future integration seam; constructing it does not connect to OpenBot.
- * The caller must enforce OpenMuse proposals before dispatching external writes.
- * OpenBot's own policy/audit gateway remains authoritative for every request.
+ * External writes are guarded at the adapter: a write call must carry the
+ * approved proposal's token (see OpenBotWriteApproval). OpenBot's own
+ * policy/audit gateway remains authoritative for every request.
  */
-export class OpenBotAdapter {
+export class OpenBotAdapter implements ExecutionBackend {
+  readonly kind = "openbot" as const;
+  readonly capabilities = Object.freeze(["intelligence", "computer"] as const);
   readonly unsupportedCapabilities = Object.freeze([
     "gmail",
     "calendar",
@@ -117,6 +185,15 @@ export class OpenBotAdapter {
     } = {},
   ) {}
 
+  /** Authenticated reachability, mapped to the backend health shape. */
+  async health(): Promise<{ available: boolean; detail: string }> {
+    const probe = await this.probe();
+    if (probe.state === "authenticated")
+      return { available: true, detail: `authenticated as ${probe.userId}` };
+    if (probe.state === "unavailable") return { available: false, detail: probe.reason };
+    return { available: false, detail: probe.state };
+  }
+
   /** Configure a compatible public CopilotKit client. This is NOT an AG-UI SSE URL. */
   runtime() {
     const transport = this.requireTransport();
@@ -126,7 +203,7 @@ export class OpenBotAdapter {
         "Choose an OpenBot agent before configuring its runtime.",
       );
     }
-    const runtimeUrl = httpUrl(transport.runtimeUrl);
+    const runtimeUrl = httpUrl(transport.runtimeUrl, true);
     return {
       runtimeUrl,
       agentId: identifier(this.options.agentId),
@@ -150,7 +227,7 @@ export class OpenBotAdapter {
     }
   }
 
-  async createConversation(agentId: string, signal?: AbortSignal) {
+  async createConversation(agentId: string, signal?: AbortSignal, approval?: OpenBotWriteApproval) {
     const id = identifier(agentId);
     const { channel } = await this.json(
       "/api/channels",
@@ -161,6 +238,7 @@ export class OpenBotAdapter {
         signal,
       },
       true,
+      approval?.proposalToken,
     );
     if (channel.agentIds.length !== 1 || channel.agentIds[0] !== id) {
       throw new OpenBotError(
@@ -190,6 +268,7 @@ export class OpenBotAdapter {
     botId: string,
     input: { url: string; toolCallId?: string },
     signal?: AbortSignal,
+    approval?: OpenBotWriteApproval,
   ): Promise<OpenBotNavigation> {
     const url = httpUrl(input.url);
     return this.json(
@@ -204,6 +283,7 @@ export class OpenBotAdapter {
         signal,
       },
       true,
+      approval?.proposalToken,
     );
   }
 
@@ -211,7 +291,12 @@ export class OpenBotAdapter {
     return this.json(computerPath(botId, "control"), controlSchema, { signal });
   }
 
-  requestControl(botId: string, reason: string, signal?: AbortSignal): Promise<OpenBotControl> {
+  requestControl(
+    botId: string,
+    reason: string,
+    signal?: AbortSignal,
+    approval?: OpenBotWriteApproval,
+  ): Promise<OpenBotControl> {
     return this.json(
       computerPath(botId, "control/request"),
       controlSchema,
@@ -221,24 +306,35 @@ export class OpenBotAdapter {
         signal,
       },
       true,
+      approval?.proposalToken,
     );
   }
 
-  takeControl(botId: string, signal?: AbortSignal): Promise<OpenBotControl> {
+  takeControl(
+    botId: string,
+    signal?: AbortSignal,
+    approval?: OpenBotWriteApproval,
+  ): Promise<OpenBotControl> {
     return this.json(
       computerPath(botId, "control/take"),
       controlSchema,
       { method: "POST", signal },
       true,
+      approval?.proposalToken,
     );
   }
 
-  releaseControl(botId: string, signal?: AbortSignal): Promise<OpenBotControl> {
+  releaseControl(
+    botId: string,
+    signal?: AbortSignal,
+    approval?: OpenBotWriteApproval,
+  ): Promise<OpenBotControl> {
     return this.json(
       computerPath(botId, "control/release"),
       controlSchema,
       { method: "POST", signal },
       true,
+      approval?.proposalToken,
     );
   }
 
@@ -258,8 +354,16 @@ export class OpenBotAdapter {
     schema: z.ZodType<T>,
     init: RequestInit = {},
     mutates = false,
+    proposalToken?: string,
   ): Promise<T> {
     const transport = this.requireTransport();
+    // Adapter-level write guard: a mutating call without an approved
+    // proposal token never reaches the transport.
+    if (mutates && !proposalToken?.trim())
+      throw new OpenBotError(
+        "refused",
+        "OpenBot write requires an approved proposal token. Approve the action in OpenMuse first.",
+      );
     if (init.signal?.aborted)
       throw new OpenBotError("cancelled", "OpenBot request cancelled before dispatch.");
     let response: Response;
@@ -283,7 +387,7 @@ export class OpenBotAdapter {
         mutates,
       );
     }
-    const body: unknown = await response.json().catch(() => undefined);
+    const body: unknown = await readCappedJson(response, mutates);
     if (!response.ok) {
       const detail = errorSchema.safeParse(body);
       const code =
@@ -326,7 +430,7 @@ function computerPath(botId: string, operation: string): string {
   return `/api/computers/${encodeURIComponent(identifier(botId))}/${operation}`;
 }
 
-function httpUrl(value: string): string {
+function httpUrl(value: string, requireHttpsForNonLoopback = false): string {
   let url: URL;
   try {
     url = new URL(value);
@@ -338,6 +442,16 @@ function httpUrl(value: string): string {
       "invalid_input",
       "A valid HTTP(S) URL without embedded credentials is required.",
     );
+  }
+  // The runtime carries session credentials, so a non-loopback runtime over
+  // plain http would send them in the clear. Navigation targets are exempt:
+  // they carry no credentials.
+  if (
+    requireHttpsForNonLoopback &&
+    url.protocol === "http:" &&
+    !["localhost", "127.0.0.1", "::1"].includes(url.hostname)
+  ) {
+    throw new OpenBotError("invalid_input", "OpenBot runtime URL must use https outside loopback.");
   }
   return url.toString();
 }

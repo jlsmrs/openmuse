@@ -50,34 +50,59 @@ export interface PdfInspection {
 // so a file under MAX_PDF_BYTES could still expand without bound. Every pdf-lib decoder grows its
 // output buffer through DecodeStream.ensureBuffer, so cap what one load may allocate there.
 const decodeBudget = new AsyncLocalStorage<{ remaining: number }>();
-let decodeStream = Object.getPrototypeOf(
-  decodePDFRawStream(
-    PDFRawStream.of(PDFContext.create().obj({ Filter: "ASCIIHexDecode" }), new Uint8Array()),
-  ),
-);
-while (decodeStream && !Object.hasOwn(decodeStream, "ensureBuffer"))
-  decodeStream = Object.getPrototypeOf(decodeStream);
-if (!decodeStream) throw new Error("pdf-lib no longer decodes through DecodeStream");
-const ensureBuffer = decodeStream.ensureBuffer;
-decodeStream.ensureBuffer = function (this: { buffer: Uint8Array }, requested: number) {
-  const before = this.buffer.byteLength;
-  const buffer: Uint8Array = ensureBuffer.call(this, requested);
-  const budget = decodeBudget.getStore();
-  if (budget) {
-    budget.remaining -= buffer.byteLength - before;
-    if (budget.remaining < 0) throw new PdfError("PDF content expands beyond the supported size");
-  }
-  return buffer;
-};
+let decodeStreamPatched = false;
+/**
+ * Install the decode-budget cap on pdf-lib's DecodeStream.ensureBuffer.
+ * Runs on first PDF load, not at import time: if pdf-lib changes internals,
+ * the failure lands on a PDF load instead of breaking the import of this
+ * whole module.
+ */
+function patchDecodeStreamBudget(): void {
+  if (decodeStreamPatched) return;
+  let decodeStream = Object.getPrototypeOf(
+    decodePDFRawStream(
+      PDFRawStream.of(PDFContext.create().obj({ Filter: "ASCIIHexDecode" }), new Uint8Array()),
+    ),
+  );
+  while (decodeStream && !Object.hasOwn(decodeStream, "ensureBuffer"))
+    decodeStream = Object.getPrototypeOf(decodeStream);
+  if (!decodeStream) throw new Error("pdf-lib no longer decodes through DecodeStream");
+  const ensureBuffer = decodeStream.ensureBuffer;
+  decodeStream.ensureBuffer = function (this: { buffer: Uint8Array }, requested: number) {
+    const before = this.buffer.byteLength;
+    const budget = decodeBudget.getStore();
+    // Check the requested size against the remaining budget BEFORE allocating:
+    // the buffer grows to at least `requested`, so a request whose minimum
+    // growth already exceeds the budget must fail without allocating it.
+    if (budget && requested - before > budget.remaining)
+      throw new PdfError("PDF content expands beyond the supported size");
+    const buffer: Uint8Array = ensureBuffer.call(this, requested);
+    if (budget) {
+      budget.remaining -= buffer.byteLength - before;
+      if (budget.remaining < 0) throw new PdfError("PDF content expands beyond the supported size");
+    }
+    return buffer;
+  };
+  decodeStreamPatched = true;
+}
+
+/**
+ * The "%PDF-" marker must start within the first 5 bytes of the file
+ * (offset 0, or after a 3-byte UTF-8 BOM with an optional line feed).
+ * A marker buried hundreds of bytes in is not a PDF header — it is trailing
+ * garbage or a foreign file with PDF bytes inside. Shared by the importer
+ * (loadPdf) and the browser-download sniffer so the two paths accept the
+ * same leading bytes.
+ */
+export function pdfMarkerAtStart(bytes: Uint8Array): boolean {
+  return Buffer.from(bytes.subarray(0, 9)).indexOf("%PDF-") >= 0;
+}
 
 async function loadPdf(bytes: Uint8Array): Promise<PDFDocument> {
-  if (
-    !bytes.length ||
-    bytes.length > MAX_PDF_BYTES ||
-    Buffer.from(bytes.subarray(0, 1024)).indexOf("%PDF-") < 0
-  ) {
+  if (!bytes.length || bytes.length > MAX_PDF_BYTES || !pdfMarkerAtStart(bytes)) {
     throw new PdfError("Invalid PDF: expected nonempty PDF bytes up to 10 MiB");
   }
+  patchDecodeStreamBudget();
   const budget = { remaining: MAX_DECODED_BYTES };
   try {
     const doc = await decodeBudget.run(budget, () =>
@@ -157,6 +182,7 @@ export async function fillPdf(
     const doc = await loadPdf(bytes);
     const form = doc.getForm();
     const fields = new Map(form.getFields().map((field) => [field.getName(), field]));
+    const filled: PDFField[] = [];
     for (const [name, value] of Object.entries(values)) {
       const field = fields.get(name);
       if (!field) throw new PdfError(`Unknown PDF field: ${name}`);
@@ -173,11 +199,22 @@ export async function fillPdf(
       } else {
         throw new PdfError(`Unsupported PDF field: ${name}`);
       }
+      filled.push(field);
     }
     removeActions(doc);
     try {
-      form.updateFieldAppearances(await doc.embedFont(StandardFonts.Helvetica));
-      return await doc.save();
+      // Re-render appearances only for the fields actually filled. Rendering
+      // every field rewrites untouched fields in Helvetica, discarding the
+      // form's own fonts for values this call never touched. save() must not
+      // re-render either: its default updateFieldAppearances pass would
+      // regenerate every field lacking an appearance stream in the form
+      // default font. The filled fields above are already rendered.
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      for (const field of filled) {
+        if (field instanceof PDFTextField) field.updateAppearances(font);
+        else if (field instanceof PDFCheckBox) field.updateAppearances();
+      }
+      return await doc.save({ updateFieldAppearances: false });
     } catch {
       throw new PdfError(
         "Could not render PDF field values; use characters supported by this form's font or choose a compatible PDF form",

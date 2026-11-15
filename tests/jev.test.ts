@@ -40,15 +40,16 @@ test("panel validation rejects empty, duplicate and unsourced comparison options
   );
   assert.throws(() => jevPanelSchema.parse({ ...panel(), candidateSetVersion: 0 }));
 });
-test("actions round trip and malformed prefixed actions reject", () => {
+test("actions round trip and malformed prefixed actions return null", () => {
   const action = { panelId: "p", threadId: "t", candidateSetVersion: 1, optionId: "a" };
   assert.deepEqual(parseJevAction(encodeJevAction(action)), action);
   assert.equal(parseJevAction("ordinary message"), null);
-  assert.throws(() => parseJevAction("[OpenMuse choice] bad-json"));
-  assert.throws(() =>
+  assert.equal(parseJevAction("[OpenMuse choice] bad-json"), null);
+  assert.equal(
     parseJevAction(
       '[OpenMuse choice] {"panelId":"p","threadId":"t","candidateSetVersion":1,"optionId":"a","label":"untrusted"}',
     ),
+    null,
   );
 });
 test("ranking uses stable ties and rejects missing, unknown or nonfinite scores", () => {

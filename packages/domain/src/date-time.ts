@@ -3,16 +3,23 @@ export function localDateTime(value: string, timeZone: string): { date: string; 
   const instant = new Date(value);
   if (!Number.isFinite(instant.getTime()))
     return { date: value.slice(0, 10), time: value.slice(11, 16) };
-  const parts = new Intl.DateTimeFormat("en-US", {
-    timeZone,
-    era: "short",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hourCycle: "h23",
-  }).formatToParts(instant);
+  let parts: Intl.DateTimeFormatPart[];
+  try {
+    parts = new Intl.DateTimeFormat("en-US", {
+      timeZone,
+      era: "short",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    }).formatToParts(instant);
+  } catch {
+    // An unknown or unsupported zone (bad stored value, minimal ICU build)
+    // falls back to the raw timestamp text instead of throwing the render.
+    return { date: value.slice(0, 10), time: value.slice(11, 16) };
+  }
   const part = (name: Intl.DateTimeFormatPartTypes) =>
     parts.find((p) => p.type === name)?.value || "";
   const year = Number(part("year"));

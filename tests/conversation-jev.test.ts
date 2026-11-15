@@ -329,7 +329,9 @@ test("live refinement reuses the verified stored sources with no new browse or o
       ? {
           url: "https://example.org/exhibit",
           title: "Exhibit",
-          text: "Observed exhibit facts",
+          // S-B5 item 11: grounding is exact excerpts now, so the page
+          // text must contain the title, label, and detail verbatim.
+          text: "Exhibit: Observed exhibit facts",
           truncated: false,
         }
       : {

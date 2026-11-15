@@ -26,27 +26,46 @@ export async function extractPdfText(bytes: Uint8Array): Promise<PdfTextExtracti
     // every PDF silently falls back to the metadata reply in production.
     const data = new Uint8Array(bytes);
     const loading = pdfjs.getDocument({ data });
-    const doc = await loading.promise;
-    const pageCount = doc.numPages;
-    const pagesToRead = Math.min(pageCount, PDF_MAX_PAGES);
-    const pages: string[] = [];
-    for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber++) {
-      const page = await doc.getPage(pageNumber);
-      const content = await page.getTextContent();
-      let pageText = "";
-      for (const item of content.items) {
-        if (!("str" in item)) continue;
-        pageText += item.str;
-        if (item.hasEOL) pageText += "\n";
+    try {
+      const doc = await loading.promise;
+      const pageCount = doc.numPages;
+      const pagesToRead = Math.min(pageCount, PDF_MAX_PAGES);
+      const pages: string[] = [];
+      for (let pageNumber = 1; pageNumber <= pagesToRead; pageNumber++) {
+        const page = await doc.getPage(pageNumber);
+        const content = await page.getTextContent();
+        let pageText = "";
+        for (const item of content.items) {
+          if (!("str" in item)) continue;
+          // Fragments on one line run together without this: "Hello" +
+          // "World" would reach the model as "HelloWorld". Separate them
+          // when neither side already supplies the whitespace.
+          if (
+            pageText &&
+            !/\s$/.test(pageText) &&
+            item.str &&
+            !/^\s/.test(item.str) &&
+            !item.hasEOL
+          )
+            pageText += " ";
+          pageText += item.str;
+          if (item.hasEOL) pageText += "\n";
+        }
+        pages.push(pageText);
       }
-      pages.push(pageText);
+      return {
+        ok: true,
+        text: pages.join("\n\n"),
+        pageCount,
+        truncatedPages: pageCount > pagesToRead,
+      };
+    } finally {
+      // Release the document's parsed structures; without this every
+      // extraction leaks its pages until the process exits. The document
+      // proxy has no destroy method in this pdfjs-dist version — the
+      // loading task owns the worker, so destroy that instead.
+      await loading.destroy().catch(() => undefined);
     }
-    return {
-      ok: true,
-      text: pages.join("\n\n"),
-      pageCount,
-      truncatedPages: pageCount > pagesToRead,
-    };
   } catch {
     return { ok: false, error: "This PDF could not be read as text." };
   }

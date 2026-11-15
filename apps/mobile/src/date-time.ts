@@ -53,3 +53,28 @@ export function isCompleteInstant(value: string): boolean {
     Number.isFinite(Date.parse(value))
   );
 }
+
+/** A YYYY-MM-DD date shifted by whole days, noon-anchored to dodge DST edges. */
+export function plusDays(date: string, days: number): string {
+  const value = new Date(`${date}T12:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + days);
+  return value.toISOString().slice(0, 10);
+}
+
+/**
+ * The calendar query window. The "Next 30 days" view is anchored at today in
+ * the user's time zone — not at the selected week date, which made the range
+ * slide as the user paged through weeks. The single-day view stays on the
+ * selected day.
+ */
+export function calendarRange(
+  date: string,
+  timeZone: string,
+  all: boolean,
+): { timeMin: string; timeMax: string } {
+  const start = all ? localDateTime(new Date().toISOString(), timeZone).date : date;
+  return {
+    timeMin: startOfZonedDay(start, timeZone),
+    timeMax: startOfZonedDay(plusDays(start, all ? 30 : 1), timeZone),
+  };
+}

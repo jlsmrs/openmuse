@@ -2,6 +2,7 @@ import { Check, ExternalLink } from "lucide-react-native";
 import { createContext, useContext, useRef, useState } from "react";
 import { ActivityIndicator, Linking, Pressable, Text, View } from "react-native";
 import type { JevOption, JevPanel } from "../../../packages/domain/src/jev";
+import { isSafeAssistantUrl } from "./assistant-markdown";
 import {
   choiceAvailability,
   parseJevResult,
@@ -37,6 +38,10 @@ export const JevInteractionContext = createContext<JevInteraction>({
 });
 
 function SourceLink({ title, url }: { title: string; url: string }) {
+  // Server-supplied URLs open only when they are http(s) with a host; anything
+  // else (javascript:, file:, app schemes) renders as plain text, never a link.
+  if (!isSafeAssistantUrl(url))
+    return <Text style={[s.small, { color: colors.muted }]}>{title}</Text>;
   return (
     <Pressable
       accessibilityRole="link"

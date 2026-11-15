@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { after, before, test } from "node:test";
-import { ComputerService, type DockerResult } from "../apps/server/src/computer.ts";
+import {
+  ComputerService,
+  computerIdentity,
+  type DockerResult,
+  type DockerRunner,
+} from "../apps/server/src/computer.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import { config, fixture, ok, sandbox } from "./helpers/computer.ts";
 
@@ -398,4 +403,218 @@ test("a command marked dead after the lease check is never executed", async () =
   } finally {
     db.get = originalGet;
   }
+});
+
+test("a Docker command exiting 124 is failed, not timed_out, and leaves the box running", async () => {
+  const f = fixture({ command: async () => ({ ...ok(), exitCode: 124 }) });
+  const service = new ComputerService(db, config, f.runner);
+  const result = await service.execute("owner", { command: "exit 124" });
+  assert.equal(result.status, "failed");
+  assert.equal(result.exitCode, 124);
+  assert.ok(
+    !f.calls.some((call) => call.args[0] === "container" && call.args[1] === "stop"),
+    "an exit-124 command must not stop the box",
+  );
+});
+
+test("file failures keep their cause class instead of one generic message", async () => {
+  const serviceFor = (result: DockerResult) =>
+    new ComputerService(db, config, fixture({ command: async () => result }).runner);
+  await assert.rejects(
+    serviceFor({
+      ...ok(),
+      exitCode: 1,
+      stderr: "Traceback (most recent call last)\nFileNotFoundError: no such file",
+    }).read("owner", "/workspace/missing.txt"),
+    { status: 422, message: /exit code 1: FileNotFoundError: no such file/ },
+  );
+  await assert.rejects(
+    serviceFor({ ...ok(), timedOut: true, exitCode: null }).read("owner", "/workspace/big.txt"),
+    {
+      status: 504,
+      message: /timed out/,
+    },
+  );
+  await assert.rejects(
+    serviceFor({ ...ok(), interrupted: true, exitCode: null }).read("owner", "/workspace/note.txt"),
+    { status: 409, message: /interrupted/ },
+  );
+  await assert.rejects(
+    serviceFor({ ...ok(), truncated: true }).read("owner", "/workspace/note.txt"),
+    { status: 413, message: /too large/ },
+  );
+});
+
+test("a busy computer names the live lease expiry", async () => {
+  await db.put("owner", "computer-state", {
+    id: "lease",
+    token: "live-lease",
+    expiresAt: Date.now() + 60000,
+    stopping: false,
+    stopInFlight: false,
+    stopAttempt: "",
+    stopConfirmed: false,
+    executorDone: true,
+    operation: "operation",
+  });
+  const f = fixture();
+  const service = new ComputerService(db, config, f.runner);
+  try {
+    await assert.rejects(
+      service.execute("owner", { command: "pwd" }),
+      /Computer is busy until \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/,
+    );
+  } finally {
+    await db.remove("owner", "computer-state", "lease");
+  }
+});
+
+test("a long operation renews its lease instead of expiring mid-flight", async () => {
+  let finish: ((result: DockerResult) => void) | undefined;
+  let signalStarted: (() => void) | undefined;
+  const started = new Promise<void>((resolve) => {
+    signalStarted = resolve;
+  });
+  const f = fixture({
+    command: () =>
+      new Promise((resolve) => {
+        finish = resolve;
+        signalStarted?.();
+      }),
+  });
+  const service = new ComputerService(db, config, f.runner);
+  const renewals: Array<() => void> = [];
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = ((fn: (...args: unknown[]) => void, ms?: number) => {
+    if (ms === 60000) renewals.push(() => fn());
+    return { unref() {}, ref() {} };
+  }) as unknown as typeof setInterval;
+  globalThis.clearInterval = (() => {}) as unknown as typeof clearInterval;
+  try {
+    const run = service.execute("owner", { command: "sleep 1" });
+    await started;
+    assert.equal(renewals.length, 1, "the running operation holds one renewal timer");
+    const before =
+      (await db.get<{ expiresAt: number }>("owner", "computer-state", "lease"))?.expiresAt ?? 0;
+    renewals[0]?.();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const after =
+      (await db.get<{ expiresAt: number }>("owner", "computer-state", "lease"))?.expiresAt ?? 0;
+    assert.ok(after > before, "renewal extends the lease expiry");
+    finish?.(ok());
+    await run;
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("forget deletes the owned container and volume after confirming their labels", async () => {
+  const base = fixture();
+  let containerDeleted = false;
+  let volumeDeleted = false;
+  const runner: DockerRunner = async (args, options) => {
+    if (containerDeleted && args[0] === "container" && args[1] === "ls") return ok("");
+    if (volumeDeleted && args[0] === "volume" && args[1] === "ls") return ok("");
+    const result = await base.runner(args, options);
+    if (args[0] === "container" && args[1] === "rm") containerDeleted = true;
+    if (args[0] === "volume" && args[1] === "rm") volumeDeleted = true;
+    return result;
+  };
+  const service = new ComputerService(db, config, runner);
+  const snapshot = await service.forget("owner");
+  const identity = computerIdentity(config, "owner");
+  assert.ok(
+    base.calls.some(
+      (call) =>
+        call.args[0] === "container" &&
+        call.args[1] === "rm" &&
+        call.args.includes(identity.container),
+    ),
+    "the container is force-removed",
+  );
+  assert.ok(
+    base.calls.some(
+      (call) =>
+        call.args[0] === "volume" && call.args[1] === "rm" && call.args.includes(identity.volume),
+    ),
+    "the volume is removed",
+  );
+  assert.equal(snapshot.status, "stopped");
+});
+
+test("forget refuses a container whose labels do not match this deployment", async () => {
+  const inspect = sandbox();
+  inspect.Config.Labels = {};
+  const f = fixture({ inspect });
+  const service = new ComputerService(db, config, f.runner);
+  await assert.rejects(service.forget("owner"), /refusing to delete/);
+  assert.ok(!f.calls.some((call) => call.args[1] === "rm"), "nothing is deleted on refusal");
+});
+
+test("forget refuses a volume whose labels do not match this deployment", async () => {
+  const identity = computerIdentity(config, "owner");
+  const f = fixture({
+    volume: {
+      Name: identity.volume,
+      Labels: {},
+      Driver: "local",
+      Options: null,
+      Scope: "local",
+    },
+  });
+  const service = new ComputerService(db, config, f.runner);
+  await assert.rejects(service.forget("owner"), /refusing to delete/);
+  assert.ok(
+    !f.calls.some((call) => call.args[0] === "volume" && call.args[1] === "rm"),
+    "the volume is not deleted on refusal",
+  );
+});
+
+test("Docker file operations honor the computed seconds budget", async () => {
+  const f = fixture({
+    command: async () => ok(JSON.stringify({ path: "/workspace/note.txt", text: "hi" })),
+  });
+  const service = new ComputerService(db, config, f.runner);
+  assert.deepEqual(await service.read("owner", "/workspace/note.txt"), {
+    path: "/workspace/note.txt",
+    text: "hi",
+  });
+  const read = f.calls.find((call) => call.args[0] === "exec");
+  assert.ok(read);
+  assert.ok(read.args.includes("9s"), "a small request gets 8s + 1s of input");
+  assert.equal(read.timeoutMs, 11000);
+  const pdf = Buffer.concat([Buffer.from("%PDF-"), Buffer.alloc(2 * 1024 * 1024)]);
+  const g = fixture({
+    command: async () => ok(JSON.stringify({ path: "/workspace/doc.pdf" })),
+  });
+  await new ComputerService(db, config, g.runner).writePdf("owner", "/workspace/doc.pdf", pdf);
+  const write = g.calls.find((call) => call.args[0] === "exec");
+  assert.ok(write);
+  assert.ok(write.args.includes("11s"), "a multi-megabyte import gets a larger budget");
+  assert.equal(write.timeoutMs, 13000);
+});
+
+test("snapshots report the total receipt count past the newest 100", async () => {
+  const owner = "count-owner";
+  const now = Date.now();
+  for (let i = 0; i < 105; i++)
+    await db.put(owner, "computer-commands", {
+      id: `receipt-${i}`,
+      command: `echo ${i}`,
+      cwd: "/workspace",
+      status: "succeeded",
+      exitCode: 0,
+      stdout: "",
+      stderr: "",
+      truncated: false,
+      startedAt: new Date(now - i * 1000).toISOString(),
+      completedAt: new Date(now - i * 1000).toISOString(),
+    });
+  const service = new ComputerService(db, config, fixture({ owner }).runner);
+  const snapshot = await service.snapshot(owner);
+  assert.equal(snapshot.commands.length, 100);
+  assert.equal(snapshot.totalCommands, 105);
+  assert.equal(snapshot.commands[0].id, "receipt-0");
 });

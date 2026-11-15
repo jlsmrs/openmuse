@@ -77,6 +77,8 @@ export interface DesktopDriver {
   pause(sandboxId: string): Promise<void>;
   /** Connect, resuming a paused sandbox, and set its idle timeout. */
   connect(sandboxId: string, timeoutMs: number): Promise<DesktopBox>;
+  /** Delete a sandbox outright. Callers must confirm ownership first. */
+  kill(sandboxId: string): Promise<void>;
 }
 
 // `load` is the SDK module; tests pass a fake one.
@@ -112,6 +114,10 @@ export function e2bDesktopDriver(config: Config, load = sdk): DesktopDriver {
       const { Sandbox } = await load();
       // Static pause: connect() would resume a box that is already paused.
       await Sandbox.pause(sandboxId, { ...opts(), keepMemory: false });
+    },
+    async kill(sandboxId) {
+      const { Sandbox } = await load();
+      await Sandbox.kill(sandboxId, opts());
     },
     async connect(sandboxId, timeoutMs) {
       const { CommandExitError, Sandbox } = await load();
@@ -261,7 +267,9 @@ export const desktopActionSchema = z
         message: "Use xdotool key names, e.g. ctrl+l",
       });
     const [x = 0, y = 0] = value.coordinate ?? [];
-    if (x >= resolution[0] || y >= resolution[1])
+    // A screenshot ignores its coordinate, so an out-of-bounds one must not
+    // fail validation for an action that never uses it.
+    if (value.action !== "screenshot" && (x >= resolution[0] || y >= resolution[1]))
       ctx.addIssue({
         code: "custom",
         path: ["coordinate"],
@@ -422,7 +430,7 @@ export class E2BDesktopComputer {
   private awake(info: DesktopInfo | undefined, ms: number) {
     return Math.max(ms, info?.state === "running" ? info.endAt.getTime() - Date.now() : 0);
   }
-  private forget(id: string) {
+  private dropHandle(id: string) {
     this.handles.delete(id);
   }
   async start(labels: Record<string, string>) {
@@ -431,7 +439,7 @@ export class E2BDesktopComputer {
       ? existing.sandboxId
       : await this.control(() => this.driver.create(this.template(), labels));
     const info = await this.inspect(labels); // re-check before start, including the shared deadline
-    if (existing?.state !== "running") this.forget(id);
+    if (existing?.state !== "running") this.dropHandle(id);
     const cached = this.handles.get(id);
     const box =
       cached?.box ?? (await this.control(() => this.driver.connect(id, this.awake(info, idleMs))));
@@ -471,9 +479,18 @@ export class E2BDesktopComputer {
   async stop(labels: Record<string, string>) {
     const info = await this.inspect(labels);
     if (info?.state === "running") {
-      this.forget(info.sandboxId);
+      this.dropHandle(info.sandboxId);
       await this.control(() => this.driver.pause(info.sandboxId));
     }
+  }
+  /** Delete the owner's sandbox after the label-query list confirms it is
+   * this deployment's. inspect() refuses on any mismatch, and a missing box
+   * is a no-op. The cached handle is dropped so a later start recreates. */
+  async forget(labels: Record<string, string>) {
+    const info = await this.inspect(labels);
+    if (!info) return;
+    await this.control(() => this.driver.kill(info.sandboxId));
+    this.dropHandle(info.sandboxId);
   }
   private async attach(
     labels: Record<string, string>,
@@ -491,10 +508,18 @@ export class E2BDesktopComputer {
       } catch (error) {
         const current = await this.inspect(labels);
         if (current?.state !== "running") {
-          this.forget(id);
+          this.dropHandle(id);
           throw stopped();
         }
-        await this.control(() => Promise.reject(error));
+        // The box is still running, so this is not a credential or template
+        // problem: keep the real error instead of the generic key/template
+        // hint, the same way the stream step keeps its own message.
+        throw error instanceof AppError
+          ? error
+          : new AppError(
+              `Desktop keep-alive failed. ${error instanceof Error ? error.message : "Check E2B_API_KEY and COMPUTER_E2B_TEMPLATE."}`,
+              503,
+            );
       }
       return cached;
     }
@@ -517,7 +542,7 @@ export class E2BDesktopComputer {
   private async connect(id: string, info: DesktopInfo, keepMs: number): Promise<Handle> {
     const box = await this.control(() => this.driver.connect(id, this.awake(info, keepMs)));
     if ((await this.control(() => box.setup("pgrep -x xfce4-session >/dev/null", user))) !== 0) {
-      this.forget(id);
+      this.dropHandle(id);
       throw new AppError(
         "The desktop session is unavailable. Start the computer to restore it.",
         409,
@@ -587,11 +612,36 @@ export class E2BDesktopComputer {
       const code = await this.control(() =>
         box.setup(actionScript(input ? "sleep 0.5" : undefined), user),
       );
-      if (code !== 0) throw new AppError("The desktop screenshot failed", 502);
+      if (code !== 0) {
+        // scrot failing on a sessionless box (logged-out desktop, Xfce gone)
+        // is not a screenshot problem: probe the session so the caller gets
+        // the same 409 the first-connect path gives instead of a generic 502.
+        const sessionAlive = await box
+          .setup("pgrep -x xfce4-session >/dev/null", user)
+          .then((probe) => probe === 0)
+          .catch(() => false);
+        if (!sessionAlive)
+          throw new AppError(
+            "The desktop session is unavailable. Start the computer to restore it.",
+            409,
+          );
+        throw new AppError("The desktop screenshot failed", 502);
+      }
       const image = await this.control(() => box.readFile(screenshotFile));
       return { ...screen, image, uncertain, warning };
     } catch (error) {
-      if (!input) throw error;
+      if (!input) {
+        // A box that paused between attach and the screenshot surfaces as a
+        // generic provider error; confirm with a fresh inspection and map it
+        // to the same 409 the first-connect path gives.
+        const current = await this.inspect(labels).catch(() => undefined);
+        if (current?.state !== "running")
+          throw new AppError(
+            "The desktop session is unavailable. Start the computer to restore it.",
+            409,
+          );
+        throw error;
+      }
       return {
         ...screen,
         image: new Uint8Array(),
@@ -641,6 +691,11 @@ export class E2BDesktopComputer {
       // Nothing started, so this is a plain failure and the box keeps running.
       result.stderr =
         error instanceof AppError ? error.message : "The computer could not be reached.";
+      // A box that paused before the command started is not a failed command:
+      // mark it paused so the receipt says so instead of "failed". Any
+      // attach refusal (409) means the computer needs a Start; a provider
+      // error (503) keeps the failed mapping.
+      if (error instanceof AppError && error.status === 409) result.paused = true;
       return result;
     }
     const abort = () => {
@@ -712,8 +767,9 @@ export class E2BDesktopComputer {
       result.exitCode = (await handle.wait()).exitCode;
     } catch (error) {
       if (error instanceof CommandExitError) result.exitCode = error.exitCode;
-      else if (error instanceof TimeoutError && error.message.includes("[deadline_exceeded]"))
-        result.timedOut = true;
+      // The SDK's TimeoutError is the timeout signal; the "[deadline_exceeded]"
+      // text inside its message is an internal detail that must not decide it.
+      else if (error instanceof TimeoutError) result.timedOut = true;
       // Any other stream loss leaves the outcome unknown; the service stops the box.
       else result.interrupted = true;
     } finally {

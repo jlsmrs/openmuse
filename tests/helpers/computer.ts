@@ -69,6 +69,13 @@ export function fixture(
   options: {
     command?: () => Promise<DockerResult>;
     inspect?: ReturnType<typeof sandbox>;
+    volume?: {
+      Name: string;
+      Labels: Record<string, string> | null;
+      Driver: string;
+      Options: null;
+      Scope: string;
+    };
     missing?: boolean;
     owner?: string;
   } = {},
@@ -85,7 +92,7 @@ export function fixture(
     if (args[0] === "volume" && args[1] === "inspect")
       return ok(
         JSON.stringify([
-          {
+          options.volume ?? {
             Name: identity.volume,
             Labels: identity.labels,
             Driver: "local",

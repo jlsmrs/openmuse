@@ -64,11 +64,10 @@ export class ActionService {
           : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
     const createdAt = new Date(this.now()).toISOString();
     const proposal: ActionProposal = {
+      ...input,
       id,
       taskId,
       title,
-      kind: input.kind,
-      data: input.data,
       account: connection?.account,
       connectionId: connection?.id,
       target: prepared?.target,

@@ -8,10 +8,50 @@ import {
   withoutRelativeTimes,
 } from "../apps/server/src/engine/page-diff.ts";
 
-test("page lines are trimmed, collapsed, deduplicated and bounded", () => {
-  assert.deepEqual(pageLines("  Jobs \n\n Siemens   AI\r\nSiemens AI\n"), ["Jobs", "Siemens AI"]);
+test("page lines are trimmed, collapsed and bounded, with repeats kept", () => {
+  // Repeats are kept: the same line twice is two lines, so a count change
+  // is a visible diff instead of a blind spot.
+  assert.deepEqual(pageLines("  Jobs \n\n Siemens   AI\r\nSiemens AI\n"), [
+    "Jobs",
+    "Siemens AI",
+    "Siemens AI",
+  ]);
   assert.equal(pageLines("a\nb\nc", 2).length, 2);
-  assert.equal(pageLines("x".repeat(500))[0].length, 300);
+  assert.equal(pageLines("x".repeat(500))[0].length, 500);
+  assert.equal(pageLines("x".repeat(1500))[0].length, 1000);
+});
+
+test("a repeat-count change is a diff", () => {
+  assert.deepEqual(diffPage(["Listing A", "Listing A", "Listing A"], ["Listing A", "Listing A"]), {
+    added: [],
+    updated: [],
+    removed: ["Listing A"],
+  });
+  assert.deepEqual(diffPage(["Listing A"], ["Listing A", "Listing A"]), {
+    added: ["Listing A"],
+    updated: [],
+    removed: [],
+  });
+  assert.deepEqual(diffPage(["Listing A", "Listing A"], ["Listing A", "Listing A"]), {
+    added: [],
+    updated: [],
+    removed: [],
+  });
+});
+
+test("duplicate previous lines are paired one-to-one by instance", () => {
+  // Two identical previous lines: pairing one must leave the other removed,
+  // not consume both under one string key.
+  assert.deepEqual(diffPage(["Shop", "Shop"], ["Shop"]), {
+    added: [],
+    updated: [],
+    removed: ["Shop"],
+  });
+  assert.deepEqual(diffPage(["Shop"], ["Shop", "Shop"]), {
+    added: ["Shop"],
+    updated: [],
+    removed: [],
+  });
 });
 
 test("new lines are separated from lines where a number changed", () => {

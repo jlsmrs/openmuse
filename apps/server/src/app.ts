@@ -32,6 +32,7 @@ import {
   rateLimit,
   resolveClientKey,
 } from "./rate-limit.ts";
+import { workerFetchInit } from "./worker-fetch.ts";
 import { WorkspaceService } from "./workspace.ts";
 
 export async function createApp(
@@ -113,6 +114,7 @@ export async function createApp(
     try {
       const res = await fetch(`${config.workerUrl}/health`, {
         signal: AbortSignal.timeout(2000),
+        ...workerFetchInit(config.workerUrl, config.workerTlsCa),
       });
       return res.ok ? "ok" : "down";
     } catch {

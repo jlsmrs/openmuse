@@ -42,7 +42,7 @@ import { useAgentWorkspace } from "./agent-workspace";
 import { API_URL } from "./api";
 import { browserAddress } from "./browser-address";
 import { AgentAvatar } from "./custom-avatar";
-import { localDateTime, startOfZonedDay, zonedInstant } from "./date-time";
+import { calendarRange, localDateTime, plusDays, zonedInstant } from "./date-time";
 import {
   Button,
   Card,
@@ -598,16 +598,12 @@ interface CalendarChoice {
   timeZone: string;
   accessRole: string;
 }
-function plusDays(date: string, days: number) {
-  const value = new Date(`${date}T12:00:00Z`);
-  value.setUTCDate(value.getUTCDate() + days);
-  return value.toISOString().slice(0, 10);
-}
 export function CalendarScreen() {
   const { workspace: w, api, open } = useWorkspace();
   const [date, setDate] = useState(todayDate());
   const [all, setAll] = useState(false);
   const [calendars, setCalendars] = useState<CalendarChoice[]>([]);
+  const [calendarsTruncated, setTruncated] = useState(false);
   const [calendarId, setCalendarId] = useState("primary");
   const [events, setEvents] = useState<CalendarEvent[]>([]);
   const [loading, setLoading] = useState(true);
@@ -625,10 +621,16 @@ export function CalendarScreen() {
   useEffect(() => {
     let active = true;
     void api
-      .request<CalendarChoice[]>("/api/calendars")
-      .then((items) => {
+      .request<{ calendars: CalendarChoice[]; truncated: boolean } | CalendarChoice[]>(
+        "/api/calendars",
+      )
+      .then((data) => {
         if (!active) return;
+        // The endpoint returns { calendars, truncated }; accept a bare array
+        // too so an older cached bundle shape still reads.
+        const items = Array.isArray(data) ? data : data.calendars;
         setCalendars(items);
+        setTruncated(!Array.isArray(data) && data.truncated);
         setCalendarId((current) =>
           items.some((c) => c.id === current) ? current : items[0]?.id || "primary",
         );
@@ -646,11 +648,8 @@ export function CalendarScreen() {
     setError("");
     void Promise.resolve()
       .then(() => {
-        const query = new URLSearchParams({
-          calendarId,
-          timeMin: startOfZonedDay(date, zone),
-          timeMax: startOfZonedDay(plusDays(date, all ? 30 : 1), zone),
-        });
+        const { timeMin, timeMax } = calendarRange(date, zone, all);
+        const query = new URLSearchParams({ calendarId, timeMin, timeMax });
         return api.request<CalendarEvent[]>(`/api/calendar/events?${query}`);
       })
       .then((items) => {
@@ -711,6 +710,9 @@ export function CalendarScreen() {
       {calendars.length > 0 && (
         <View style={{ gap: 9 }}>
           <Text style={s.label}>Your calendars</Text>
+          {calendarsTruncated && (
+            <Text style={s.muted}>More calendars exist than are shown here.</Text>
+          )}
           <View style={[s.row, { gap: 8, flexWrap: "wrap" }]}>
             {calendars.map((c) => (
               <Button
@@ -836,6 +838,11 @@ export function BrowserScreen() {
   const [url, setUrl] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // The server marks the browser connection "unavailable" when a configured
+  // worker does not answer, and "unconfigured" when there is no worker at
+  // all; opening a session in either case can only fail server-side.
+  const browserConnection = w.connections.find((c) => c.id === "browser");
+  const browserReady = browserConnection?.status === "connected";
   async function create() {
     setError("");
     setBusy(true);
@@ -877,12 +884,19 @@ export function BrowserScreen() {
             primary
             icon={Plus}
             busy={busy}
-            disabled={!url.trim()}
+            disabled={!url.trim() || !browserReady}
             onPress={() => void create()}
           >
             Open session
           </Button>
         </View>
+        {!browserReady && (
+          <Text style={[s.muted, { marginTop: 10 }]}>
+            {browserConnection?.status === "unavailable"
+              ? "The browser worker is offline, so new sessions cannot be opened right now."
+              : "The browser worker is not configured, so new sessions cannot be opened."}
+          </Text>
+        )}
         <ErrorNotice error={error} />
       </Card>
       <Card>
@@ -942,6 +956,8 @@ function fileTypeLabel(f: Artifact): string {
   const ext = f.name.split(".").pop();
   return ext && ext !== f.name ? ext.toUpperCase().slice(0, 10) : "FILE";
 }
+/** Client-side mirror of the server's 10 MB file-import limit. */
+export const MAX_IMPORT_BYTES = 10 * 1024 * 1024;
 export function FilesScreen() {
   const { workspace: w, api, refresh, open } = useWorkspace();
   const [busy, setBusy] = useState(false);
@@ -956,6 +972,14 @@ export function FilesScreen() {
       });
       if (result.canceled) return;
       const file = result.assets[0];
+      // The server enforces a 10 MB import limit; check it here first so a
+      // too-large file fails immediately with a clear message instead of
+      // uploading and failing server-side. (Native pickers do not always
+      // report a size; then the server limit still applies.)
+      if (file.size !== undefined && file.size > MAX_IMPORT_BYTES)
+        throw new Error(
+          `That file is ${Math.ceil(file.size / (1024 * 1024))} MB, over the 10 MB import limit. Choose a smaller file.`,
+        );
       let artifact: Artifact;
       if (Platform.OS === "web") {
         const form = new FormData();
@@ -971,10 +995,23 @@ export function FilesScreen() {
           mimeType: file.mimeType || "application/octet-stream",
           headers: { Authorization: `Bearer ${api.token}` },
         });
-        const payload = JSON.parse(result.body);
-        if (result.status < 200 || result.status >= 300)
-          throw new Error(payload.error || "Could not import this file.");
-        artifact = payload;
+        // Check the status before parsing: an error body may not be JSON, and
+        // parsing it first turns the server's message into a SyntaxError.
+        if (result.status < 200 || result.status >= 300) {
+          let detail = "Could not import this file.";
+          try {
+            const failed = JSON.parse(result.body) as { error?: unknown };
+            if (typeof failed?.error === "string") detail = failed.error;
+          } catch {
+            // A non-JSON error body keeps the generic message.
+          }
+          throw new Error(detail);
+        }
+        try {
+          artifact = JSON.parse(result.body) as Artifact;
+        } catch {
+          throw new Error("Could not import this file.");
+        }
       }
       await refresh();
       open({ type: "file", file: artifact });

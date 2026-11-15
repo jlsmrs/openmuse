@@ -56,17 +56,23 @@ export interface SpeechEnv {
   webkitSpeechRecognition?: RecognitionConstructor;
   speechSynthesis?: SynthesisInstance;
   SpeechSynthesisUtterance?: UtteranceConstructor;
+  /** BCP 47 language tag for dictation, e.g. "fr-FR". Defaults to en-US. */
+  language?: string;
 }
 
 function windowEnv(): SpeechEnv {
   if (typeof globalThis === "undefined") return {};
   const w = (globalThis as unknown as { window?: Record<string, unknown> }).window;
   if (!w || typeof w !== "object") return {};
+  const navigator = (globalThis as unknown as { navigator?: { language?: string } }).navigator;
   return {
     SpeechRecognition: w.SpeechRecognition as RecognitionConstructor | undefined,
     webkitSpeechRecognition: w.webkitSpeechRecognition as RecognitionConstructor | undefined,
     speechSynthesis: w.speechSynthesis as SynthesisInstance | undefined,
     SpeechSynthesisUtterance: w.SpeechSynthesisUtterance as UtteranceConstructor | undefined,
+    // The device locale, so dictation hears the user's language; en-US is the
+    // fallback when the browser reports none.
+    language: navigator?.language,
   };
 }
 
@@ -120,7 +126,7 @@ export function startDictation(
   let stopped = false;
   recognition.continuous = true;
   recognition.interimResults = true;
-  recognition.lang = "en-US";
+  recognition.lang = env.language || "en-US";
   recognition.onresult = (event) => {
     callbacks.onTranscript(joinTranscript(event));
   };
@@ -196,4 +202,17 @@ export function stopSpeaking(env: SpeechEnv): void {
   } catch {
     // Nothing speaking; nothing to do.
   }
+}
+
+/**
+ * Native-only support probe, resolved from voice.native.ts on iOS and
+ * Android. This web stub always reports unavailable and is never
+ * called on web — chat.tsx only calls it on native, where Metro
+ * resolves "./voice" to voice.native.ts instead.
+ */
+export async function resolveNativeVoiceSupport(): Promise<{
+  dictation: boolean;
+  readback: boolean;
+}> {
+  return { dictation: false, readback: false };
 }

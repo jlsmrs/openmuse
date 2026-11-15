@@ -6,7 +6,6 @@ import type { JevService } from "./service.ts";
 const optionInput = jevOptionSchema
   .omit({ id: true })
   .extend({ id: z.string().trim().min(1).max(200).optional() });
-const normalizeExcerpt = (value: string) => value.replace(/\s+/g, " ").toLowerCase();
 export const presentChoicesParameters = z
   .object({
     message: z.string().trim().min(1).max(2000),
@@ -24,6 +23,13 @@ export const presentChoicesParameters = z
         code: "custom",
         path: ["options"],
         message: "New choices need at least one option",
+      });
+    if (input.refinementPanelId && input.options.length > 0)
+      ctx.addIssue({
+        code: "custom",
+        path: ["options"],
+        message:
+          "Refining a panel reuses the original options; leave options empty and supply only refinementPanelId",
       });
   });
 export function presentChoicesTool(
@@ -59,19 +65,28 @@ export function presentChoicesTool(
                 const observed = await jev.evidenceText(owner, threadId, turnId, "web", source.url);
                 if (!observed)
                   throw new Error(`Read the source page before comparing: ${source.url}`);
-                const text = normalizeExcerpt(observed);
-                if (!text.includes(normalizeExcerpt(source.title)))
+                // The tool description promises exact excerpts, so the
+                // check is an exact substring match on the read text —
+                // not a normalised one. A label, title, or detail that
+                // differs in case or spacing is not the excerpt it claims.
+                if (!observed.includes(source.title))
                   throw new Error(
                     `Comparison source title is not present in source text: ${source.url}`,
                   );
-                texts.push(text);
+                texts.push(observed);
               }
-              if (!texts.some((observed) => observed.includes(normalizeExcerpt(option.label))))
-                throw new Error(`Comparison label is not present in source text: ${option.label}`);
+              // The label is grounded in every source the option cites,
+              // not just any one of them: a source that never mentions
+              // the label cannot evidence it.
+              for (const text of texts)
+                if (!text.includes(option.label))
+                  throw new Error(
+                    `Comparison label is not present in source text: ${option.label}`,
+                  );
               if (!option.details.length)
                 throw new Error(`Comparison needs at least one grounded detail: ${option.label}`);
               for (const detail of option.details)
-                if (!texts.some((observed) => observed.includes(normalizeExcerpt(detail))))
+                if (!texts.some((observed) => observed.includes(detail)))
                   throw new Error(
                     `Comparison detail is not present in source text: ${option.label}`,
                   );

@@ -12,6 +12,28 @@ export const schoolTripFixture = {
 
 // Facts checked against the aquarium's public exhibit pages on 2026-09-23.
 // These records make sample decisions repeatable; they do not represent a live Jev response.
+export const aquariumFixtureCheckedAt = "2026-09-23";
+
+/** Exhibit facts go stale when the aquarium's pages change: past this many
+ * days since the last check, sample mode warns instead of deciding quietly. */
+export const AQUARIUM_FIXTURE_STALE_DAYS = 90;
+
+/** Freshness of the aquarium fixture facts against a date (default now):
+ * the checked date, the age in whole days, and whether a re-check is due. */
+export function aquariumFixtureFreshness(now: Date = new Date()): {
+  checkedAt: string;
+  ageDays: number;
+  stale: boolean;
+} {
+  const ageDays = Math.floor(
+    (now.getTime() - new Date(`${aquariumFixtureCheckedAt}T00:00:00Z`).getTime()) / 86_400_000,
+  );
+  return {
+    checkedAt: aquariumFixtureCheckedAt,
+    ageDays,
+    stale: ageDays > AQUARIUM_FIXTURE_STALE_DAYS,
+  };
+}
 export const aquariumFixture = {
   indexUrl: "https://www.montereybayaquarium.org/visit/exhibits",
   options: [

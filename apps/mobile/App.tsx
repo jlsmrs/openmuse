@@ -405,18 +405,20 @@ function WorkspaceShell({
                       Side chat
                     </Text>
                   )}
-                  {visited.map((thread) => (
-                    <View
-                      key={thread.id}
-                      style={{ display: selection.id === thread.id ? "flex" : "none", flex: 1 }}
-                    >
-                      <ChatScreen
-                        thread={thread}
-                        active={section === "chat" && selection.id === thread.id}
-                        prompt={selection.id === thread.id ? prompt : undefined}
-                      />
-                    </View>
-                  ))}
+                  {/* Only the selected thread stays mounted; a hidden thread
+                      mounts a full ChatScreen for nothing. Switching back
+                      remounts and re-hydrates it from the thread. */}
+                  {visited
+                    .filter((thread) => thread.id === selection.id)
+                    .map((thread) => (
+                      <View key={thread.id} style={{ display: "flex", flex: 1 }}>
+                        <ChatScreen
+                          thread={thread}
+                          active={section === "chat" && selection.id === thread.id}
+                          prompt={selection.id === thread.id ? prompt : undefined}
+                        />
+                      </View>
+                    ))}
                 </>
               ) : (
                 <ChatScreen prompt={prompt} active={section === "chat"} />

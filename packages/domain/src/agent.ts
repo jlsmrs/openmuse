@@ -147,7 +147,17 @@ export type CreateTaskInput = z.infer<typeof createTaskSchema>;
 export const monitorInputSchema = z
   .object({
     title: z.string().min(1).max(160),
-    url: z.url().max(4096),
+    url: z
+      .string()
+      .url()
+      .max(4096)
+      .refine((value) => {
+        // http(s) for real pages; sample: is the in-app fixture scheme used
+        // by sample-mode monitors (service.ts rejects sample: in live mode
+        // and unknown sample sources, so this stays a syntactic guard).
+        const protocol = new URL(value).protocol;
+        return protocol === "http:" || protocol === "https:" || protocol === "sample:";
+      }, "Monitor URL must use HTTP, HTTPS, or the sample fixture scheme"),
     condition: z.enum(["change", "contains", "price_below"]).default("change"),
     value: z.string().max(300).default(""),
     intervalMinutes: z.number().int().min(1).max(10080).default(15),

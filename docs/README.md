@@ -11,6 +11,8 @@ The demos follow a request from chat to the agent's inline browser, then show ho
 - [Quick start and architecture](../README.md)
 - [Native iOS / Android / web setup](../apps/mobile/README.md)
 - [Browser worker, API, persistence, and network boundary](../apps/worker/README.md)
+- [Azure browser worker deployment](AZURE-WORKER.md)
+- [Local stack: worker, API, and web app](LOCAL-STACK.md)
 - [Linux computer, terminal, and workspace files](COMPUTER.md)
 - [CopilotKit Rich Threads](RICH-THREADS.md)
 - [Interaction design and conversation behavior](EXPERIENCE.md)

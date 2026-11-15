@@ -88,5 +88,11 @@ export function encodeJevAction(action: JevAction): string {
 }
 export function parseJevAction(text: string): JevAction | null {
   if (!text.startsWith(jevActionPrefix)) return null;
-  return jevActionSchema.parse(JSON.parse(text.slice(jevActionPrefix.length)));
+  try {
+    return jevActionSchema.parse(JSON.parse(text.slice(jevActionPrefix.length)));
+  } catch {
+    // A malformed prefixed action is unreadable, not fatal: the caller
+    // already handles null ("The choice could not be read").
+    return null;
+  }
 }

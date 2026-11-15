@@ -173,6 +173,7 @@ test("CopilotKit model worker executes server tools and persists the confirmed o
         title: "Sample walk",
         start: "2026-10-10T10:00:00-07:00",
         end: "2026-10-10T11:00:00-07:00",
+        timeZone: "America/Los_Angeles",
       },
     });
     const appointment = await server.agent.createTask("owner", {
@@ -332,6 +333,7 @@ test("replaying a completed prepared action returns its receipt without reopenin
     title: "Sample walk",
     start: "2026-10-10T10:00:00-07:00",
     end: "2026-10-10T11:00:00-07:00",
+    timeZone: "America/Los_Angeles",
   };
   let calls: ({ name: string; arguments: object } | undefined)[] = [
     { name: "prepare_event", arguments: draft },

@@ -15,6 +15,8 @@
 // BMP and TIFF are converted to PNG first (BMP by the pure-JS decoder in
 // bmp.ts, TIFF by geotiff), because the models do not accept those formats.
 // Anything else, or anything that fails conversion, is refused plainly.
+// A GIF is sent as a single still: only its first frame reaches the model,
+// and the reply says so.
 //
 // Limits are plain and cross-provider: Anthropic caps an image at 5 MB, the
 // strictest of the three supported providers, so 5 MB is the cap for all.
@@ -195,7 +197,14 @@ export async function visionParts(
   mimeType: string,
   bytes: Uint8Array,
 ): Promise<VisionResult> {
-  if (isVisionMime(mimeType)) return imageParts(name, mimeType, bytes);
+  if (isVisionMime(mimeType)) {
+    const result = imageParts(name, mimeType, bytes);
+    // A GIF is sent as one still image: disclose that only its first frame
+    // is visible, so the model is never asked about motion it cannot see.
+    if (mimeType === "image/gif")
+      appendTextNote(result, "Only the first frame of this animated GIF is shown.");
+    return result;
+  }
   if (mimeType === "image/bmp") {
     const decoded = bmpToRgb(bytes);
     if (!decoded.ok) return { error: decoded.error };

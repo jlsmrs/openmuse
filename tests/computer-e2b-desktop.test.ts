@@ -84,6 +84,7 @@ function fake(
     stdin: [] as Uint8Array[],
     closed: 0,
     kills: 0,
+    sandboxKills: [] as string[],
     streams: [] as (string | undefined)[],
   };
   const add = (info: Partial<DesktopInfo>) => {
@@ -202,6 +203,11 @@ function fake(
       (boxes.get(id) as DesktopInfo).state = "paused";
       desktops.set(id, false);
     },
+    async kill(id) {
+      calls.sandboxKills.push(id);
+      boxes.delete(id);
+      desktops.delete(id);
+    },
     async connect(id, timeoutMs) {
       calls.connect.push({ id, timeoutMs });
       // Sandbox.connect resumes a paused box.
@@ -295,6 +301,29 @@ test("stop pauses without connecting, which would resume the box", async () => {
   await assert.rejects(computer.execute(owner, { command: "pwd" }), /Start the computer/);
 });
 
+test("forget deletes the owned desktop after confirming its labels", async () => {
+  const f = fake({ boxes: [{}] });
+  const { computer, owner } = service(f);
+  await computer.start(owner);
+  assert.equal((await computer.forget(owner)).status, "stopped");
+  assert.deepEqual(f.calls.sandboxKills, ["sbx-1"]);
+  assert.equal((await computer.snapshot(owner)).status, "stopped");
+});
+
+test("forget refuses a box whose labels do not match this deployment", async () => {
+  const f = fake({ boxes: [{ metadata: { ...labels, "dev.openmuse.extra": "x" } }] });
+  const { computer, owner } = service(f);
+  await assert.rejects(computer.forget(owner), { status: 409 });
+  assert.deepEqual(f.calls.sandboxKills, []);
+});
+
+test("forget of a missing desktop is a no-op", async () => {
+  const f = fake({ boxes: [] });
+  const { computer, owner } = service(f);
+  assert.equal((await computer.forget(owner)).status, "stopped");
+  assert.deepEqual(f.calls.sandboxKills, []);
+});
+
 test("attaching fails closed on duplicates, foreign metadata, template or lifecycle", async () => {
   for (const boxes of [
     [{}, { sandboxId: "second" }],
@@ -378,18 +407,20 @@ test("the in-box wrapper keeps quoting, exit codes and does not wait for backgro
   assert.match(runaway.stderr, /Output exceeded the limit/);
 });
 
-test("exit 124 is timed_out and leaves the box running, like Docker", async () => {
+test("a command exiting 124 is failed, not timed_out, and leaves the box running", async () => {
   const f = fake({ boxes: [{}], run: () => 124 });
   const { computer, owner } = service(f);
-  assert.equal((await computer.execute(owner, { command: "sleep 40" })).status, "timed_out");
+  const result = await computer.execute(owner, { command: "exit 124" });
+  assert.equal(result.status, "failed");
+  assert.equal(result.exitCode, 124);
   assert.equal(f.calls.pause.length, 0);
   assert.equal((await computer.snapshot(owner)).status, "running");
 });
 
-test("only a deadline TimeoutError is timed_out; any other stream loss is interrupted", async () => {
+test("any TimeoutError is timed_out; any other stream loss is interrupted", async () => {
   for (const [error, status] of [
     [new TimeoutError("[deadline_exceeded] the operation timed out"), "timed_out"],
-    [new TimeoutError("[unavailable] connection reset"), "interrupted"],
+    [new TimeoutError("[unavailable] connection reset"), "timed_out"],
     [new Error("socket hang up"), "interrupted"],
   ] as const) {
     const f = fake({
@@ -633,6 +664,27 @@ test("a Stop between find and use fails the operation instead of resuming the bo
   assert.equal(f.calls.connect.length, 2);
 });
 
+test("a command whose box pauses mid-flight is a paused receipt, not failed", async () => {
+  let pauseNext = false;
+  const f = fake({
+    boxes: [{}],
+    afterInfo: (id) => {
+      if (!pauseNext) return;
+      pauseNext = false;
+      void f.driver.pause(id);
+    },
+  });
+  const { computer, owner } = service(f);
+  await computer.start(owner);
+  pauseNext = true;
+  const result = await computer.execute(owner, { command: "pwd" });
+  assert.equal(result.status, "paused");
+  assert.equal(result.exitCode, undefined);
+  assert.match(result.stderr, /Start the computer/);
+  assert.equal(f.calls.pause.length, 1, "the paused box is not stopped again");
+  assert.equal((await computer.snapshot(owner)).status, "stopped");
+});
+
 test("a fresh process connects once and never pauses a missing desktop session", async () => {
   const f = fake({ boxes: [{}] });
   const { computer, owner, restarted } = service(f);
@@ -801,6 +853,17 @@ test("each desktop action maps to one xdotool call; coordinates and keys are val
     assert.equal(desktopActionSchema.safeParse(bad).success, false, JSON.stringify(bad));
 });
 
+test("a screenshot action ignores out-of-bounds coordinates", () => {
+  assert.equal(
+    desktopActionSchema.safeParse({ action: "screenshot", coordinate: [2000, 900] }).success,
+    true,
+  );
+  assert.equal(
+    desktopActionSchema.safeParse({ action: "left_click", coordinate: [2000, 900] }).success,
+    false,
+  );
+});
+
 test("a desktop action runs with a screenshot after it, leaves a receipt and keeps the image", async () => {
   const f = fake({ boxes: [{}] });
   const { computer, owner } = service(f);
@@ -854,6 +917,55 @@ test("a failed screenshot is reported and recorded; a stopped box is never resum
   assert.deepEqual((await paused.computer.snapshot(paused.owner)).commands, []);
   await assert.rejects(paused.computer.latestScreenshot(paused.owner), { status: 404 });
   await assert.rejects(new ComputerService(db, base).desktopAction(owner, {}), /no desktop/);
+});
+
+test("a screenshot failure on a sessionless box is the 409 session error, not a generic 502", async () => {
+  let pgrepCalls = 0;
+  const f = fake({
+    boxes: [{}],
+    setupExit: (command) => {
+      if (command.includes("scrot")) return 4;
+      if (command === "pgrep -x xfce4-session >/dev/null") return ++pgrepCalls === 1 ? 0 : 1;
+      return 0;
+    },
+  });
+  const { computer, owner } = service(f);
+  await assert.rejects(computer.desktopAction(owner, { action: "screenshot" }), {
+    status: 409,
+    message: "The desktop session is unavailable. Start the computer to restore it.",
+  });
+  assert.equal(f.boxes.get("sbx-1")?.state, "running");
+});
+
+test("a box that pauses before the screenshot maps to the 409 session error", async () => {
+  const f = fake({
+    boxes: [{}],
+    setupEffect: async (command) => {
+      if (!command.includes("scrot")) return;
+      await f.driver.pause("sbx-1");
+      throw new Error("Sandbox not found");
+    },
+  });
+  const { computer, owner } = service(f);
+  await computer.start(owner);
+  await assert.rejects(computer.desktopAction(owner, { action: "screenshot" }), {
+    status: 409,
+    message: "The desktop session is unavailable. Start the computer to restore it.",
+  });
+  assert.equal(f.boxes.get("sbx-1")?.state, "paused");
+  assert.deepEqual((await computer.snapshot(owner)).commands, []);
+});
+
+test("latestScreenshot with an empty legacy record is a 404, not an empty image", async () => {
+  const f = fake({ boxes: [{}] });
+  const { computer, owner } = service(f);
+  await db.put(owner, "computer-desktop-screens", {
+    id: "latest",
+    receiptId: "receipt-1",
+    mimeType: "image/jpeg",
+    data: "",
+  });
+  await assert.rejects(computer.latestScreenshot(owner), { status: 404 });
 });
 
 // Models the root cause: Sandbox.create puts DISPLAY in the sandbox env, and a resumed
@@ -1040,7 +1152,11 @@ test("transient keepAlive errors remain provider failures on a running computer"
   const f = fake({ boxes: [{}], keepAliveError: new Error("rate limited") });
   const { computer, owner } = service(f);
   await computer.start(owner);
-  await assert.rejects(computer.desktopUrl(owner), { status: 503 });
+  const error = await computer.desktopUrl(owner).catch((caught: unknown) => caught);
+  assert.ok(error instanceof AppError);
+  assert.equal(error.status, 503);
+  assert.match(error.message, /rate limited/);
+  assert.doesNotMatch(error.message, /Check E2B_API_KEY/);
   assert.equal((await computer.snapshot(owner)).status, "running");
   assert.equal(f.calls.connect.length, 1);
 });

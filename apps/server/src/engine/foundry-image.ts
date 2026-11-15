@@ -31,6 +31,53 @@ const imageParams = z.object({
   filename: z.string().trim().max(100).optional(),
 });
 
+/** Timeout for downloading a provider-supplied image URL. */
+export const FOUNDRY_IMAGE_FETCH_TIMEOUT_MS = 60_000;
+/** Maximum generated-image bytes written to disk: a gpt-image-2 PNG at the
+ * largest offered size is a few MB, so 25 MB is generous headroom and still
+ * bounds what one tool call can materialize. */
+export const FOUNDRY_IMAGE_MAX_BYTES = 25 * 1024 * 1024;
+
+/** Download a provider-supplied image URL with the guards the direct fetch
+ * lacked: https-only, a timeout, and a streamed byte cap (a lying
+ * Content-Length cannot smuggle a larger body past the cap). */
+export async function downloadImageBytes(url: string): Promise<Buffer> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error("Image generation returned an invalid image URL.");
+  }
+  if (parsed.protocol !== "https:")
+    throw new Error("Image generation returned a non-https image URL; refusing to fetch it.");
+  const res = await fetch(url, { signal: AbortSignal.timeout(FOUNDRY_IMAGE_FETCH_TIMEOUT_MS) });
+  if (!res.ok) throw new Error(`Image download failed: HTTP ${res.status}.`);
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > FOUNDRY_IMAGE_MAX_BYTES)
+    throw new Error(
+      `Image generation returned an image over the ${FOUNDRY_IMAGE_MAX_BYTES / (1024 * 1024)} MB limit.`,
+    );
+  if (!res.body) throw new Error("Image download failed: no response body.");
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (value) {
+      total += value.length;
+      if (total > FOUNDRY_IMAGE_MAX_BYTES) {
+        await reader.cancel();
+        throw new Error(
+          `Image generation returned an image over the ${FOUNDRY_IMAGE_MAX_BYTES / (1024 * 1024)} MB limit.`,
+        );
+      }
+      chunks.push(value);
+    }
+  }
+  return Buffer.concat(chunks);
+}
+
 export const generateImageTool = defineTool({
   name: "generate_image",
   description:
@@ -65,9 +112,18 @@ export const generateImageTool = defineTool({
     const item = payload.data?.[0];
     if (!item) return { error: "Image generation returned no image." };
     if (!item.b64_json && !item.url) return { error: "Image generation returned no image data." };
-    const raw = item.b64_json
-      ? Buffer.from(item.b64_json, "base64")
-      : Buffer.from(await (await fetch(item.url as string)).arrayBuffer());
+    let raw: Buffer;
+    try {
+      raw = item.b64_json
+        ? Buffer.from(item.b64_json, "base64")
+        : await downloadImageBytes(item.url as string);
+    } catch (error) {
+      return { error: error instanceof Error ? error.message : "Image download failed." };
+    }
+    if (raw.length > FOUNDRY_IMAGE_MAX_BYTES)
+      return {
+        error: `Image generation returned an image over the ${FOUNDRY_IMAGE_MAX_BYTES / (1024 * 1024)} MB limit.`,
+      };
     const dir = join(process.env.DATA_DIR || ".openmuse", "generated-images");
     await mkdir(dir, { recursive: true });
     const safe = (filename || `image-${Date.now()}`).replace(/[^A-Za-z0-9._-]/g, "_");
