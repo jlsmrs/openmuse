@@ -119,7 +119,7 @@ export async function createWorkerServer(
       }
       if (pathname === "/sessions" && request.method === "POST") {
         const body = await readBody(request);
-        json(201, await browser.create(validateSessionId(body.id), requiredUrl(body)));
+        json(201, await browser.create(validateSessionId(body.id), requiredUrl(body), body.engine));
         return;
       }
       const match =
