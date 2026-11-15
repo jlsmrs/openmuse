@@ -1,10 +1,12 @@
-import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { readdirSync } from "node:fs";
+import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { Browser, BrowserContext, Page } from "playwright";
 import {
   capturePdfDownload,
   MAX_DOWNLOAD_BYTES,
   type PdfDownload,
+  quarantineFile,
   readDownloadFailures,
 } from "./downloads.ts";
 import { WorkerError } from "./errors.ts";
@@ -24,6 +26,11 @@ type Running = {
   touched: number;
   pending: Set<Promise<void>>;
   downloadError?: boolean;
+  // Downloads started since this session opened. navigate() records the
+  // count before goto and treats a higher count afterwards as proof the
+  // navigation turned into a download — no string-matching on
+  // Playwright's error text.
+  downloadCount: number;
   // Set in Obscura mode: the CDP connection behind the context. Closing the
   // context alone does not drop it, so closeSession closes both.
   browser?: Browser;
@@ -171,15 +178,35 @@ export function validateSessionId(id: unknown): string {
   return id.toLowerCase();
 }
 
+/**
+ * A stored session.json is only trusted when it has the Session shape.
+ * A bare cast lets a malformed file into list() and into later close
+ * results; malformed files are quarantined by the caller instead.
+ */
+function parseStoredSession(value: unknown): Omit<Session, "id"> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const { title, url, status, updatedAt } = value as Partial<Session>;
+  if (typeof title !== "string" || typeof url !== "string" || typeof updatedAt !== "string")
+    return null;
+  if (status !== "active" && status !== "closed" && status !== "error") return null;
+  return { title, url, status, updatedAt };
+}
+
 export async function createBrowserManager(
   options: {
     dataDir: string;
     maxSessions?: number;
     idleTimeoutMs?: number;
+    /**
+     * Total-download quota in bytes, enforced by evicting the oldest
+     * PDFs first after each publish (G2). Undefined means no total
+     * quota is enforced.
+     */
+    downloadQuotaBytes?: number;
   },
   createProxy = startEgressProxy,
 ) {
-  const { dataDir, maxSessions = 3, idleTimeoutMs = 30 * 60_000 } = options;
+  const { dataDir, maxSessions = 3, idleTimeoutMs = 30 * 60_000, downloadQuotaBytes } = options;
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const sessions = new Map<string, Session>();
   const running = new Map<string, Running>();
@@ -191,27 +218,44 @@ export async function createBrowserManager(
   // note at the CDP attach site); the worker-side URL-validation layer
   // still guards every navigation and subrequest on top of it.
   const proxy = obscura ? { url: "", close: async () => {} } : await createProxy();
+  const directory = (id: string) => join(dataDir, validateSessionId(id));
+  // The per-session temp download dir. Published downloads live under the
+  // session dir; this holds only in-flight Chromium files.
+  const tempDirectoryFor = (id: string) =>
+    join("/tmp", `openmuse-downloads-${validateSessionId(id)}`);
   for (const id of await readdir(dataDir)) {
     if (!SESSION_ID.test(id)) continue;
+    const sessionPath = join(dataDir, id, "session.json");
+    let stored: unknown;
     try {
-      const stored = JSON.parse(
-        await readFile(join(dataDir, id, "session.json"), "utf8"),
-      ) as Session;
-      sessions.set(id, { ...stored, id, status: "closed" });
+      stored = JSON.parse(await readFile(sessionPath, "utf8"));
     } catch {
       /* An incomplete first launch has no session metadata to restore. */
+      continue;
     }
-    if (sessions.has(id)) {
-      try {
-        await readDownloadFailures(join(dataDir, id), true);
-      } catch {
-        // Startup recovery must not kill the worker: a corrupt outcome is
-        // already quarantined by readDownloadFailures, and the failures
-        // list is rebuilt on the next downloads call.
-      }
+    const valid = parseStoredSession(stored);
+    if (!valid) {
+      // Never serve a malformed stored session: move it aside for the
+      // operator and treat the profile as unrestored.
+      await quarantineFile(sessionPath).catch(() => {});
+      continue;
+    }
+    sessions.set(id, { ...valid, id, status: "closed" });
+    try {
+      await readDownloadFailures(join(dataDir, id), true);
+    } catch {
+      // Startup recovery must not kill the worker: a corrupt outcome is
+      // already quarantined by readDownloadFailures, and the failures
+      // list is rebuilt on the next downloads call.
     }
   }
-  const directory = (id: string) => join(dataDir, validateSessionId(id));
+  // Sweep temp dirs left behind by crashed runs. Only sessions this
+  // worker owns (restored from its own dataDir) are swept — another
+  // worker sharing /tmp may own other ids, and its live temp dirs must
+  // not be touched.
+  for (const id of sessions.keys()) {
+    await rm(tempDirectoryFor(id), { recursive: true, force: true }).catch(() => {});
+  }
   async function persist(session: Session) {
     const path = join(directory(session.id), "session.json");
     await writeFile(`${path}.tmp`, JSON.stringify(session), { mode: 0o600 });
@@ -260,8 +304,26 @@ export async function createBrowserManager(
     const list: PdfDownload[] = [];
     for (const name of await readdir(folder)) {
       if (!name.endsWith(".json")) continue;
-      const item = JSON.parse(await readFile(join(folder, name), "utf8")) as PdfDownload;
-      list.push(item);
+      const path = join(folder, name);
+      try {
+        const value: unknown = JSON.parse(await readFile(path, "utf8"));
+        if (typeof value !== "object" || value === null || Array.isArray(value))
+          throw new Error("Invalid download metadata");
+        const { id: itemId, name: itemName, size, mimeType } = value as Partial<PdfDownload>;
+        if (
+          typeof itemId !== "string" ||
+          typeof itemName !== "string" ||
+          typeof size !== "number" ||
+          mimeType !== "application/pdf"
+        )
+          throw new Error("Invalid download metadata");
+        list.push(value as PdfDownload);
+      } catch {
+        // One corrupt metadata file must not fail the whole list (the
+        // same per-file quarantine M-B3 gave the outcome files): move it
+        // aside and keep the healthy downloads.
+        await quarantineFile(path).catch(() => {});
+      }
     }
     return list;
   }
@@ -269,6 +331,7 @@ export async function createBrowserManager(
     const target = await validatePublicUrl(url);
     const instance = active(id);
     const { page } = instance;
+    const downloadsBefore = instance.downloadCount;
     try {
       // Obscura 0.2.6 cookie bug (verified by local probes, Nov 13, 2026):
       // once a cookie exists for a domain, every later request to that
@@ -296,12 +359,26 @@ export async function createBrowserManager(
     } catch (error) {
       if (error instanceof WorkerError && error.code === "BLOCKED_URL") {
         await page.goto("about:blank", { timeout: 5000 });
+        // A redirect to a blocked destination keeps the distinct code so
+        // the API/UI can tell it apart from an unreachable page.
+        throw error;
       }
-      // A successful attachment intentionally aborts page navigation.
-      if (!(error instanceof Error && /Download is starting/.test(error.message))) {
+      // A successful attachment intentionally aborts page navigation. The
+      // download event — not Playwright's error text — is the signal: a
+      // download that started during this navigation means the navigation
+      // "failed" only because the attachment took over. The goto rejection
+      // can win the race with the event (both land in the same millisecond),
+      // so give the event a brief grace period before calling it a failure.
+      if (instance.downloadCount <= downloadsBefore) {
+        for (let waited = 0; waited < 500; waited += 25) {
+          await new Promise((resolve) => setTimeout(resolve, 25));
+          if (instance.downloadCount > downloadsBefore) break;
+        }
+      }
+      if (instance.downloadCount <= downloadsBefore) {
         throw new WorkerError(
           "NAVIGATION_FAILED",
-          "The page could not be loaded. It may be unreachable or contain a blocked destination.",
+          "The page could not be loaded. It may be unreachable.",
           502,
         );
       }
@@ -314,7 +391,11 @@ export async function createBrowserManager(
     if (!stored) throw new WorkerError("SESSION_NOT_FOUND", "Browser session not found.", 404);
     if (instance) {
       try {
-        await instance.context.storageState({ path: join(directory(id), "storage.json") });
+        const statePath = join(directory(id), "storage.json");
+        await instance.context.storageState({ path: statePath });
+        // Playwright writes the cookie jar with the process umask; pin it
+        // to owner-only like session.json and download files.
+        await chmod(statePath, 0o600);
       } catch {
         // Cookie persistence is best-effort during teardown. A crashed or
         // unreachable browser must still release its context and session slot.
@@ -324,6 +405,10 @@ export async function createBrowserManager(
       await Promise.allSettled(instance.pending);
       running.delete(id);
     }
+    // The temp dir holds only in-flight Chromium files; published
+    // downloads live under the session dir, so it is safe to remove once
+    // the context is closed and pending captures have settled.
+    await rm(tempDirectoryFor(id), { recursive: true, force: true }).catch(() => {});
     const result: Session = { ...stored, status: "closed", updatedAt: new Date().toISOString() };
     sessions.set(id, result);
     await persist(result);
@@ -346,14 +431,23 @@ export async function createBrowserManager(
       );
     const previous = sessions.get(id);
     const profileDir = join(directory(id), "profile");
-    const tempDirectory = join("/tmp", `openmuse-downloads-${id}`);
+    const tempDirectory = tempDirectoryFor(id);
     // Obscura is zero-state: no profile directory is created. The session
     // directory itself is still needed for session.json and storage.json.
-    // The temp directory is only used by the oversized-download monitor,
-    // which watches the browser's downloadsPath — in Obscura mode the
-    // remote browser downloads elsewhere, so nothing ever lands there.
+    // The temp directory holds only in-flight Chromium files — the
+    // download handler diffs it for .crdownload files and the
+    // oversized-download monitor watches them. In Obscura mode the
+    // remote browser downloads elsewhere, so nothing ever lands there
+    // and the directory is not created at all.
     await mkdir(obscura ? directory(id) : profileDir, { recursive: true, mode: 0o700 });
     if (!obscura) await mkdir(tempDirectory, { recursive: true, mode: 0o700 });
+    // Files already in the temp dir predate this session (stale leftovers
+    // the startup sweep missed); they belong to no capture here. In
+    // Obscura mode the temp dir is never created (the remote browser
+    // downloads elsewhere), so there is nothing to snapshot.
+    const knownTempFiles = obscura
+      ? new Set<string>()
+      : new Set<string>(await readdir(tempDirectory));
     let context: BrowserContext;
     let remoteBrowser: Browser | null = null;
     try {
@@ -402,11 +496,12 @@ export async function createBrowserManager(
           // is written in full to the remote container's disk before
           // the worker-side stream cap (10 MiB in capturePdfDownload)
           // stops the worker's own copy — the cap bounds what the
-          // worker writes, not what the remote browser writes, and
-          // the temp-directory oversized monitor cannot observe the
-          // remote file growing, so nothing cancels the transfer
-          // mid-download. The remote file is deleted after the
-          // transfer (download.delete), so the exposure is transient
+          // worker writes, not what the remote browser writes. The
+          // temp-directory oversized monitor (the backstop for a
+          // stalled stream) has no temp files to watch in Obscura
+          // mode, so it cannot cancel the remote transfer either.
+          // The remote file is deleted after the transfer
+          // (download.delete), so the exposure is transient
           // disk use on the Obscura container, not worker disk use.
         });
       } else {
@@ -419,7 +514,12 @@ export async function createBrowserManager(
           },
           headless: true,
           viewport: { width: 1280, height: 800 },
-          proxy: { server: proxy.url, bypass: "<-loopback>" },
+          // No loopback bypass: loopback destinations are routed through the
+          // egress proxy like everything else, so the proxy's pinned-IP
+          // validation — not just the Playwright route hook — enforces the
+          // public-only rule. A direct loopback connection could otherwise
+          // reach the worker's own API port or other local services.
+          proxy: { server: proxy.url },
           serviceWorkers: "block",
           acceptDownloads: true,
           downloadsPath: tempDirectory,
@@ -479,6 +579,7 @@ export async function createBrowserManager(
         page,
         touched: Date.now(),
         pending: new Set(),
+        downloadCount: 0,
         browser: remoteBrowser ?? undefined,
         obscura: obscura !== null,
       };
@@ -490,17 +591,45 @@ export async function createBrowserManager(
         void dialog.dismiss();
       });
       page.on("download", (download) => {
+        instance.downloadCount++;
+        // Chromium names an in-flight download <uuid>.crdownload, and that
+        // UUID is not exposed by the Download object — so the files
+        // belonging to this capture are established by diffing the temp dir
+        // synchronously when the event fires (the file already exists at
+        // that point). Anything seen before belongs to a stale leftover or
+        // an earlier concurrent download and is never monitored.
+        let captureFiles: string[] = [];
+        try {
+          const fresh = readdirSync(tempDirectory);
+          captureFiles = fresh.filter(
+            (name) => name.endsWith(".crdownload") && !knownTempFiles.has(name),
+          );
+          for (const name of fresh) knownTempFiles.add(name);
+        } catch {
+          // A missing temp dir means there is nothing to monitor; the
+          // pipeline byte counter still enforces the cap.
+        }
         const pending = downloads(id).then((saved) =>
           capturePdfDownload({
             directory: directory(id),
+            dataDir,
+            quotaBytes: downloadQuotaBytes,
             tempDirectory,
+            tempFiles: captureFiles,
             download,
             limitReached: saved.length + instance.pending.size > 20,
           }),
         );
         instance.pending.add(pending);
         void pending.then(
-          () => instance.pending.delete(pending),
+          () => {
+            // The store answered again: a later success clears a sticky
+            // download-store failure instead of failing every list until
+            // the session is closed. The failure itself stays recorded in
+            // the download-outcomes list.
+            instance.downloadError = false;
+            instance.pending.delete(pending);
+          },
           () => {
             instance.downloadError = true;
             instance.pending.delete(pending);
