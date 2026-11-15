@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { Transform } from "node:stream";
+import { Readable, Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import type { Download } from "playwright";
 
@@ -190,6 +190,119 @@ export async function readDownloadFailures(directory: string, recoverInterrupted
   return failures.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
 }
 
+/**
+ * Persist a failed download outcome, remove any partial PDF for it, and
+ * trim the failure history to the 100 most recent. Extracted from
+ * capturePdfDownload's catch, which now delegates here (the helper also
+ * creates the outcomes folder, which the caller had already done).
+ */
+export async function recordDownloadFailure(
+  directory: string,
+  failure: DownloadFailure,
+): Promise<void> {
+  const outcomes = join(directory, "download-outcomes");
+  await mkdir(outcomes, { recursive: true, mode: 0o700 });
+  const outcome: Outcome = { ...failure, status: "failed" };
+  await persist(join(outcomes, `${outcome.id}.json`), outcome);
+  await rm(join(directory, "downloads", `${outcome.id}.pdf`), { force: true });
+  // Keep a bounded recent failure history alongside the bounded PDF store.
+  for (const stale of (await readDownloadFailures(directory)).slice(100)) {
+    await rm(join(outcomes, `${stale.id}.json`), { force: true });
+  }
+}
+
+/** Ids of the PDFs currently published under a session directory. */
+export async function listPublishedDownloadIds(directory: string): Promise<Set<string>> {
+  const folder = join(directory, "downloads");
+  const ids = new Set<string>();
+  for (const name of await readdir(folder).catch(() => [])) {
+    if (name.endsWith(".json")) ids.add(name.slice(0, -".json".length));
+  }
+  return ids;
+}
+
+const UNSAFE_FILENAME = /[^a-zA-Z0-9._ -]/g;
+
+/**
+ * The display name for a download from its response: the
+ * `content-disposition` filename when present (quoted, bare, or RFC 5987
+ * `filename*=UTF-8''...`), else the URL's basename, else `"download"`.
+ * Sanitized exactly the way capturePdfDownload sanitizes
+ * suggestedFilename, so a failure record and a published download for
+ * the same file carry the same name.
+ */
+export function downloadFilenameFromResponse(
+  url: string,
+  contentDisposition: string | undefined,
+): string {
+  let candidate = "";
+  if (contentDisposition) {
+    const extended = /filename\*\s*=\s*([^;]+)/i.exec(contentDisposition);
+    if (extended) {
+      // Strip the charset'language' prefix (RFC 5987), then percent-decode.
+      const encoded = extended[1].trim().replace(/^[^']*'[^']*'/, "");
+      try {
+        candidate = decodeURIComponent(encoded).trim();
+      } catch {
+        candidate = "";
+      }
+    }
+    if (!candidate) {
+      const simple = /filename\s*=\s*(?:"([^"]*)"|([^;\s]+))/i.exec(contentDisposition);
+      candidate = (simple?.[1] ?? simple?.[2] ?? "").trim();
+    }
+  }
+  if (!candidate) {
+    try {
+      const base = new URL(url).pathname.split("/").filter(Boolean).pop() ?? "";
+      candidate = decodeURIComponent(base).trim();
+    } catch {
+      candidate = "";
+    }
+  }
+  return candidate.replace(UNSAFE_FILENAME, "_").slice(0, 180) || "download";
+}
+
+/**
+ * Capture a download whose bytes are already in hand (the Obscura-native
+ * path: page.goto() returned the attachment Response and body() returned
+ * the bytes). Builds a minimal Download adapter and delegates to
+ * capturePdfDownload, so publish, marker-check, quota, outcome, and
+ * failure-trimming logic are shared, not duplicated. Returns true when
+ * the bytes were published as a PDF.
+ */
+export async function capturePdfDownloadFromBytes(options: {
+  directory: string;
+  tempDirectory: string;
+  limitReached: boolean;
+  dataDir?: string;
+  quotaBytes?: number;
+  url: string;
+  contentDisposition?: string;
+  bytes: Buffer;
+}): Promise<boolean> {
+  const { directory, tempDirectory, limitReached, dataDir, quotaBytes, url } = options;
+  const before = await listPublishedDownloadIds(directory);
+  await capturePdfDownload({
+    directory,
+    tempDirectory,
+    // Bytes are already in memory: no in-flight temp files to watch.
+    tempFiles: [],
+    download: {
+      suggestedFilename: () => downloadFilenameFromResponse(url, options.contentDisposition),
+      createReadStream: async () => Readable.from([options.bytes]),
+      cancel: async () => {},
+      delete: async () => {},
+    },
+    limitReached,
+    dataDir,
+    quotaBytes,
+  });
+  const after = await listPublishedDownloadIds(directory);
+  for (const id of after) if (!before.has(id)) return true;
+  return false;
+}
+
 export async function capturePdfDownload(options: {
   directory: string;
   tempDirectory: string;
@@ -313,13 +426,8 @@ export async function capturePdfDownload(options: {
       outcome.code = "DOWNLOAD_TOO_LARGE";
       outcome.message = "The download exceeds 10 MiB. Choose a smaller PDF.";
     }
-    outcome.status = "failed";
-    await persist(outcomePath, outcome);
-    await rm(destination, { force: true });
-    // Keep a bounded recent failure history alongside the bounded PDF store.
-    for (const stale of (await readDownloadFailures(directory)).slice(100)) {
-      await rm(join(outcomes, `${stale.id}.json`), { force: true });
-    }
+    const { status: _status, ...failure } = outcome;
+    await recordDownloadFailure(directory, failure);
   } finally {
     clearInterval(monitor);
     await download.delete().catch(() => {});

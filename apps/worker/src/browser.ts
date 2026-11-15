@@ -1,13 +1,18 @@
+import { randomUUID } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { chmod, mkdir, readdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { Browser, BrowserContext, Page } from "playwright";
+import type { Browser, BrowserContext, Download, LaunchOptions, Page, Response } from "playwright";
 import {
   capturePdfDownload,
+  capturePdfDownloadFromBytes,
+  downloadFilenameFromResponse,
+  listPublishedDownloadIds,
   MAX_DOWNLOAD_BYTES,
   type PdfDownload,
   quarantineFile,
   readDownloadFailures,
+  recordDownloadFailure,
 } from "./downloads.ts";
 import { WorkerError } from "./errors.ts";
 import { validatePublicUrl } from "./network.ts";
@@ -178,6 +183,358 @@ export function validateSessionId(id: unknown): string {
   return id.toLowerCase();
 }
 
+export type BrowserEngine = "obscura" | "chromium";
+
+/**
+ * Resolve the engine for a new session. Absent means the env-configured
+ * mode (Obscura if configured, else Chromium). An unknown value is a 400;
+ * "obscura" without Obscura config is a 503 — never a silent fall back
+ * to the other engine.
+ */
+export function resolveSessionEngine(engine: unknown, obscuraConfigured: boolean): BrowserEngine {
+  if (engine === undefined) return obscuraConfigured ? "obscura" : "chromium";
+  if (engine !== "obscura" && engine !== "chromium")
+    throw new WorkerError("INVALID_ENGINE", 'engine must be "obscura" or "chromium".', 400);
+  if (engine === "obscura" && !obscuraConfigured)
+    throw new WorkerError(
+      "BROWSER_UNAVAILABLE",
+      "Obscura is not configured on this worker, so an Obscura session cannot be created.",
+      503,
+    );
+  return engine;
+}
+
+/** Default Chromium launcher for the Obscura-mode download fallback. */
+async function defaultChromiumLauncher(options: LaunchOptions): Promise<Browser> {
+  const { chromium } = await import("playwright");
+  return chromium.launch(options);
+}
+
+function lowercaseHeaders(headers: Record<string, string>): Record<string, string> {
+  const lower: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) lower[key.toLowerCase()] = value;
+  return lower;
+}
+
+/**
+ * Whether a navigation Response is a download in Obscura mode: a
+ * content-disposition carrying `attachment`, or a PDF content-type
+ * (parameters after `;` ignored). Non-PDF content-types with no
+ * attachment disposition are not downloads for this worker (the store
+ * only accepts PDFs). Header names are matched case-insensitively;
+ * Playwright already lowercases them.
+ */
+export function isDownloadResponse(headers: Record<string, string>): boolean {
+  const lower = lowercaseHeaders(headers);
+  // Parse the disposition TYPE (before the first semicolon): matching
+  // the bare word "attachment" anywhere would also match an inline
+  // response whose filename merely contains it, e.g.
+  // `inline; filename="attachment-guide.html"`.
+  const disposition = lower["content-disposition"]?.split(";")[0]?.trim().toLowerCase();
+  if (disposition === "attachment") return true;
+  const contentType = lower["content-type"]?.split(";")[0]?.trim().toLowerCase();
+  return contentType === "application/pdf";
+}
+
+function parseContentLength(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined;
+  // Strict decimal syntax only: Number() would accept "0x10" (16),
+  // "1e3" (1000), and "" (0), none of which is a valid Content-Length.
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) return undefined;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed)) return undefined;
+  return parsed;
+}
+
+export interface ObscuraDownloadContext {
+  directory: string;
+  tempDirectory: string;
+  dataDir: string;
+  quotaBytes?: number;
+  limitReached: boolean;
+  ensureProxy: () => Promise<{ url: string; close: () => Promise<void> }>;
+  chromiumLauncher: (options: LaunchOptions) => Promise<Browser>;
+  /** How long the fallback waits for the download event (default 20 s). */
+  downloadWaitMs?: number;
+  /** How long the fallback waits for the capture to finish (default 20 s). */
+  captureWaitMs?: number;
+}
+
+const DOWNLOAD_INTERRUPTED_MESSAGE =
+  "The download was interrupted or could not be retrieved. Try downloading it again.";
+
+// Launch arguments shared by the per-session Chromium path and the
+// Obscura-mode download fallback (one copy so they cannot drift):
+// QUIC off, WebRTC non-proxied UDP disabled, no extensions, /dev/shm
+// crash guard, and the host-resolver rules that force every destination
+// through the proxy.
+const CHROMIUM_LAUNCH_ARGS = [
+  "--disable-quic",
+  "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+  "--disable-extensions",
+  "--disable-dev-shm-usage",
+  "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+];
+
+/**
+ * The environment a launched Chromium inherits: HOME, PATH, and LANG
+ * only. The worker's own environment (WORKER_TOKEN, OBSCURA_CDP_*)
+ * must never reach the browser process — the per-session Chromium
+ * path has always allowlisted it, and the download fallback must
+ * match. Built per launch so a changed process environment is picked
+ * up, exactly as the per-session path did inline.
+ */
+function chromiumLaunchEnv(): NodeJS.ProcessEnv {
+  return {
+    HOME: process.env.HOME ?? "/tmp",
+    PATH: process.env.PATH ?? "/usr/bin:/bin",
+    LANG: "C.UTF-8",
+  };
+}
+
+async function recordObscuraDownloadFailure(
+  directory: string,
+  url: string,
+  contentDisposition: string | undefined,
+  code: string,
+  message: string,
+): Promise<void> {
+  await recordDownloadFailure(directory, {
+    id: randomUUID(),
+    name: downloadFilenameFromResponse(url, contentDisposition),
+    code,
+    message,
+    createdAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * Chromium fallback for an Obscura-mode download the native path cannot
+ * serve (absent content-length, a non-identity content-encoding, or
+ * body() threw). Lazily starts the egress proxy, launches a short-lived
+ * Chromium (transient: it does not count toward maxSessions), and
+ * captures through the existing capturePdfDownload path. On no download
+ * event or capture failure a DOWNLOAD_INTERRUPTED failure is recorded
+ * and the session stays usable. The fallback navigates by GET only, in
+ * a fresh context with no cookies.
+ *
+ * The capture has its own deadline (captureWaitMs, default 20 s):
+ * without one a stalled transfer would block the session's navigation
+ * queue indefinitely, since this fallback — unlike the Chromium event
+ * handler — is awaited inside navigate(). On deadline the download is
+ * cancelled and the failure is recorded.
+ */
+export async function captureViaChromiumFallback(
+  deps: ObscuraDownloadContext,
+  url: string,
+): Promise<boolean> {
+  let fallbackBrowser: Browser | null = null;
+  let before: Set<string> | null = null;
+  try {
+    const egress = await deps.ensureProxy();
+    // The temp dir is never created for Obscura sessions; the fallback
+    // needs it as the Chromium downloads path. downloadsPath is a LAUNCH
+    // option, not a newContext option (BrowserContextOptions has no such
+    // field in Playwright 1.62) — with it set, accepted downloads land in
+    // the temp dir and the diffing below works like the Chromium path.
+    await mkdir(deps.tempDirectory, { recursive: true, mode: 0o700 });
+    fallbackBrowser = await deps.chromiumLauncher({
+      headless: true,
+      // Same allowlisted environment as the per-session Chromium path:
+      // the worker's own environment (WORKER_TOKEN, OBSCURA_CDP_*)
+      // must never reach the browser process.
+      env: chromiumLaunchEnv(),
+      proxy: { server: egress.url },
+      downloadsPath: deps.tempDirectory,
+      args: CHROMIUM_LAUNCH_ARGS,
+    });
+    const context = await fallbackBrowser.newContext({
+      acceptDownloads: true,
+    });
+    try {
+      const page = await context.newPage();
+      // Temp-dir diffing like createSession's download handler: the
+      // files belonging to this capture are the .crdownload files that
+      // appear after this point. (The snapshot here is taken after page
+      // creation rather than at event time, but it is still before goto,
+      // so the same exclusion holds.)
+      const knownTempFiles = new Set(await readdir(deps.tempDirectory).catch(() => []));
+      let resolveDownload: (download: Download) => void = () => {};
+      const downloadPromise = new Promise<Download>((resolve) => {
+        resolveDownload = resolve;
+      });
+      const onDownload = (download: Download) => resolveDownload(download);
+      page.on("download", onDownload);
+      let eventTimer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<null>((resolve) => {
+        eventTimer = setTimeout(() => resolve(null), deps.downloadWaitMs ?? 20_000);
+      });
+      try {
+        // A successful attachment intentionally aborts page navigation in
+        // Chromium, so a goto rejection here is not a failure: the download
+        // event is the signal.
+        await page.goto(url, { waitUntil: "domcontentloaded", timeout: 20_000 }).catch(() => {});
+        const download = await Promise.race([downloadPromise, timeout]);
+        if (!download) {
+          await recordObscuraDownloadFailure(
+            deps.directory,
+            url,
+            undefined,
+            "DOWNLOAD_INTERRUPTED",
+            DOWNLOAD_INTERRUPTED_MESSAGE,
+          );
+          return false;
+        }
+        const fresh = await readdir(deps.tempDirectory).catch(() => []);
+        const captureFiles = fresh.filter(
+          (name) => name.endsWith(".crdownload") && !knownTempFiles.has(name),
+        );
+        before = await listPublishedDownloadIds(deps.directory);
+        const failuresBefore = await readDownloadFailures(deps.directory).catch(() => []);
+        const capture = capturePdfDownload({
+          directory: deps.directory,
+          tempDirectory: deps.tempDirectory,
+          tempFiles: captureFiles,
+          download,
+          limitReached: deps.limitReached,
+          dataDir: deps.dataDir,
+          quotaBytes: deps.quotaBytes,
+        });
+        let captureTimer: ReturnType<typeof setTimeout> | undefined;
+        const captureTimeout = new Promise<never>((_, reject) => {
+          captureTimer = setTimeout(() => {
+            void download.cancel().catch(() => {});
+            reject(new Error("Download capture timed out"));
+          }, deps.captureWaitMs ?? 20_000);
+        });
+        try {
+          await Promise.race([capture, captureTimeout]);
+        } catch (error) {
+          // The capture may still settle later (the download was
+          // cancelled, not awaited): observe it so its rejection is not
+          // unhandled, then give it a short grace period to record its
+          // own failure. A cancelled capture records
+          // DOWNLOAD_INTERRUPTED in its own catch; recording a second
+          // one here would show the same failure twice for one download.
+          void capture.catch(() => {});
+          await Promise.race([
+            capture.then(
+              () => undefined,
+              () => undefined,
+            ),
+            new Promise((resolve) => setTimeout(resolve, 1000)),
+          ]);
+          const after = await listPublishedDownloadIds(deps.directory);
+          for (const id of after) if (!before.has(id)) return true;
+          const failuresAfter = await readDownloadFailures(deps.directory).catch(() => []);
+          if (failuresAfter.length > failuresBefore.length) return false;
+          throw error; // the capture never recorded: let the outer catch do it
+        } finally {
+          clearTimeout(captureTimer);
+        }
+        const after = await listPublishedDownloadIds(deps.directory);
+        for (const id of after) if (!before.has(id)) return true;
+        return false;
+      } finally {
+        clearTimeout(eventTimer);
+        page.off("download", onDownload);
+      }
+    } finally {
+      await context.close().catch(() => {});
+    }
+  } catch {
+    // A capture that published and then failed its journal cleanup throws
+    // from capturePdfDownload: the PDF is in the store, so report success
+    // rather than recording a spurious failure.
+    if (before) {
+      const after = await listPublishedDownloadIds(deps.directory).catch(() => new Set<string>());
+      for (const id of after) if (!before.has(id)) return true;
+    }
+    // Launch, context, or goto failure: the download could not be
+    // retrieved. Record it instead of failing the navigation — the
+    // session stays usable and the failure is visible in GET /downloads.
+    // If recording itself fails the store is broken: let that throw so
+    // the caller marks the download store failed instead of reporting
+    // a navigation that produced neither a PDF nor a recorded failure.
+    await recordObscuraDownloadFailure(
+      deps.directory,
+      url,
+      undefined,
+      "DOWNLOAD_INTERRUPTED",
+      DOWNLOAD_INTERRUPTED_MESSAGE,
+    );
+    return false;
+  } finally {
+    await fallbackBrowser?.close().catch(() => {});
+  }
+}
+
+/**
+ * Obscura-native download capture for a navigation Response that
+ * isDownloadResponse flagged. Reads the bytes from the navigation
+ * Response itself — no second server-side fetch. Returns true when the
+ * download was published as a PDF.
+ */
+export async function handleObscuraDownloadResponse(
+  deps: ObscuraDownloadContext,
+  response: Pick<Response, "headers" | "body">,
+  url: string,
+): Promise<boolean> {
+  const headers = lowercaseHeaders(response.headers());
+  const contentLength = parseContentLength(headers["content-length"]);
+  // A non-identity content-encoding means the length (when present)
+  // describes the encoded representation while body() returns the
+  // decoded body, so the length cannot bound the buffer. Belt and
+  // braces: Obscura 0.2.6 strips content-encoding and content-length
+  // when it decodes a body (verified by probe, Nov 15, 2026), so an
+  // encoded response normally arrives with no length and takes the
+  // fallback below anyway — but if an encoding ever survives to this
+  // point, route it to the bounded fallback rather than trusting the
+  // length against a decoded body.
+  const encoding = headers["content-encoding"]?.split(",")[0]?.trim().toLowerCase();
+  if (encoding !== undefined && encoding !== "" && encoding !== "identity") {
+    return captureViaChromiumFallback(deps, url);
+  }
+  if (contentLength !== undefined && contentLength > MAX_DOWNLOAD_BYTES) {
+    // Honest oversized length: record the failure without calling body(),
+    // so the huge file is never buffered.
+    await recordObscuraDownloadFailure(
+      deps.directory,
+      url,
+      headers["content-disposition"],
+      "DOWNLOAD_TOO_LARGE",
+      "The download exceeds 10 MiB. Choose a smaller PDF.",
+    );
+    return false;
+  }
+  if (contentLength === undefined) {
+    // No length means unbounded buffering for body(); the fallback
+    // streams with the existing byte cap instead.
+    return captureViaChromiumFallback(deps, url);
+  }
+  let bytes: Buffer;
+  try {
+    bytes = await response.body();
+  } catch {
+    return captureViaChromiumFallback(deps, url);
+  }
+  // A content-length that lies small still buffers the whole body once
+  // before the cap in capturePdfDownloadFromBytes rejects it; the worker
+  // only navigates to operator-requested URLs, so this needs a hostile
+  // server the operator chose to visit.
+  return capturePdfDownloadFromBytes({
+    directory: deps.directory,
+    tempDirectory: deps.tempDirectory,
+    limitReached: deps.limitReached,
+    dataDir: deps.dataDir,
+    quotaBytes: deps.quotaBytes,
+    url,
+    contentDisposition: headers["content-disposition"],
+    bytes,
+  });
+}
+
 /**
  * A stored session.json is only trusted when it has the Session shape.
  * A bare cast lets a malformed file into list() and into later close
@@ -203,10 +560,23 @@ export async function createBrowserManager(
      * quota is enforced.
      */
     downloadQuotaBytes?: number;
+    /**
+     * Chromium launcher for the Obscura-mode download fallback.
+     * Injected for tests; defaults to the real chromium.launch.
+     * (The per-session Chromium engine path still uses
+     * launchPersistentContext directly.)
+     */
+    chromiumLauncher?: (options: LaunchOptions) => Promise<Browser>;
   },
   createProxy = startEgressProxy,
 ) {
-  const { dataDir, maxSessions = 3, idleTimeoutMs = 30 * 60_000, downloadQuotaBytes } = options;
+  const {
+    dataDir,
+    maxSessions = 3,
+    idleTimeoutMs = 30 * 60_000,
+    downloadQuotaBytes,
+    chromiumLauncher = defaultChromiumLauncher,
+  } = options;
   await mkdir(dataDir, { recursive: true, mode: 0o700 });
   const sessions = new Map<string, Session>();
   const running = new Map<string, Running>();
@@ -216,8 +586,27 @@ export async function createBrowserManager(
   // worker's loopback egress proxy is unreachable from it and is not
   // started. Remote-side SSRF enforcement is Obscura's own guard (see the
   // note at the CDP attach site); the worker-side URL-validation layer
-  // still guards every navigation and subrequest on top of it.
-  const proxy = obscura ? { url: "", close: async () => {} } : await createProxy();
+  // still guards every navigation and subrequest on top of it. A Chromium
+  // session or a download fallback inside an Obscura-configured worker
+  // still needs the proxy (the Chromium launch passes proxy.url), so in
+  // Obscura mode it starts LAZILY on first Chromium use and is cached;
+  // in Chromium mode it starts eagerly, exactly as before.
+  const eagerProxy = obscura ? null : await createProxy();
+  let lazyProxy: Promise<{ url: string; close: () => Promise<void> }> | null = null;
+  async function ensureProxy() {
+    if (eagerProxy) return eagerProxy;
+    if (!lazyProxy) {
+      const starting = createProxy();
+      lazyProxy = starting;
+      // A failed startup must not poison later use: clear the cache so
+      // the next caller retries, while concurrent callers still share
+      // this one attempt.
+      starting.catch(() => {
+        if (lazyProxy === starting) lazyProxy = null;
+      });
+    }
+    return lazyProxy;
+  }
   const directory = (id: string) => join(dataDir, validateSessionId(id));
   // The per-session temp download dir. Published downloads live under the
   // session dir; this holds only in-flight Chromium files.
@@ -332,6 +721,7 @@ export async function createBrowserManager(
     const instance = active(id);
     const { page } = instance;
     const downloadsBefore = instance.downloadCount;
+    let response: Response | null = null;
     try {
       // Obscura 0.2.6 cookie bug (verified by local probes, Nov 13, 2026):
       // once a cookie exists for a domain, every later request to that
@@ -351,7 +741,10 @@ export async function createBrowserManager(
       // way. The one case this cannot rescue is a cookie set
       // mid-navigation followed by a same-domain redirect.
       if (instance.obscura) await instance.context.clearCookies();
-      await page.goto(target.url.href, { waitUntil: "domcontentloaded", timeout: 20_000 });
+      response = await page.goto(target.url.href, {
+        waitUntil: "domcontentloaded",
+        timeout: 20_000,
+      });
       // Chromium can follow redirects outside Playwright's initial route hook.
       // The proxy blocks those sockets, but its 403 is still an HTTP response:
       // validate the final location so the API does not report it as success.
@@ -382,6 +775,42 @@ export async function createBrowserManager(
           502,
         );
       }
+    }
+    // Obscura 0.2.6 emits no download event, but page.goto() to an
+    // attachment returns a Response whose body() returns the bytes
+    // (verified by local probe, Nov 15, 2026). Detect downloads from the
+    // navigation response and capture them natively; Chromium mode keeps
+    // its event path and never reaches this branch.
+    if (instance.obscura && response && isDownloadResponse(response.headers())) {
+      let published = false;
+      try {
+        published = await handleObscuraDownloadResponse(
+          {
+            directory: directory(id),
+            tempDirectory: tempDirectoryFor(id),
+            dataDir,
+            quotaBytes: downloadQuotaBytes,
+            // The current capture is NOT in instance.pending here (unlike
+            // the Chromium event handler, which adds it before its async
+            // check runs), so the boundary is >= 20: with 20 saved PDFs
+            // the next capture is the 21st and must be refused.
+            limitReached: (await downloads(id)).length + instance.pending.size >= 20,
+            ensureProxy,
+            chromiumLauncher,
+          },
+          response,
+          target.url.href,
+        );
+        // The store answered (published, or a failure recorded): a
+        // transient store failure is cleared, mirroring the Chromium
+        // event handler's success path.
+        instance.downloadError = false;
+      } catch {
+        // Mirror the Chromium event handler: a rejected capture marks the
+        // download store failed instead of failing the navigation.
+        instance.downloadError = true;
+      }
+      if (published) instance.downloadCount++;
     }
     return refresh(id);
   }
@@ -414,9 +843,12 @@ export async function createBrowserManager(
     await persist(result);
     return result;
   }
-  async function createSession(id: string, url: string) {
+  async function createSession(id: string, url: string, engine?: unknown) {
     await validatePublicUrl(url);
     if (running.has(id)) return navigate(id, url);
+    // Engine applies at session creation only: create() on an
+    // already-running id navigated above and ignores the argument.
+    const useObscura = resolveSessionEngine(engine, obscura !== null) === "obscura";
     if (running.size >= maxSessions)
       throw new WorkerError(
         "SESSION_LIMIT",
@@ -439,20 +871,28 @@ export async function createBrowserManager(
     // oversized-download monitor watches them. In Obscura mode the
     // remote browser downloads elsewhere, so nothing ever lands there
     // and the directory is not created at all.
-    await mkdir(obscura ? directory(id) : profileDir, { recursive: true, mode: 0o700 });
-    if (!obscura) await mkdir(tempDirectory, { recursive: true, mode: 0o700 });
+    await mkdir(useObscura ? directory(id) : profileDir, { recursive: true, mode: 0o700 });
+    if (!useObscura) await mkdir(tempDirectory, { recursive: true, mode: 0o700 });
     // Files already in the temp dir predate this session (stale leftovers
     // the startup sweep missed); they belong to no capture here. In
     // Obscura mode the temp dir is never created (the remote browser
     // downloads elsewhere), so there is nothing to snapshot.
-    const knownTempFiles = obscura
+    const knownTempFiles = useObscura
       ? new Set<string>()
       : new Set<string>(await readdir(tempDirectory));
     let context: BrowserContext;
     let remoteBrowser: Browser | null = null;
     try {
       const { chromium } = await import("playwright");
-      if (obscura) {
+      if (useObscura) {
+        // resolveSessionEngine already guarantees config exists when
+        // useObscura is true; this guard is for the type checker.
+        if (!obscura)
+          throw new WorkerError(
+            "BROWSER_UNAVAILABLE",
+            "Obscura is not configured on this worker.",
+            503,
+          );
         // Direct CDP attach. No profile directory, no launch args, and no
         // proxy option: the worker's egress proxy is unreachable from the
         // remote browser, so traffic egresses from Azure directly. The
@@ -505,13 +945,14 @@ export async function createBrowserManager(
           // disk use on the Obscura container, not worker disk use.
         });
       } else {
+        // The egress proxy is required here: without it the launch gets
+        // an empty proxy server. In Chromium mode it started eagerly at
+        // manager creation; in Obscura mode with a Chromium-engine
+        // session it starts lazily on this first use.
+        const egress = await ensureProxy();
         context = await chromium.launchPersistentContext(profileDir, {
           // Chromium does not need the worker API credential in its environment.
-          env: {
-            HOME: process.env.HOME ?? "/tmp",
-            PATH: process.env.PATH ?? "/usr/bin:/bin",
-            LANG: "C.UTF-8",
-          },
+          env: chromiumLaunchEnv(),
           headless: true,
           viewport: { width: 1280, height: 800 },
           // No loopback bypass: loopback destinations are routed through the
@@ -519,20 +960,16 @@ export async function createBrowserManager(
           // validation — not just the Playwright route hook — enforces the
           // public-only rule. A direct loopback connection could otherwise
           // reach the worker's own API port or other local services.
-          proxy: { server: proxy.url },
+          proxy: { server: egress.url },
           serviceWorkers: "block",
           acceptDownloads: true,
           downloadsPath: tempDirectory,
           timeout: 25_000,
-          args: [
-            "--disable-quic",
-            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
-            "--disable-extensions",
-            // /dev/shm is 64 MB by default on Render and Azure Container Apps
-            // with no size control; without this flag heavy pages crash tabs.
-            "--disable-dev-shm-usage",
-            "--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
-          ],
+          // Shared with the download fallback (CHROMIUM_LAUNCH_ARGS).
+          // /dev/shm is 64 MB by default on Render and Azure Container Apps
+          // with no size control; without --disable-dev-shm-usage heavy
+          // pages crash tabs.
+          args: CHROMIUM_LAUNCH_ARGS,
         });
       }
     } catch {
@@ -541,7 +978,7 @@ export async function createBrowserManager(
       await rm(tempDirectory, { recursive: true, force: true });
       throw new WorkerError(
         "BROWSER_UNAVAILABLE",
-        obscura
+        useObscura
           ? "The remote browser could not be reached. Check the Obscura endpoint and token configuration."
           : "Chromium could not start. Rebuild the browser-worker image and check its resource limits.",
         503,
@@ -558,7 +995,7 @@ export async function createBrowserManager(
         // (verified by local probes, Nov 13, 2026), so restoring cookies
         // would break the session's first navigation to its own domain.
         // storage.json is still written on close for a future fixed engine.
-        if (!obscura) await context.addCookies(state.cookies);
+        if (!useObscura) await context.addCookies(state.cookies);
       } catch (error) {
         if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
       }
@@ -581,7 +1018,7 @@ export async function createBrowserManager(
         pending: new Set(),
         downloadCount: 0,
         browser: remoteBrowser ?? undefined,
-        obscura: obscura !== null,
+        obscura: useObscura,
       };
       running.set(id, instance);
       context.on("page", (popup) => {
@@ -677,8 +1114,8 @@ export async function createBrowserManager(
   sweeper.unref();
   return {
     list: () => [...sessions.values()],
-    create: (id: string, url: string) =>
-      serial("create", () => serial(id, () => createSession(id, url))),
+    create: (id: string, url: string, engine?: unknown) =>
+      serial("create", () => serial(id, () => createSession(id, url, engine))),
     navigate: (id: string, url: string) => serial(id, () => navigate(id, url)),
     closeSession: (id: string) => serial(id, () => closeSession(id)),
     screenshot: (id: string) =>
@@ -769,7 +1206,8 @@ export async function createBrowserManager(
       clearInterval(sweeper);
       await Promise.allSettled([...queues.values()]);
       await Promise.allSettled([...running.keys()].map(closeSession));
-      await proxy.close();
+      await eagerProxy?.close();
+      if (lazyProxy) await lazyProxy.then((started) => started.close()).catch(() => {});
     },
   };
 }
