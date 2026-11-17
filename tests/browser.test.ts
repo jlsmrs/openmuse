@@ -80,6 +80,72 @@ test("browser API reopens an owned profile at the edited address and renews cons
   assert.equal(calls.length, 2, "renewal and rejected requests never navigate the browser");
 });
 
+test("browser creation forwards an engine choice and rejects unknown engines", async (t) => {
+  const calls: { path: string; body: Record<string, unknown> }[] = [];
+  const { db, config } = await browserFixture(t, (path, body) => {
+    calls.push({ path, body });
+    return { data: { ...savedSession, id: body.id, url: body.url } };
+  });
+  const { app, auth, agent } = await createApp(db, config);
+  t.after(() => agent.stop());
+  const { token } = await auth.session();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  const create = (body: unknown) =>
+    app.request("/api/browsers", { method: "POST", headers, body: JSON.stringify(body) });
+
+  const chromium = await create({ url: "https://example.org/", engine: "chromium" });
+  assert.equal(chromium.status, 201);
+  assert.equal(calls[0]?.body.engine, "chromium");
+  assert.equal(calls[0]?.body.url, "https://example.org/");
+
+  const obscura = await create({ url: "https://example.org/", engine: "obscura" });
+  assert.equal(obscura.status, 201);
+  assert.equal(calls[1]?.body.engine, "obscura");
+
+  const fallback = await create({ url: "https://example.org/" });
+  assert.equal(fallback.status, 201);
+  assert.equal(calls.length, 3, "the fallback create reached the worker");
+  assert.equal(calls[2]?.path, "/sessions");
+  assert.equal("engine" in (calls[2]?.body ?? {}), false, "absent engine sends no engine key");
+
+  for (const bad of ["safari", null, 123, true, {}, []]) {
+    const before: number = calls.length;
+    const rejected = await create({ url: "https://example.org/", engine: bad });
+    assert.equal(rejected.status, 400);
+    assert.equal((await rejected.json()).error, 'engine must be "obscura" or "chromium".');
+    assert.equal(calls.length, before, "an invalid engine never reaches the worker");
+  }
+  assert.equal(
+    (await db.list<BrowserSession>("local-user", "browsers")).length,
+    3,
+    "rejected creates leave no stray session record",
+  );
+});
+
+test("browser service forwards the engine and validates it before calling the worker", async (t) => {
+  const calls: { path: string; body: Record<string, unknown> }[] = [];
+  const { db, service } = await browserFixture(t, (path, body) => {
+    calls.push({ path, body });
+    return { data: { ...savedSession, id: body.id, url: body.url } };
+  });
+  const created = await service.create("owner", "https://example.org/", "chromium");
+  assert.equal(created.status, "active");
+  assert.equal(calls[0]?.body.engine, "chromium");
+  try {
+    await service.create("owner", "https://example.org/", "safari");
+    assert.fail("expected an invalid engine to be rejected");
+  } catch (error) {
+    assert.equal((error as { status?: number }).status, 400);
+    assert.equal((error as Error).message, 'engine must be "obscura" or "chromium".');
+  }
+  assert.equal(calls.length, 1, "an invalid engine never reaches the worker");
+  assert.equal(
+    (await db.list<BrowserSession>("owner", "browsers")).length,
+    1,
+    "a rejected create leaves no stray session record",
+  );
+});
+
 test("server reopens the same worker UUID regardless of stale local session status", async (t) => {
   const calls: { path: string; body: Record<string, unknown> }[] = [];
   const { db, service } = await browserFixture(t, (path, body) => {

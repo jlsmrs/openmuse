@@ -418,8 +418,10 @@ export async function createApp(
     return c.json({ ok: true });
   });
   app.post("/api/browsers", async (c) => {
-    const body = z.object({ url: z.url().max(4096) }).parse(await c.req.json());
-    return c.json(await browser.create(c.get("owner"), body.url), 201);
+    const body = z
+      .object({ url: z.url().max(4096), engine: z.unknown().optional() })
+      .parse(await c.req.json());
+    return c.json(await browser.create(c.get("owner"), body.url, body.engine), 201);
   });
   app.get("/api/browsers/:id", async (c) => {
     const owner = c.get("owner");

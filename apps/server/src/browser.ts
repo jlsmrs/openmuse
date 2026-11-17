@@ -78,6 +78,24 @@ function assertSessionId(id: string): void {
   if (!BROWSER_SESSION_ID.test(id)) throw new AppError("Browser session not found", 404);
 }
 
+type BrowserEngine = "obscura" | "chromium";
+
+/**
+ * Validate the requested browser engine the way the worker does
+ * (resolveSessionEngine in apps/worker/src/browser.ts): only
+ * "obscura" | "chromium", or absent for the env default. Anything else is
+ * a 400 with the worker's message, rejected here before any worker call
+ * instead of travelling to the worker and failing there. A zod enum is
+ * deliberately not used: it would surface as a 422, not the 400 the
+ * worker returns for INVALID_ENGINE.
+ */
+function assertEngine(engine: unknown): BrowserEngine | undefined {
+  if (engine === undefined) return undefined;
+  if (engine !== "obscura" && engine !== "chromium")
+    throw new AppError('engine must be "obscura" or "chromium".', 400);
+  return engine;
+}
+
 /**
  * Read a worker response body without ever holding more than the file cap in
  * memory: chunks are accumulated only until the cap is crossed, at which
@@ -203,7 +221,8 @@ export class BrowserService {
     await this.db.put(owner, "browsers", session);
     return this.decorate(owner, session);
   }
-  async create(owner: string, url: string, signal?: AbortSignal) {
+  async create(owner: string, url: string, engine?: unknown, signal?: AbortSignal) {
+    const resolved = assertEngine(engine);
     const id = randomUUID();
     // Record ownership before calling the worker, including when its response is lost.
     await this.db.put(owner, "browsers", {
@@ -213,13 +232,19 @@ export class BrowserService {
       status: "idle",
       updatedAt: new Date().toISOString(),
     });
-    return this.reopen(owner, id, url, signal);
+    return this.reopen(owner, id, url, resolved, signal);
   }
-  private async openOwned(owner: string, id: string, url?: string, signal?: AbortSignal) {
+  private async openOwned(
+    owner: string,
+    id: string,
+    url?: string,
+    engine?: BrowserEngine,
+    signal?: AbortSignal,
+  ) {
     const value = await this.get(owner, id);
     const target = url ?? value.url;
     try {
-      const response = await this.request("/sessions", { id, url: target }, signal);
+      const response = await this.request("/sessions", { id, url: target, engine }, signal);
       return await this.save(owner, await response.json(), id);
     } catch (error) {
       signal?.throwIfAborted();
@@ -231,8 +256,8 @@ export class BrowserService {
       throw error;
     }
   }
-  reopen(owner: string, id: string, url?: string, signal?: AbortSignal) {
-    return this.serial(id, () => this.openOwned(owner, id, url, signal));
+  reopen(owner: string, id: string, url?: string, engine?: BrowserEngine, signal?: AbortSignal) {
+    return this.serial(id, () => this.openOwned(owner, id, url, engine, signal));
   }
   navigate(owner: string, id: string, url: string) {
     return this.reopen(owner, id, url);
@@ -261,10 +286,10 @@ export class BrowserService {
     return this.serial(id, () => this.readOwned(owner, id));
   }
   async observe(owner: string, url: string, existingId?: string, signal?: AbortSignal) {
-    const id = existingId ?? (await this.create(owner, url, signal)).id;
+    const id = existingId ?? (await this.create(owner, url, undefined, signal)).id;
     return this.serial(id, async () => {
       signal?.throwIfAborted();
-      if (existingId) await this.openOwned(owner, id, url, signal);
+      if (existingId) await this.openOwned(owner, id, url, undefined, signal);
       signal?.throwIfAborted();
       return { sessionId: id, ...(await this.readOwned(owner, id, signal)) };
     });
@@ -291,7 +316,7 @@ export class BrowserService {
     });
     return this.serial(id, async () => {
       signal?.throwIfAborted();
-      await this.openOwned(owner, id, url, signal);
+      await this.openOwned(owner, id, url, undefined, signal);
       signal?.throwIfAborted();
       const page = await this.readOwned(owner, id, signal);
       signal?.throwIfAborted();
