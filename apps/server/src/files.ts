@@ -364,7 +364,16 @@ export class Files {
     return this.signed(owner, persisted ?? (await this.get(owner, id)));
   }
   signed(owner: string, file: Artifact): Artifact {
-    return { ...file, url: this.auth.sign(owner, `/api/files/${file.id}/content`) };
+    // The returned Artifact projection: legacy rows imported before B1
+    // have no formKind on their row, and they report "none" until
+    // re-imported (the pre-B1 kind is never guessed). The fallback lives
+    // here so list() and search() — both of which project through
+    // signed() — report it, not just the search filter.
+    return {
+      ...file,
+      formKind: file.formKind ?? "none",
+      url: this.auth.sign(owner, `/api/files/${file.id}/content`),
+    };
   }
   async list(owner: string) {
     return (await this.db.list<Artifact>(owner, "files")).map((file) => this.signed(owner, file));
@@ -380,8 +389,13 @@ export class Files {
    * corpus is hundreds of files, not millions). Substring match over the
    * file name and over field names/values, plus formKind and createdAt
    * filters. Owner-scoped: another owner's files can never match.
-   * Returned rows keep the existing Artifact shape — no snippet field,
-   * so field values (SSNs/EINs on a W-9) never leak into list surfaces.
+   * Returned rows keep the existing Artifact shape, INCLUDING field
+   * values — search returns full Artifact rows to their owner, exactly
+   * as list() does. The no-snippet rule only prevents a SEPARATE
+   * snippet surface (field values excerpted into logs or other
+   * surfaces); it does not redact the rows themselves. Whether search
+   * should return field values at all is Josh's open P1-1 decision, not
+   * something this comment may settle by assertion.
    * Date-interval semantics: `from` is inclusive of its start (a bare
    * date means the start of that day); `to` is inclusive of the whole
    * day when given as a bare date (2026-11-18 matches files created at
