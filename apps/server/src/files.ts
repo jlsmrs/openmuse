@@ -214,8 +214,11 @@ export function deterministicFileId(owner: string, operationKey: string): string
 
 /** One row of a file's lineage: provenance only. No field values, no
  * applied field map, and no signed URL ever cross owners here — the
- * chain (ids, names, owners, times) is what lineage reconstructs, and
- * the full Artifact rows stay behind the owner-scoped `get`. */
+ * chain (ids, names, times) is what lineage reconstructs, and
+ * the full Artifact rows stay behind the owner-scoped `get`. (M5,
+ * round 4: the old comment promised "owners" here, but this entry
+ * carries no owner field — the chain is identified by ids, names, and
+ * times, and the starting file's owner is the caller's.) */
 export interface FileLineageEntry {
   id: string;
   name: string;
@@ -235,7 +238,13 @@ export interface FileLineageEntry {
  * (YYYY-MM-DD) and ISO datetimes are accepted, and the calendar date
  * must really exist (month 1–12, day within the month, leap years
  * honoured) with a valid time of day. Returns the epoch-ms instant, or
- * throws a 422 naming the value.
+ * throws a 422 naming the value. The days-in-month check is arithmetic
+ * (M3, round 4), never `new Date(Date.UTC(year, month, 0))`: Date.UTC
+ * remaps years 0–99 to 1900–1999, which wrongly rejected the valid
+ * leap date 0000-02-29. Timezone-less datetimes are interpreted in the
+ * server's local timezone (M4, round 4): that is `Date.parse`
+ * behaviour, documented in the SPEC's date semantics — a bare
+ * `2026-11-18T12:00:00` is not UTC unless it carries a `Z` or offset.
  */
 export function parseSearchDate(value: string): number {
   const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
@@ -248,7 +257,15 @@ export function parseSearchDate(value: string): number {
   const year = Number(match[1]);
   const month = Number(match[2]);
   const day = Number(match[3]);
-  if (month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate())
+  // Arithmetic leap years (proleptic Gregorian): divisible by 4, except
+  // centuries, except centuries divisible by 400. Year 0 is divisible
+  // by 400, so 0000-02-29 exists; 0100-02-29 does not.
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth =
+    month >= 1 && month <= 12
+      ? [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+      : 0;
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth)
     throw new AppError(`Search date '${value}' is not a real calendar date`, 422);
   if (match[4] !== undefined) {
     const hour = Number(match[4]);
@@ -546,8 +563,8 @@ export class Files {
    * Full lineage of a file, oldest → newest, by walking parentId links
    * across owners (a hop lives under its target owner, so the walk reads
    * the whole files table, not one owner's rows). Rows are
-   * provenance-only (see FileLineageEntry): the chain, the owners, and
-   * the times — never field values or signed URLs. A missing or deleted
+   * provenance-only (see FileLineageEntry): the chain (ids, names,
+   * times) — never field values or signed URLs. A missing or deleted
    * ancestor ends the chain; a cycle cannot loop forever.
    */
   async lineage(owner: string, id: string): Promise<FileLineageEntry[]> {
