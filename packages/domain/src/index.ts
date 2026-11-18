@@ -78,6 +78,7 @@ export const calendarRangeSchema = z
     const duration = Date.parse(timeMax) - Date.parse(timeMin);
     return duration > 0 && duration <= 366 * 86400000;
   }, "Calendar range must end after it starts and span at most 366 days");
+export type FormKind = "acroform" | "xfa-static" | "xfa-dynamic" | "none";
 export interface Artifact {
   id: string;
   name: string;
@@ -89,6 +90,13 @@ export interface Artifact {
   source: string;
   parentId?: string;
   fields?: { name: string; value: string; type: "text" | "checkbox" | "unsupported" }[];
+  /** Form flavour from inspectPdf ("none" for non-PDFs and PDFs with no form). */
+  formKind?: FormKind;
+  /**
+   * Post-fill field map, reserved for the B2 fill build: accepted and
+   * persisted (and copied by pull) but never populated by B1 code paths.
+   */
+  appliedFields?: { name: string; value: string; type: "text" | "checkbox" | "unsupported" }[];
 }
 export interface BrowserSession {
   id: string;

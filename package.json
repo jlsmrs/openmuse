@@ -42,6 +42,7 @@
     "@tanstack/ai-gemini": "^0.32.1",
     "@tanstack/ai-openai": "^0.23.2",
     "@typesafe-ai/sdk": "0.6.0",
+    "fast-xml-parser": "5.3.4",
     "geotiff": "^3.0.5",
     "hono": "^4.11.4",
     "jszip": "^3.10.2",

@@ -174,12 +174,12 @@ test("PDF output removes active actions before returning a filled document", asy
   );
 });
 
-test("XFA forms fail explicitly instead of silently losing their fields", async () => {
+test("a malformed /XFA entry fails closed instead of silently losing its fields", async () => {
   const doc = await PDFDocument.load(await createSamplePdf());
   const acroForm = doc.getForm().acroForm.dict;
   acroForm.set(PDFName.of("XFA"), PDFString.of("<synthetic-xfa />"));
   const bytes = await doc.save({ updateFieldAppearances: false });
-  await assert.rejects(inspectPdf(bytes), /unsupported.*XFA|XFA.*unsupported/i);
+  await assert.rejects(inspectPdf(bytes), /XFA.*malformed|malformed.*XFA/i);
   await assert.rejects(
     fillPdf(bytes, { participant_name: "Test Participant" }),
     /unsupported.*XFA|XFA.*unsupported/i,
@@ -287,9 +287,9 @@ test("incident PDF (encrypted, empty password) imports after genuine decryption"
     createHash("sha256").update(incident).digest("hex"),
     "f6edcd8a1b4f7cb85486d0c6777f9174eadbc4d1d0d9e5aeba7132f30b34bc3e",
   );
-  assert.deepEqual(await inspectPdf(incident), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(incident), { pageCount: 1, fields: [], formKind: "none" });
   const decrypted = pdfFixture("pdf-test-decrypted.pdf");
-  assert.deepEqual(await inspectPdf(decrypted), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(decrypted), { pageCount: 1, fields: [], formKind: "none" });
   // The decrypted control is still linearized + ObjStm, just unencrypted:
   // linearization and object streams were never the problem.
   const text = Buffer.from(decrypted).toString("latin1");
@@ -301,7 +301,7 @@ test("incident PDF (encrypted, empty password) imports after genuine decryption"
   // itself — the full page text survives the round-trip, byte-identical
   // (whitespace-normalized) to the independent pypdf decryption.
   const own = decryptPdfWithEmptyPassword(incident);
-  assert.deepEqual(await inspectPdf(own), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(own), { pageCount: 1, fields: [], formKind: "none" });
   assert.equal(Buffer.from(own).includes(Buffer.from("/ObjStm")), false);
   assert.equal(Buffer.from(own).includes(Buffer.from("/Encrypt")), false);
   assert.equal(
@@ -351,7 +351,7 @@ test("object-stream inflation is bounded by the shared budget", () => {
 
 test("empty-password RC4-40 (V=1, R=2) decrypts too", async () => {
   const bytes = pdfFixture("pdf-empty-password-rc4-40.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -360,7 +360,7 @@ test("empty-password RC4-40 (V=1, R=2) decrypts too", async () => {
 
 test("indirect stream /Length is resolved, not read as the byte count", async () => {
   const bytes = pdfFixture("pdf-indirect-length.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -369,7 +369,7 @@ test("indirect stream /Length is resolved, not read as the byte count", async ()
 
 test("a forged /Type /XRef comment inside a stream dict is not an xref stream", async () => {
   const bytes = pdfFixture("pdf-xref-comment.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -378,7 +378,7 @@ test("a forged /Type /XRef comment inside a stream dict is not an xref stream", 
 
 test("a /Type /XRef inside an array-valued entry is not an xref stream", async () => {
   const bytes = pdfFixture("pdf-array-xref.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -387,7 +387,7 @@ test("a /Type /XRef inside an array-valued entry is not an xref stream", async (
 
 test("a CR-only comment does not swallow the string after it", async () => {
   const bytes = pdfFixture("pdf-cr-comment.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   // The /Producer hex string sits after a CR-terminated comment; it must
   // be decrypted (hex for "pypdf"), not copied as ciphertext.
   const own = decryptPdfWithEmptyPassword(bytes);
@@ -396,7 +396,7 @@ test("a CR-only comment does not swallow the string after it", async () => {
 
 test("a fake trailer inside a comment cannot redirect the document root", async () => {
   const bytes = pdfFixture("pdf-fake-trailer.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   // The comment's /Root 1 0 R must not reach the rebuilt trailer.
   const own = decryptPdfWithEmptyPassword(bytes);
   const text = Buffer.from(own).toString("latin1");
@@ -405,7 +405,7 @@ test("a fake trailer inside a comment cannot redirect the document root", async 
 
 test("a comment-shadowed /P in the Encrypt dict does not change the key", async () => {
   const bytes = pdfFixture("pdf-shadow-p.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -441,13 +441,13 @@ test("primitive object-stream members get token separation on emission", async (
   assert.equal(text.includes("7 0 obj\n42"), true);
   assert.equal(text.includes("7 0 obj42"), false);
   // Breaking the structure tree does not break pages, fields, or text.
-  assert.deepEqual(await inspectPdf(own), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(own), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /Congratulations, your computer is equipped/);
 });
 
 test("nonzero object generations survive the xref rebuild", async () => {
   const bytes = pdfFixture("pdf-nonzero-gen.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   // Object 1 was rewritten with generation 2; the rebuilt xref must carry
   // that generation, not the hardcoded 00000 of the first draft.
   const out = decryptPdfWithEmptyPassword(bytes);
@@ -462,7 +462,7 @@ test("a hyphenated name is not split, so /Type /XRef is not misread", async () =
   // exempting the stream as an xref stream and copying its ciphertext —
   // the page loaded with empty text. The full name token must be read.
   const bytes = pdfFixture("pdf-hyphen-name.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -474,7 +474,7 @@ test("a commented-out object header is not promoted into a live object", async (
   // old header regex recorded it, and its xref entry replaced the real
   // page's — page count preserved, text lost. The comment must be skipped.
   const bytes = pdfFixture("pdf-comment-page.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -487,7 +487,7 @@ test("a literal string holding `endobj` does not truncate its object", async () 
   // branch at the second `<`, and returned the `endobj` inside the
   // literal string as syntax — truncating the dict. `<<` is atomic now.
   const bytes = pdfFixture("pdf-ltlt-string.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -500,7 +500,7 @@ test("an incremental update replacing a compressed object wins the rebuild", asy
   // later (`/K []`): the old code rejected ANY such collision, but the
   // active revision is the last occurrence in the file.
   const bytes = pdfFixture("pdf-incremental-objstm.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   const own = decryptPdfWithEmptyPassword(bytes);
   const text = Buffer.from(own).toString("latin1");
   assert.equal(text.includes("/K []"), true);
@@ -518,7 +518,7 @@ test("a thousand-object PDF decrypts in well under ten seconds", async () => {
   const started = Date.now();
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.ok(Date.now() - started < 10_000, "decryption took over 10 seconds");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /MANY/);
 });
 
@@ -531,7 +531,7 @@ test("a stream whose ciphertext contains `endstream` still decrypts (direct /Len
   const text = Buffer.from(bytes).toString("latin1");
   const streamAt = text.indexOf("stream\n");
   assert.equal(text.slice(streamAt + 8, streamAt + 17), "endstream");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /MARKER/);
 });
 
@@ -540,7 +540,7 @@ test("a stream whose ciphertext contains `endstream` still decrypts (indirect /L
   const text = Buffer.from(bytes).toString("latin1");
   const streamAt = text.indexOf("stream\n");
   assert.equal(text.slice(streamAt + 8, streamAt + 17), "endstream");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /MARKER/);
 });
 
@@ -552,7 +552,7 @@ test("a non-breaking space inside a name is not PDF whitespace, so /Type /XRef i
   // reads `/Type` = `/XRef`, and copies the stream as ciphertext — the
   // old code loaded the file with EMPTY text.
   const bytes = pdfFixture("pdf-nbsp-name.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(
     await pdfText(decryptPdfWithEmptyPassword(bytes)),
     /Congratulations, your computer is equipped/,
@@ -568,7 +568,7 @@ test("an indirect stream /Length living in an object stream is resolved", async 
   // decryptor now expands object streams into the length map before
   // rebuilding.
   const bytes = pdfFixture("pdf-length-in-objstm.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.match(await pdfText(own), /MARKER/);
   // The output must not carry the source's cross-reference stream: its
@@ -604,7 +604,7 @@ test("many streams whose ciphertext is an unterminated `(` do not slow the scan"
   const started = Date.now();
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.ok(Date.now() - started < 2000, "decryption took over 2 seconds");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /STREAMY/);
 });
 
@@ -764,7 +764,7 @@ test("a #xx-escaped dictionary name is still that name (/L#65ngth is /Length)", 
   // one byte and copying the rest as ciphertext, so the file loaded
   // with EMPTY text. The length is now recognized and used.
   const bytes = pdfFixture("pdf-length-escaped.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /MARKER/);
 });
 
@@ -792,7 +792,7 @@ test("ciphertext forged as objects does not replace the real page", async () => 
   // The length is now resolved from the real object before the stream,
   // and spans inside the true data range are removed as forgeries.
   const bytes = pdfFixture("pdf-forged-objects.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.match(await pdfText(own), /REALPAGE/);
   assert.equal(Buffer.from(own).includes(Buffer.from("/Encrypt")), false);
@@ -901,7 +901,7 @@ test("many independent forged streams are cleaned in one pass", async () => {
   const started = Date.now();
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.ok(Date.now() - started < 5000, "decryption took over 5 seconds");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /MANYFORGED/);
 });
 
@@ -1023,7 +1023,7 @@ test("balanced nested parens in the skipped region decrypt fast and intact", asy
   const started = Date.now();
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.ok(Date.now() - started < 5000, "decryption took over 5 seconds");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /NESTED/);
 });
 
@@ -1179,7 +1179,7 @@ test("many restart points decrypt fast and intact", async () => {
   const started = Date.now();
   const own = decryptPdfWithEmptyPassword(bytes);
   assert.ok(Date.now() - started < 5000, "decryption took over 5 seconds");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(own), /MANYRESTART/);
 });
 
@@ -1203,7 +1203,7 @@ test("a comment inside an indirect /Length reference resolves to the length obje
   // NameObject"); verification is by direct RC4-decrypt (see the
   // fixture README), not pypdf.
   const bytes = pdfFixture("pdf-length-comment-ref.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /LENGTHCOMMENT/);
 });
 
@@ -1225,6 +1225,7 @@ test("a comment inside an indirect-object header does not drop the object", asyn
   assert.deepEqual(await inspectPdf(bytes), {
     pageCount: 1,
     fields: [{ name: "F1", value: "FIELDVALUE", type: "text" }],
+    formKind: "acroform",
   });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /HEADERCOMMENT/);
 });
@@ -1250,6 +1251,7 @@ test("a `%` inside a literal string does not hide the next object", async () => 
   assert.deepEqual(await inspectPdf(bytes), {
     pageCount: 1,
     fields: [{ name: "F1", value: "FIELDVALUE", type: "text" }],
+    formKind: "acroform",
   });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /PERCENTSTRING/);
 });
@@ -1270,7 +1272,7 @@ test("many same-line objects decrypt in linear time", async () => {
   const out = decryptPdfWithEmptyPassword(bytes);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 5000, `decrypt took ${elapsed} ms, expected < 5000 ms`);
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(out), /SAMELINE/);
 });
 
@@ -1316,6 +1318,7 @@ test("an unclosed `[` in ciphertext does not hide the next object", async () => 
   assert.deepEqual(await inspectPdf(bytes), {
     pageCount: 1,
     fields: [{ name: "F1", value: "FIELDVALUE", type: "text" }],
+    formKind: "acroform",
   });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /BRACKETSKIP/);
 });
@@ -1332,6 +1335,7 @@ test("an unclosed `<<` in ciphertext does not hide the next object", async () =>
   assert.deepEqual(await inspectPdf(bytes), {
     pageCount: 1,
     fields: [{ name: "F1", value: "FIELDVALUE", type: "text" }],
+    formKind: "acroform",
   });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /DICTSKIP/);
 });
@@ -1357,7 +1361,7 @@ test("a long `%` run in a removed forged span does not backtrack exponentially",
   const out = decryptPdfWithEmptyPassword(bytes);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 5000, `decrypt took ${elapsed} ms, expected < 5000 ms`);
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(out), /PERCENTRUN/);
 });
 
@@ -1414,7 +1418,7 @@ test("many unclosed forged dictionaries decrypt in linear time", async () => {
   const out = decryptPdfWithEmptyPassword(bytes);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 5000, `decrypt took ${elapsed} ms, expected < 5000 ms`);
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(out), /UNCLOSED/);
 });
 
@@ -1440,7 +1444,7 @@ test("many `endobjx` forged dictionaries decrypt in linear time", async () => {
   const out = decryptPdfWithEmptyPassword(bytes);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 5000, `decrypt took ${elapsed} ms, expected < 5000 ms`);
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(out), /ENDOBJX/);
 });
 
@@ -1457,6 +1461,6 @@ test("a stream dict containing the name `/endobj` decrypts successfully", async 
   // decrypts successfully. The test asserts successful import with the
   // page text preserved (not merely a page-count check).
   const bytes = pdfFixture("pdf-endobj-name.pdf");
-  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [] });
+  assert.deepEqual(await inspectPdf(bytes), { pageCount: 1, fields: [], formKind: "none" });
   assert.match(await pdfText(decryptPdfWithEmptyPassword(bytes)), /ENDOBJNAME/);
 });
