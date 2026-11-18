@@ -1,4 +1,4 @@
-import { XMLParser } from "fast-xml-parser";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 import {
   decodePDFRawStream,
   PDFArray,
@@ -40,6 +40,12 @@ const MAX_XFA_PACKET_BYTES = 10 * 1024 * 1024;
 const MAX_XFA_TAGS = 200000;
 /** Recursive walks give up past this depth instead of overflowing the stack. */
 const MAX_XFA_DEPTH = 100;
+/**
+ * Hard output bound for the SOM join: one template field can otherwise
+ * resolve to thousands of repeat instances (P1-8). A form that would
+ * report more than this many fields fails closed instead.
+ */
+const MAX_JOINED_FIELDS = 10000;
 
 export type XfaFieldType = "text" | "checkbox" | "unsupported";
 
@@ -75,14 +81,37 @@ function isRecord(value: unknown): value is XmlRecord {
   return typeof value === "object" && value !== null;
 }
 
-/** Concatenate every text leaf under a node (captions, rich-text values). */
-function nodeText(node: unknown, depth = 0): string {
+/**
+ * Concatenate every text leaf under a node (captions, rich-text values),
+ * in parser entry order. Fails closed (throws) when the depth guard is
+ * hit. Mixed content has a documented parser limitation: fast-xml-parser
+ * merges the text around child elements into a single #text value, so
+ * their document order is lost. For field VALUES (strict) that is a
+ * fail-closed 422 rather than an invented order; for captions (lenient)
+ * the flattened label is best-effort — the parser exposes #text last, so
+ * free text lands after the styled spans — and the label is display-only.
+ * Whitespace-only #text (pretty-printing between elements) carries no
+ * order-sensitive content and is skipped in strict mode.
+ */
+function nodeText(node: unknown, depth = 0, strict = false): string {
   if (typeof node === "string") return node;
-  if (!isRecord(node) || depth > MAX_XFA_DEPTH) return "";
+  if (Array.isArray(node)) return node.map((item) => nodeText(item, depth, strict)).join("");
+  if (!isRecord(node)) return "";
+  if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA packet is nested too deeply");
+  const text = typeof node["#text"] === "string" ? node["#text"] : undefined;
+  const elementEntries = Object.entries(node).filter(
+    ([key]) => !key.startsWith("@_") && key !== "#text",
+  );
+  if (strict && text !== undefined && text.trim() !== "" && elementEntries.length > 0)
+    throw new XfaError(
+      "XFA packet has ambiguous mixed content: text interleaved with child elements cannot be ordered",
+    );
   let out = "";
-  for (const [key, value] of Object.entries(node)) {
-    if (key.startsWith("@_")) continue;
-    out += nodeText(value, depth + 1);
+  for (const [, value] of elementEntries) out += nodeText(value, depth + 1, strict);
+  if (elementEntries.length === 0) {
+    out += text ?? "";
+  } else if (!strict && text !== undefined) {
+    out += text;
   }
   return out;
 }
@@ -153,9 +182,31 @@ export function readXfaPackets(doc: PDFDocument): Map<string, Uint8Array> {
       throw new XfaError(
         `XFA packet '${name}' is too large (${decoded.length} bytes, limit ${MAX_XFA_PACKET_BYTES})`,
       );
+    // A duplicate packet name must fail closed: silently keeping the last
+    // one would let a second template/datasets overwrite the first.
+    if (packets.has(name)) throw new XfaError(`XFA form is malformed: duplicate '${name}' packet`);
     packets.set(name, decoded);
   }
   return packets;
+}
+
+/**
+ * Strip namespace prefixes (xfa:, xhtml:) from element keys so prefixed
+ * roots like <xfa:template> are recognised. Attribute keys (@_*) and
+ * #text are left alone. Distinct-prefixed siblings that normalise to the
+ * same key collapse (last wins) — acceptable for XFA packets, whose
+ * element names are unprefixed in practice.
+ */
+function normalizeXmlKeys(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(normalizeXmlKeys);
+  if (!isRecord(node)) return node;
+  const out: XmlRecord = {};
+  for (const [key, value] of Object.entries(node)) {
+    const normalized =
+      key.startsWith("@_") || key === "#text" ? key : (key.split(":").at(-1) ?? key);
+    out[normalized] = normalizeXmlKeys(value);
+  }
+  return out;
 }
 
 function parseXfaXml(packetName: string, bytes: Uint8Array): XmlRecord {
@@ -173,6 +224,14 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XmlRecord {
     );
   if ((text.match(/</g) ?? []).length > MAX_XFA_TAGS)
     throw new XfaError(`XFA packet '${packetName}' has too many XML nodes`);
+  // fast-xml-parser's parse step alone does not reject every malformed
+  // document (a template missing only its final closing tag parses), so
+  // validate well-formedness explicitly first, on every packet.
+  const validation = XMLValidator.validate(text);
+  if (validation !== true)
+    throw new XfaError(
+      `XFA packet '${packetName}' is not parseable XML: ${validation.err.msg} (line ${validation.err.line}, col ${validation.err.col})`,
+    );
   let parsed: unknown;
   try {
     parsed = xmlParser.parse(text);
@@ -180,19 +239,50 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XmlRecord {
     throw new XfaError(`XFA packet '${packetName}' is not parseable XML`, { cause: error });
   }
   if (!isRecord(parsed)) throw new XfaError(`XFA packet '${packetName}' is not parseable XML`);
-  return parsed;
+  return normalizeXmlKeys(parsed) as XmlRecord;
 }
+
+type BindKind = "default" | "global" | "none" | "dataRef" | "unsupported";
 
 interface TemplateField {
   /** Template SOM path, e.g. topmostSubform.Page1.f1_01. */
   somPath: string;
   leafName: string;
   ui: XfaFieldType;
-  bind: "default" | "global" | "none" | "dataRef";
+  bind: BindKind;
   ref?: string;
+  /** Raw match value when the match is unknown (bind "unsupported"). */
+  rawMatch?: string;
   options?: string[];
   label?: string;
   onValues?: string[];
+}
+
+/**
+ * Read a <bind> element. No <bind> at all means "default"; a match value
+ * outside the known set (dataRef/global/none) is "unsupported" — never
+ * coerced to "default", so an XFA-defined value like match="once" cannot
+ * silently acquire a binding it was never given.
+ */
+function parseBind(bindNode: XmlRecord): {
+  bind: BindKind;
+  ref?: string;
+  rawMatch?: string;
+} {
+  const rawMatch = bindNode["@_match"];
+  const bind: BindKind =
+    rawMatch === "global" || rawMatch === "none" || rawMatch === "dataRef"
+      ? rawMatch
+      : rawMatch === undefined || rawMatch === "default"
+        ? "default"
+        : "unsupported";
+  const refValue = bindNode["@_ref"];
+  const ref = typeof refValue === "string" && refValue !== "" ? refValue : undefined;
+  return {
+    bind,
+    ref,
+    ...(bind === "unsupported" && typeof rawMatch === "string" ? { rawMatch } : {}),
+  };
 }
 
 function fieldTypeFromUi(uiKind: string): XfaFieldType {
@@ -201,11 +291,16 @@ function fieldTypeFromUi(uiKind: string): XfaFieldType {
   return "unsupported";
 }
 
-/** Choice-list option texts from the field-level `<items><text>…`. */
+/** Choice-list option texts from the field-level `<items><text>…`. Accepts
+ * several <items> elements (the parser produces an array for them) and
+ * merges their texts in order instead of silently dropping to []. */
 function itemTexts(node: XmlRecord): string[] {
-  const items = node.items;
-  if (!isRecord(items)) return [];
-  return asArray(items.text).filter((text): text is string => typeof text === "string");
+  const out: string[] = [];
+  for (const items of asArray(node.items)) {
+    if (!isRecord(items)) continue;
+    out.push(...asArray(items.text).filter((text): text is string => typeof text === "string"));
+  }
+  return out;
 }
 
 function buildTemplateField(node: XmlRecord, somPath: string): TemplateField | undefined {
@@ -216,9 +311,7 @@ function buildTemplateField(node: XmlRecord, somPath: string): TemplateField | u
   const uiKind =
     Object.keys(uiNode).find((key) => !key.startsWith("@_") && key !== "#text") ?? "none";
   const bindNode = isRecord(node.bind) ? node.bind : {};
-  const match = bindNode["@_match"];
-  const bind = match === "global" || match === "none" || match === "dataRef" ? match : "default";
-  const ref = bindNode["@_ref"];
+  const { bind, ref, rawMatch } = parseBind(bindNode);
   const items = itemTexts(node);
   let onValues: string[] | undefined;
   // On-values live in <items> only for checkButtons; a choiceList's
@@ -233,7 +326,8 @@ function buildTemplateField(node: XmlRecord, somPath: string): TemplateField | u
     leafName,
     ui: fieldTypeFromUi(uiKind),
     bind,
-    ref: typeof ref === "string" && ref !== "" ? ref : undefined,
+    ref,
+    rawMatch,
     options: options.length > 0 ? options : undefined,
     label,
     onValues,
@@ -251,7 +345,10 @@ function collectTemplateFields(
   depth: number,
   out: TemplateField[],
 ): void {
-  if (!isRecord(node) || depth > MAX_XFA_DEPTH) return;
+  if (!isRecord(node)) return;
+  // Fail closed like the datasets walk: a form whose only fields are too
+  // deep is a 422, never a silent field-less report.
+  if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA template packet is nested too deeply");
   for (const [key, value] of Object.entries(node)) {
     if (key.startsWith("@_") || key === "#text") continue;
     if (key === "subform") {
@@ -273,22 +370,39 @@ function collectTemplateFields(
         if (!isRecord(group)) continue;
         const name = group["@_name"];
         if (typeof name !== "string" || name === "") continue;
+        const groupPath = path === "" ? name : `${path}.${name}`;
         const options: string[] = [];
-        let bind: TemplateField["bind"] = "default";
-        let ref: string | undefined;
+        const childBinds: { bind: BindKind; ref: string | undefined }[] = [];
         for (const optionField of asArray(group.field)) {
           if (!isRecord(optionField)) continue;
           const built = buildTemplateField(optionField, path);
           if (built) {
             options.push(built.onValues?.[0] ?? built.leafName);
-            bind = built.bind;
-            ref = built.ref;
+            childBinds.push({ bind: built.bind, ref: built.ref });
           }
+        }
+        // The group's own <bind> governs the group field; the children's
+        // bindings govern only their option identity, never the value.
+        // With no group binding, the children must agree — if they
+        // disagree, fail closed instead of letting the last child win.
+        let bind: BindKind = "default";
+        let ref: string | undefined;
+        const groupBindNode = isRecord(group.bind) ? group.bind : undefined;
+        if (groupBindNode) {
+          ({ bind, ref } = parseBind(groupBindNode));
+        } else if (childBinds.length > 0) {
+          const first = childBinds[0];
+          if (childBinds.some((child) => child.bind !== first.bind || child.ref !== first.ref))
+            throw new XfaError(
+              `XFA template/datasets mismatch: exclGroup '${groupPath}' has no group binding and its option fields disagree`,
+            );
+          bind = first.bind;
+          ref = first.ref;
         }
         const caption = isRecord(group.caption) ? group.caption : undefined;
         const captionValue = caption !== undefined ? nodeText(caption.value) : "";
         out.push({
-          somPath: path === "" ? name : `${path}.${name}`,
+          somPath: groupPath,
           leafName: name,
           ui: "unsupported",
           bind,
@@ -327,7 +441,9 @@ function stripIndices(path: string): string {
 function collectDataLeaves(node: unknown, path: string, depth: number, out: DataLeaf[]): void {
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA datasets packet is nested too deeply");
   if (typeof node === "string") {
-    out.push({ path, value: node.trim(), markup: false });
+    // Dataset whitespace is significant: the parser is configured with
+    // trimValues: false, and no trimming happens here either.
+    out.push({ path, value: node, markup: false });
     return;
   }
   if (!isRecord(node)) {
@@ -337,12 +453,18 @@ function collectDataLeaves(node: unknown, path: string, depth: number, out: Data
   const children = Object.entries(node).filter(([key]) => !key.startsWith("@_") && key !== "#text");
   if (children.length === 0) {
     const text = typeof node["#text"] === "string" ? node["#text"] : "";
-    out.push({ path, value: text.trim(), markup: false });
+    out.push({ path, value: text, markup: false });
     return;
   }
-  // Rich-text values (<xhtml>…) are leaves: their text content, flagged.
-  if (children.some(([key]) => key === "xhtml" || key.includes(":"))) {
-    out.push({ path, value: normalizeSpace(nodeText(node)), markup: true });
+  // Rich-text values are leaves: their flattened text content, flagged.
+  // Only actual rich-text containers count (an <xhtml> subtree or an
+  // <exData> element) — a bare colon in a key used to trigger this too.
+  // The flattened value keeps the text as parsed (no whitespace
+  // normalisation); block boundaries carry no separator in the flattened
+  // value, and interleaved mixed content fails closed (strict nodeText)
+  // because the parser cannot order it.
+  if (children.some(([key]) => key === "xhtml" || key === "exData")) {
+    out.push({ path, value: nodeText(node, 0, true), markup: true });
     return;
   }
   for (const [key, value] of children) {
@@ -354,38 +476,83 @@ function collectDataLeaves(node: unknown, path: string, depth: number, out: Data
   }
 }
 
-/** Suffix score: how many trailing segments template and leaf paths share. */
-function suffixScore(templatePath: string, leafPath: string): number {
-  const templateParts = templatePath.split(".");
-  const leafParts = stripIndices(leafPath).split(".");
-  let score = 0;
-  while (
-    score < templateParts.length &&
-    score < leafParts.length &&
-    templateParts[templateParts.length - 1 - score] === leafParts[leafParts.length - 1 - score]
-  ) {
-    score++;
+function isSubsequence(shorter: string[], longer: string[]): boolean {
+  let index = 0;
+  for (const segment of longer) {
+    if (index < shorter.length && segment === shorter[index]) index++;
   }
-  return score;
+  return index === shorter.length;
+}
+
+/**
+ * Normalise a dataRef to a stripped SOM path, or fail closed naming the
+ * field and the ref: a missing, empty, or unparseable ref never falls back
+ * to name matching. Indexed refs ($data.form.repeat[1].itemName) are
+ * normalised by stripping [N] segments, like dataset paths.
+ */
+function parseDataRef(field: TemplateField): string {
+  const ref = field.ref;
+  if (ref === undefined)
+    throw new XfaError(
+      `XFA template/datasets mismatch: field '${field.somPath}' has a dataRef binding with a missing or empty ref`,
+    );
+  const withoutPrefix = ref.replace(/^\$data\./, "").replace(/^\$/, "");
+  const stripped = stripIndices(withoutPrefix);
+  if (!/^[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*$/.test(stripped))
+    throw new XfaError(
+      `XFA template/datasets mismatch: field '${field.somPath}' has an unparseable dataRef '${ref}'`,
+    );
+  return stripped;
 }
 
 /**
  * Find the datasets leaf/leaves a template field binds to.
- * - dataRef: the explicit SOM path (leading "$data." stripped).
- * - default/global: leaves with the same leaf name, keeping only the
- *   best suffix match — so a repeated subform yields one field per
- *   instance, while a same-named leaf in an unrelated branch loses.
+ * - dataRef: the explicit SOM path, index-stripped, exact-matched.
+ * - global: the first same-named leaf in document order, single field —
+ *   the XFA semantic for global binding, distinct from default.
+ * - default: the data node under the matching subform path. The match is
+ *   structural, not name-only: the stripped leaf path and the template
+ *   path must be equal up to subform segments present on one side only
+ *   (one path is a subsequence of the other). Literal path equality was
+ *   considered and rejected: the W-9's template nests fields under
+ *   Page1 (topmostSubform.Page1.f1_01) while its datasets omit that
+ *   subform (topmostSubform.f1_01), so literal equality would reject the
+ *   real-world form. Among candidates the closest structural match wins
+ *   (fewest skipped segments); repeat instances of one path all resolve;
+ *   distinct paths tied for closest fail closed as ambiguous. A
+ *   same-named leaf in an unrelated branch (customer vs supplier) is
+ *   never a subsequence match, so it can never be claimed.
  */
 function findLeaves(field: TemplateField, leaves: DataLeaf[]): DataLeaf[] {
-  if (field.bind === "dataRef" && field.ref) {
-    const target = field.ref.replace(/^\$data\./, "").replace(/^\$/, "");
+  if (field.bind === "dataRef") {
+    const target = parseDataRef(field);
     return leaves.filter((leaf) => stripIndices(leaf.path) === target);
   }
-  const candidates = leaves.filter((leaf) => leafNameOf(leaf.path) === field.leafName);
+  if (field.bind === "global") {
+    const first = leaves.find((leaf) => leafNameOf(leaf.path) === field.leafName);
+    return first ? [first] : [];
+  }
+  // default
+  const templateParts = field.somPath.split(".");
+  const candidates: { leaf: DataLeaf; gap: number; stripped: string }[] = [];
+  for (const leaf of leaves) {
+    if (leafNameOf(leaf.path) !== field.leafName) continue;
+    const stripped = stripIndices(leaf.path);
+    const leafParts = stripped.split(".");
+    const shorter = templateParts.length <= leafParts.length ? templateParts : leafParts;
+    const longer = templateParts.length <= leafParts.length ? leafParts : templateParts;
+    if (!isSubsequence(shorter, longer)) continue;
+    candidates.push({ leaf, gap: longer.length - shorter.length, stripped });
+  }
   if (candidates.length === 0) return [];
-  let best = 0;
-  for (const leaf of candidates) best = Math.max(best, suffixScore(field.somPath, leaf.path));
-  return candidates.filter((leaf) => suffixScore(field.somPath, leaf.path) === best);
+  const bestGap = Math.min(...candidates.map((candidate) => candidate.gap));
+  const best = candidates.filter((candidate) => candidate.gap === bestGap);
+  const distinctPaths = [...new Set(best.map((candidate) => candidate.stripped))];
+  if (distinctPaths.length > 1)
+    throw new XfaError(
+      `XFA template/datasets mismatch: field '${field.somPath}' matches more than one data node (${distinctPaths.join(", ")})`,
+    );
+  return best.map((candidate) => candidate.leaf);
 }
 
 function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string): XfaField {
@@ -405,7 +572,10 @@ function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string)
  * one field collapse to ONE field (W-9 c1_1 ×7 → one field); the
  * per-occurrence on-values are merged onto it. A field with no data node
  * and no `bind none` fails closed — a template/datasets name mismatch
- * must never silently report a wrong value.
+ * must never silently report a wrong value. Two distinct template paths
+ * resolving to the same data node fail closed too (public-name collision),
+ * and the resolved field count is capped at MAX_JOINED_FIELDS so no input
+ * can produce unbounded output.
  */
 function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaField[] {
   const merged = new Map<string, TemplateField>();
@@ -415,6 +585,12 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       merged.set(field.somPath, { ...field, onValues: field.onValues });
       continue;
     }
+    // Same path, different binding: the first occurrence must not win
+    // silently — fail closed naming the path.
+    if (field.bind !== existing.bind || field.ref !== existing.ref || field.ui !== existing.ui)
+      throw new XfaError(
+        `XFA template/datasets mismatch: field '${field.somPath}' has conflicting bindings (bind '${existing.bind}' vs '${field.bind}')`,
+      );
     if (field.onValues && existing.onValues) {
       const seen = new Set(existing.onValues);
       for (const value of field.onValues) {
@@ -430,19 +606,38 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
     if (!existing.options && field.options) existing.options = field.options;
   }
   const out: XfaField[] = [];
+  const resolvedByName = new Map<string, string>();
+  const push = (field: XfaField, somPath: string): void => {
+    const previous = resolvedByName.get(field.name);
+    if (previous !== undefined && previous !== somPath)
+      throw new XfaError(
+        `XFA template/datasets mismatch: fields '${previous}' and '${somPath}' resolve to the same data node '${field.name}'`,
+      );
+    resolvedByName.set(field.name, somPath);
+    out.push(field);
+    if (out.length > MAX_JOINED_FIELDS)
+      throw new XfaError(
+        `XFA join produced more than ${MAX_JOINED_FIELDS} fields; refusing to report an unbounded result`,
+      );
+  };
+  const unbound = (field: TemplateField): XfaField => {
+    const result: XfaField = { name: field.somPath, value: "", type: "unsupported" };
+    if (field.options) result.options = field.options;
+    if (field.label) result.label = field.label;
+    return result;
+  };
   for (const field of merged.values()) {
     if (field.bind === "none") {
-      // No data binding: use the datasets value only when a node with
-      // this name exists anyway; otherwise report "" / unsupported.
-      const match = findLeaves(field, leaves)[0];
-      if (match) {
-        out.push(toXfaField(field, match));
-      } else {
-        const unbound: XfaField = { name: field.somPath, value: "", type: "unsupported" };
-        if (field.options) unbound.options = field.options;
-        if (field.label) unbound.label = field.label;
-        out.push(unbound);
-      }
+      // No data binding: never consult the datasets, even when a
+      // same-named node exists.
+      push(unbound(field), field.somPath);
+      continue;
+    }
+    if (field.bind === "unsupported") {
+      // Unknown bind match: report the field as unsupported, never guess
+      // a binding. (The raw match value has no field on XfaField to
+      // carry it; the unsupported type is the signal.)
+      push(unbound(field), field.somPath);
       continue;
     }
     const matches = findLeaves(field, leaves);
@@ -450,7 +645,7 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       throw new XfaError(
         `XFA template/datasets mismatch: field '${field.somPath}' has no data node`,
       );
-    for (const match of matches) out.push(toXfaField(field, match));
+    for (const match of matches) push(toXfaField(field, match), field.somPath);
   }
   return out;
 }
@@ -470,12 +665,12 @@ export function inspectXfa(doc: PDFDocument): {
   if (!isRecord(templateRoot))
     throw new XfaError("XFA form is malformed: template packet has no <template> element");
   const datasetsParsed = parseXfaXml("datasets", datasetsBytes);
-  const datasetsRoot = datasetsParsed["xfa:datasets"];
+  const datasetsRoot = datasetsParsed.datasets;
   if (!isRecord(datasetsRoot))
-    throw new XfaError("XFA form is malformed: datasets packet has no <xfa:datasets> element");
-  const dataRoot = datasetsRoot["xfa:data"];
+    throw new XfaError("XFA form is malformed: datasets packet has no <datasets> element");
+  const dataRoot = datasetsRoot.data;
   if (dataRoot === undefined)
-    throw new XfaError("XFA form is malformed: datasets packet has no <xfa:data> element");
+    throw new XfaError("XFA form is malformed: datasets packet has no <data> element");
   const templateFields: TemplateField[] = [];
   collectTemplateFields(templateRoot, "", 0, templateFields);
   const leaves: DataLeaf[] = [];
