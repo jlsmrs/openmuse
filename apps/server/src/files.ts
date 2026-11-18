@@ -455,9 +455,9 @@ export class Files {
    * values — search returns full Artifact rows to their owner, exactly
    * as list() does. The no-snippet rule only prevents a SEPARATE
    * snippet surface (field values excerpted into logs or other
-   * surfaces); it does not redact the rows themselves. Whether search
-   * should return field values at all is Josh's open P1-1 decision, not
-   * something this comment may settle by assertion.
+   * surfaces); it does not redact the rows themselves. Including field
+   * values in search results is Josh's P1-1 decision (Nov 18, 2026:
+   * INCLUDE) — search stays as-is.
    * Date-interval semantics: `from` is inclusive of its start (a bare
    * date means the start of that day); `to` is inclusive of the whole
    * day when given as a bare date (2026-11-18 matches files created at
