@@ -269,7 +269,11 @@ test("P1-3: dataRef without a usable ref fails closed instead of falling back", 
   }
 });
 
-test("P1-3: an indexed dataRef resolves to the repeat instances (probe C shape)", async () => {
+test("P1-3: an indexed dataRef selects only its occurrence (probe C shape, T-2 round 4)", async () => {
+  // Round-4 correction (T-2): the old test expected BOTH repeat
+  // instances for a [1] selector — the selector was stripped and the
+  // ref reinterpreted as "every occurrence". An explicit selector is
+  // now honoured: [1] selects only occurrence 1 (Oranges).
   const bytes = await createXfaPdf({
     dynamic: true,
     templateXml:
@@ -286,7 +290,6 @@ test("P1-3: an indexed dataRef resolves to the repeat instances (probe C shape)"
   });
   const result = await inspectPdf(bytes);
   assert.deepEqual(result.fields, [
-    { name: "form.repeat[0].itemName", value: "Apples", type: "text" },
     { name: "form.repeat[1].itemName", value: "Oranges", type: "text" },
   ]);
 });
@@ -690,7 +693,8 @@ test("R-6: other malformed dataRefs fail closed, valid indexed refs still resolv
     );
     await assert.rejects(inspectPdf(bytes), /unparseable dataRef/, ref);
   }
-  // A bare (no $data.) indexed ref is a permitted prefix and resolves.
+  // A bare (no $data.) indexed ref is a permitted prefix and its
+  // selector is honoured: [1] selects only occurrence 1 (T-2, round 4).
   const bare = await createXfaPdf({
     dynamic: true,
     templateXml:
@@ -707,7 +711,6 @@ test("R-6: other malformed dataRefs fail closed, valid indexed refs still resolv
   });
   const result = await inspectPdf(bare);
   assert.deepEqual(result.fields, [
-    { name: "form.repeat[0].itemName", value: "Apples", type: "text" },
     { name: "form.repeat[1].itemName", value: "Oranges", type: "text" },
   ]);
 });
@@ -741,7 +744,10 @@ test("R-7: many distinct fields over many unrelated leaves complete quickly", as
 
 test("R-7 (round 3): same-named candidate spam now resolves fast and correctly", async () => {
   // Round 3: exact scope-path matching replaced the per-field name
-  // scan, so the join-work budget it guarded is retired. 1,100 fields
+  // scan. Round-4 correction (R-7): the scan's budget is NOT simply
+  // retired — the pre-resolution paths are now bounded instead by the
+  // aggregate internal path/index byte bound (T-3) and the on-values
+  // merge bound (T-4); see buildJoinIndex and joinFields. 1,100 fields
   // named `code` under distinct parents, each with its own matching
   // leaf plus 1,100 same-named leaves under unrelated parents: every
   // field looks up its own exact path only, so this completes quickly
@@ -1063,4 +1069,270 @@ test("S-5: a bounded input stays under the byte bound and resolves", async () =>
   assert.equal(result.fields[0]?.value, "V0");
   assert.equal(result.fields[0]?.label, "Code");
   assert.equal(result.fields[499]?.name, "form.item[499].code");
+});
+
+// --- B1 fix round 4 (panel re-review #3, T-1..T-4 + M1/M2, Nov 18, 2026) ---
+// Regression tests for the four adopted P1 findings and the two
+// observable minors. Probe shapes are noted per test; the probe
+// harness is panel/probe-rereview3-astra.mts.
+
+test("T-1: same-named subforms with different dataRef scopes both resolve (probe T1 shape)", async () => {
+  // Two <subform name="s">, dataRef-bound to form.customer vs
+  // form.supplier, each with a default-bound field `code`. The old
+  // collapse grouped by somPath only and kept the first scope, so the
+  // supplier field disappeared silently. Scope is now part of the
+  // collapse identity, so both fields come out under their own scope.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.customer"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.supplier"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<customer><code>CUSTOMER</code></customer><supplier><code>SUPPLIER</code></supplier>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.customer.code", value: "CUSTOMER", type: "text" },
+    { name: "form.supplier.code", value: "SUPPLIER", type: "text" },
+  ]);
+});
+
+test("T-1: same-named subforms with distinct captions keep both captions (probe T1b shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.customer"/><field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>Customer code</text></value></caption></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.supplier"/><field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>Supplier code</text></value></caption></field></subform>',
+      "<customer><code>CUSTOMER</code></customer><supplier><code>SUPPLIER</code></supplier>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.customer.code", value: "CUSTOMER", type: "text", label: "Customer code" },
+    { name: "form.supplier.code", value: "SUPPLIER", type: "text", label: "Supplier code" },
+  ]);
+});
+
+test("T-1: same somPath under the SAME scope still collapses to one field (positive control)", async () => {
+  // Two occurrences of one field under subforms with the same name AND
+  // the same dataRef bind share one data identity, so they collapse
+  // exactly as before (W-9 c1_1 ×7 shape, scoped).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.customer"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.customer"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<customer><code>CUSTOMER</code></customer>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.customer.code", value: "CUSTOMER", type: "text" },
+  ]);
+});
+
+test("T-2: a dataRef [1] selector selects only occurrence 1 (probe T2 shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="selected"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[1].taxId"/></field>',
+      "<person><taxId>FIRST</taxId></person><person><taxId>SECOND</taxId></person>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[1].taxId", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("T-2: a dataRef [0] selector selects the first occurrence, including a lone element", async () => {
+  // Occurrence 0 of a single <person> is that element; [0] resolves
+  // it rather than failing closed.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="selected"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[0].taxId"/></field>',
+      "<person><taxId>ONLY</taxId></person>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.person.taxId", value: "ONLY", type: "text" }]);
+});
+
+test("T-2: a nonexistent dataRef [999] selector fails closed (probe T2b shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="selected"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[999].taxId"/></field>',
+      "<person><taxId>FIRST</taxId></person><person><taxId>SECOND</taxId></person>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.selected.*has no data node/);
+    assert.doesNotMatch(error.message, /FIRST|SECOND/);
+    return true;
+  });
+});
+
+test("T-2: an indexed dataRef-bound subform scope selects only that occurrence", async () => {
+  // The subform is dataRef-bound to $data.form.person[1]: fields
+  // inside it resolve under occurrence 1 only, not under occurrence 0.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person[1]"/><field name="taxId"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<person><taxId>FIRST</taxId></person><person><taxId>SECOND</taxId></person>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[1].taxId", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("T-2: an indexed dataRef-bound subform scope with no such occurrence fails closed", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person[1]"/><field name="taxId"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<person><taxId>ONLY</taxId></person>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*has no data node/);
+    assert.doesNotMatch(error.message, /ONLY/);
+    return true;
+  });
+});
+
+test("T-3: a long ancestor name times many leaves fails closed fast (probe T3 shape)", async () => {
+  // Scaled probe: 64 KiB ancestor name × 2,000 leaves, zero template
+  // fields. The old code built the join index anyway (~9.3 s / +165 MB
+  // RSS); the field-less template now skips the index entirely, and
+  // the same construction WITH a field hits the aggregate internal
+  // path bound instead of materializing ~128 MB of key characters.
+  const longName = "a".repeat(64 * 1024);
+  const leaves = Array.from({ length: 2000 }, (_, i) => `<f${i}/>`).join("");
+  const fieldless = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"></subform></template>',
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><${longName}>${leaves}</${longName}></form></xfa:data></xfa:datasets>`,
+  });
+  const started = Date.now();
+  const fieldlessResult = await inspectPdf(fieldless);
+  assert.ok(Date.now() - started < 5000, `field-less inspect took ${Date.now() - started}ms`);
+  assert.deepEqual(fieldlessResult.fields, []);
+  // The same datasets with one template field under the long ancestor:
+  // the aggregate internal path bound must fire instead of indexing.
+  const withField = await createXfaPdf(
+    wrap(
+      `<subform name="${longName}"><field name="f0"><ui><textEdit/></ui><bind match="default"/></field></subform>`,
+      `<${longName}><f0>VALUE</f0>${leaves}</${longName}>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(withField), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /exceeds 4194304 bytes of internal paths/);
+    return true;
+  });
+});
+
+test("T-3: many leaves under a short ancestor still resolve (positive control)", async () => {
+  // The T-3 control: 2,000 leaves under a short name with a field-less
+  // template completes and reports no fields — the bound is a ceiling
+  // on amplification, not on leaf count as such.
+  const leaves = Array.from({ length: 2000 }, (_, i) => `<f${i}/>`).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"></subform></template>',
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><a>${leaves}</a></form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, []);
+});
+
+test("T-4: a large collapsed checkbox group with distinct on-values completes quickly (probe T4 shape)", async () => {
+  // 10,000 occurrences of one checkbox field, each with a distinct
+  // on-value. The old per-occurrence Set rebuild was superlinear
+  // (1,000 → 111 ms, 5,000 → 922 ms); one Set per merged group is
+  // linear, so this completes in well under the bound with all 10,000
+  // on-values merged onto the single output field.
+  const count = 10000;
+  const occurrences = Array.from(
+    { length: count },
+    (_, i) =>
+      `<field name="code"><ui><checkButton/></ui><items><text>v${i}</text></items><bind match="global"/></field>`,
+  ).join("");
+  const bytes = await createXfaPdf(wrap(occurrences, "<code>0</code>"));
+  const started = Date.now();
+  const result = await inspectPdf(bytes);
+  assert.ok(Date.now() - started < 5000, `checkbox merge took ${Date.now() - started}ms`);
+  assert.equal(result.fields.length, 1);
+  assert.equal(result.fields[0]?.onValues?.length, count);
+  assert.equal(result.fields[0]?.onValues?.[0], "v0");
+  assert.equal(result.fields[0]?.onValues?.[count - 1], `v${count - 1}`);
+});
+
+test("M1: an error naming a very long field stays bounded (probe T5 shape)", async () => {
+  // A 100 KiB field name with no data node used to produce a
+  // 102,462-byte error message. Names in errors are now truncated
+  // with a marker, so the message stays small while still naming the
+  // field's start.
+  const longName = "x".repeat(100 * 1024);
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="${longName}"><ui><textEdit/></ui><bind match="default"/></field>`,
+      "<other>no match</other>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.ok(Buffer.byteLength(error.message, "utf8") < 4096);
+    assert.match(error.message, /has no data node/);
+    assert.match(error.message, /\[truncated \d+ chars\]/);
+    return true;
+  });
+});
+
+test("M2: the output-byte bound counts the JSON array exactly (probe T7 shape)", async () => {
+  // The old accounting summed JSON.stringify(field) + 1 per field,
+  // undercounting the full array by exactly 1 byte (the opening `[`
+  // against the closing `]`/separators). Boundary probe: one field
+  // whose serialized JSON is exactly 1,048,575 bytes, so the array
+  // is exactly 1,048,577 — one byte OVER the 1 MiB bound — and must
+  // reject; one byte less (array exactly 1,048,576) must pass.
+  const buildValue = (targetFieldJsonBytes: number): string => {
+    // {"name":"form.a","value":"<v>","type":"text"} — a fixed-size
+    // envelope plus the value. Solve for the value length, then verify
+    // the serialized field is exactly the target size.
+    const fixed = Buffer.byteLength(
+      JSON.stringify({ name: "form.a", value: "", type: "text" }),
+      "utf8",
+    );
+    const value = "V".repeat(targetFieldJsonBytes - fixed);
+    assert.equal(
+      Buffer.byteLength(JSON.stringify({ name: "form.a", value, type: "text" }), "utf8"),
+      targetFieldJsonBytes,
+    );
+    return value;
+  };
+  const overBytes = await createXfaPdf(
+    wrap(
+      '<field name="a"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<a>${buildValue(1048575)}</a>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(overBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /more than 1048576 bytes of resolved fields/);
+    return true;
+  });
+  const exactBytes = await createXfaPdf(
+    wrap(
+      '<field name="a"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<a>${buildValue(1048574)}</a>`,
+    ),
+  );
+  const result = await inspectPdf(exactBytes);
+  assert.equal(result.fields.length, 1);
+  assert.equal(result.fields[0]?.name, "form.a");
 });

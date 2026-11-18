@@ -11,6 +11,7 @@ import { createStore, type Store } from "../apps/server/src/db.ts";
 import type { AgentService } from "../apps/server/src/engine/service.ts";
 import { FILE_PULL_AUDIT_COLLECTION, type FilePullAudit, Files } from "../apps/server/src/files.ts";
 import type { Artifact } from "../packages/domain/src/index.ts";
+import { createXfaPdf } from "./xfa-fixtures.ts";
 
 let db: Store;
 let app: Awaited<ReturnType<typeof createApp>>["app"];
@@ -177,6 +178,43 @@ test("search route validates query params and stays owner-scoped", async () => {
     headers: headers(),
   });
   assert.equal(badDate.status, 422);
+  // Owner isolation over HTTP (M6b, round 4): a second owner's file
+  // with the SAME name must not appear in the session owner's results,
+  // while the session owner's own upload does. Status codes alone
+  // cannot show this — the result ids are the assertion.
+  const other = await agent.files.import(
+    "other-owner",
+    "fw9.pdf",
+    await fixture("fw9.pdf"),
+    "test",
+  );
+  const uploadForm = new FormData();
+  uploadForm.append(
+    "file",
+    new File([new Uint8Array(await fixture("fw9.pdf"))], "fw9.pdf", {
+      type: "application/pdf",
+    }),
+  );
+  const upload = await app.request("/api/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: uploadForm,
+  });
+  assert.equal(upload.status, 201);
+  const uploaded = (await upload.json()) as { id: string };
+  const searchResponse = await app.request("/api/files/search?q=fw9", {
+    headers: headers(),
+  });
+  assert.equal(searchResponse.status, 200);
+  const results = (await searchResponse.json()) as { id: string }[];
+  assert.ok(
+    results.some((file) => file.id === uploaded.id),
+    "session owner's own fw9 must be in its search results",
+  );
+  assert.ok(
+    results.every((file) => file.id !== other.id),
+    "a second owner's fw9 must not appear in the session owner's search results",
+  );
 });
 
 test("pull is atomic: a failed audit write leaves no visible, unaudited copy", async () => {
@@ -697,7 +735,22 @@ test("search rejects impossible calendar dates, service-level and over HTTP", as
   }
   // Leap day exists in a leap year, and valid dates still filter.
   assert.ok((await agent.files.search(owner, { from: "2024-02-29" })).length >= 1);
-  assert.ok((await agent.files.search(owner, { to: "2026-11-18T12:00:00.000Z" })).length >= 0);
+  // A `to` bound after the import admits the file: a real assertion on
+  // the `to` filter (M6a, round 4 — the old `.length >= 0` could never
+  // fail, so it proved nothing about the `to` bound).
+  assert.ok((await agent.files.search(owner, { to: "2999-01-01" })).length >= 1);
+  // Year 0–99 leap handling (M3, round 4): the old days-in-month check
+  // used Date.UTC, which remaps years 0–99 to 1900–1999 and wrongly
+  // rejected the valid leap date 0000-02-29. Arithmetic leap years:
+  // year 0 is divisible by 400, so 0000-02-29 exists; 0100 is a
+  // century not divisible by 400, so 0100-02-29 does not.
+  assert.ok((await agent.files.search(owner, { from: "0000-02-29" })).length >= 1);
+  assert.ok((await agent.files.search(owner, { from: "0004-02-29" })).length >= 1);
+  assert.ok((await agent.files.search(owner, { from: "2000-02-29" })).length >= 1);
+  await assert.rejects(
+    agent.files.search(owner, { from: "0100-02-29" }),
+    /not a real calendar date/,
+  );
 });
 
 test("a malformed XFA import fails over HTTP and persists no row and no bytes", async () => {
@@ -735,6 +788,64 @@ test("a malformed XFA import fails over HTTP and persists no row and no bytes", 
         type: "application/pdf",
       },
     ),
+  );
+  const response = await app.request("/api/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  assert.equal(response.status, 422);
+  const listAfter: { id: string }[] = await (
+    await app.request("/api/files", { headers: headers() })
+  ).json();
+  // Compare ids only: each list() re-signs the content URLs with a fresh
+  // expiry, so the full rows differ run to run even when nothing changed.
+  assert.deepEqual(
+    listAfter.map((file) => file.id),
+    listBefore.map((file) => file.id),
+  );
+  assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
+});
+
+test("an output-limit import fails over HTTP and persists no row and no bytes", async () => {
+  // M6c, round 4: round 3 added the malformed-XML HTTP test only; the
+  // 1 MiB output-byte bound had no HTTP coverage. One field whose
+  // value alone serializes past the bound must 422 at import time,
+  // service-level and over HTTP, leaving no row and no bytes behind.
+  const owner = "output-limit-http-owner";
+  const filesBefore = await readdir(join(directory, "files"));
+  const huge = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      '<subform name="form" layout="tb">' +
+      '<field name="a"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form><a>${"V".repeat(2 * 1024 * 1024)}</a></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  // Service-level first: the import rejects, and the owner's list stays empty.
+  await assert.rejects(
+    agent.files.import(owner, "xfa-huge-value.pdf", huge, "test"),
+    (error: unknown) => {
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match((error as Error).message, /more than 1048576 bytes of resolved fields/);
+      return true;
+    },
+  );
+  assert.deepEqual(await agent.files.list(owner), []);
+  assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
+  // Over HTTP: a multipart upload of the same PDF is a 422, and
+  // neither the session owner's file list nor the bytes on disk gains
+  // anything from the attempt.
+  const listBefore: { id: string }[] = await (
+    await app.request("/api/files", { headers: headers() })
+  ).json();
+  const form = new FormData();
+  form.append(
+    "file",
+    new File([new Uint8Array(huge)], "xfa-huge-value.pdf", { type: "application/pdf" }),
   );
   const response = await app.request("/api/files", {
     method: "POST",
