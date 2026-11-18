@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { Artifact } from "../../../packages/domain/src/index.ts";
+import type { Artifact, FormKind } from "../../../packages/domain/src/index.ts";
 import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integrations/src/pdf.ts";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
@@ -23,6 +23,19 @@ export function sanitizeFileName(name: string): string {
 }
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+/** One audited cross-company pull: who pulled what, from where, to where, when. */
+export interface FilePullAudit {
+  id: string;
+  who: string;
+  fileId: string;
+  fileName: string;
+  sourceId: string;
+  from: string;
+  to: string;
+  when: string;
+}
+export const FILE_PULL_AUDIT_COLLECTION = "file-pull-audit";
 
 // MIME types the workspace recognises by file extension. Anything else is
 // still accepted and stored — it is recorded as application/octet-stream and
@@ -306,6 +319,7 @@ export class Files {
       size: bytes.length,
       pageCount: metadata?.pageCount ?? 0,
       fields: metadata?.fields,
+      formKind: metadata?.formKind ?? "none",
       url: "",
       createdAt: new Date().toISOString(),
       source,
@@ -329,6 +343,119 @@ export class Files {
     const file = await this.db.get<Artifact>(owner, "files", id);
     if (!file) throw new AppError("File not found", 404);
     return file;
+  }
+  /**
+   * Search the caller's own files (milestone 1: filter-over-list — the
+   * corpus is hundreds of files, not millions). Substring match over the
+   * file name and over field names/values, plus formKind and createdAt
+   * filters. Owner-scoped: another owner's files can never match.
+   * Returned rows keep the existing Artifact shape — no snippet field,
+   * so field values (SSNs/EINs on a W-9) never leak into list surfaces.
+   */
+  async search(
+    owner: string,
+    query: { q?: string; formKind?: FormKind; from?: string; to?: string },
+  ): Promise<Artifact[]> {
+    const needle = query.q?.trim().toLowerCase();
+    const from = query.from === undefined ? Number.NaN : Date.parse(query.from);
+    const to = query.to === undefined ? Number.NaN : Date.parse(query.to);
+    return (await this.list(owner)).filter((file) => {
+      if (query.formKind !== undefined && (file.formKind ?? "none") !== query.formKind)
+        return false;
+      const createdAt = Date.parse(file.createdAt);
+      if (Number.isFinite(from) && createdAt < from) return false;
+      if (Number.isFinite(to) && createdAt > to) return false;
+      if (!needle) return true;
+      if (file.name.toLowerCase().includes(needle)) return true;
+      return (file.fields ?? []).some(
+        (field) =>
+          field.name.toLowerCase().includes(needle) || field.value.toLowerCase().includes(needle),
+      );
+    });
+  }
+  /**
+   * Cross-company pull: an explicit, audited COPY of one file into
+   * another owner's workspace. Type-agnostic — bytes + the metadata row
+   * are copied as-is, so PDFs, Office docs, text, images, audio/video,
+   * archives, and application/octet-stream all pull the same way; no
+   * PDF-specific logic lives anywhere in this path. The source row is
+   * untouched and the copy gets a fresh id, `parentId` = source id, and
+   * `source` = "Pulled from <source-owner>/<id>". The audit entry is
+   * written with the copy: if the copy fails, no audit entry exists.
+   */
+  async pull(owner: string, id: string, toOwner: string): Promise<Artifact> {
+    if (typeof toOwner !== "string" || toOwner.trim() === "" || toOwner !== toOwner.trim())
+      throw new AppError("A target workspace is required", 422);
+    // Same hygiene as sanitizeFileName: no path separators, no control characters.
+    if (
+      toOwner.includes("/") ||
+      toOwner.includes("\\") ||
+      [...toOwner].some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)
+    )
+      throw new AppError("Target workspace is invalid", 422);
+    if (toOwner === owner) throw new AppError("File is already in this workspace", 422);
+    // Read access to the source is required: without it this is a 404,
+    // not a 403 with details — existence must not leak.
+    const source = await this.get(owner, id);
+    const bytes = await this.bytes(owner, id);
+    const newId = randomUUID();
+    const directory = join(this.config.dataDir, "files");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = this.pathFor(newId, source.name);
+    await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+    const when = new Date().toISOString();
+    const artifact: Artifact = {
+      ...source,
+      id: newId,
+      url: "",
+      createdAt: when,
+      source: `Pulled from ${owner}/${id}`,
+      parentId: id,
+    };
+    try {
+      await this.db.put(toOwner, "files", artifact);
+      const audit: FilePullAudit = {
+        id: randomUUID(),
+        who: owner,
+        fileId: newId,
+        fileName: source.name,
+        sourceId: id,
+        from: owner,
+        to: toOwner,
+        when,
+      };
+      await this.db.put("system", FILE_PULL_AUDIT_COLLECTION, audit);
+    } catch (error) {
+      await this.db.remove(toOwner, "files", newId).catch(() => undefined);
+      await rm(path, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    return this.signed(toOwner, artifact);
+  }
+  /**
+   * Full lineage of a file, oldest → newest, by walking parentId links
+   * across owners (a hop lives under its target owner, so the walk reads
+   * the whole files table, not one owner's rows). Rows are returned as
+   * stored (unsigned): signing another owner's row for this caller would
+   * be wrong. A missing or deleted ancestor ends the chain; a cycle
+   * cannot loop forever.
+   */
+  async lineage(owner: string, id: string): Promise<Artifact[]> {
+    const start = await this.get(owner, id);
+    const byId = new Map(
+      (await this.db.scan<Artifact>("files")).map((row) => [row.value.id, row.value]),
+    );
+    const chain: Artifact[] = [start];
+    const seen = new Set([start.id]);
+    let current = start;
+    while (current.parentId !== undefined && !seen.has(current.parentId)) {
+      const parent = byId.get(current.parentId);
+      if (!parent) break;
+      seen.add(parent.id);
+      chain.push(parent);
+      current = parent;
+    }
+    return chain.reverse();
   }
   private pathFor(id: string, name?: string): string {
     assertFileId(id);
