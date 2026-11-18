@@ -201,17 +201,19 @@ test("P1-2: default binding never claims a same-named leaf from another branch",
   });
 });
 
-test("P1-2: default binding fails closed when two branches tie for closest match", async () => {
-  // One-sided rule: both dataset parents ([form, a] and [form, b]) are
-  // subsequences of the template parent ([form, a, b]) at the same gap,
-  // so neither wins — ambiguous, fail closed.
+test("P1-2: default binding fails closed when no dataset path matches the scope", async () => {
+  // Round 3: the scope rule replaced closest-match. Template
+  // form.a.b.code has scope [form, a, b] (both subforms bind by name);
+  // neither dataset parent ([form, a] nor [form, b]) equals it, so
+  // there is no data node — still fail closed, now as a scope mismatch
+  // rather than a tie.
   const bytes = await createXfaPdf(
     wrap(
       '<subform name="a"><subform name="b"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
       "<a><code>ONE</code></a><b><code>TWO</code></b>",
     ),
   );
-  await assert.rejects(inspectPdf(bytes), /matches more than one data node/);
+  await assert.rejects(inspectPdf(bytes), /form\.a\.b\.code.*has no data node/);
 });
 
 test("P1-2 (round 2): a dataset segment the template does not name never matches", async () => {
@@ -546,23 +548,26 @@ test("R-1: Astra's nested counterexample fails closed (probe R1 shape)", async (
   });
 });
 
-test("R-1: same-name nesting, template-deeper direction, resolves (residual ambiguity)", async () => {
-  // The mirror of the counterexample: the template names a supplier
-  // branch the datasets omit (form.supplier.customer.taxId vs
-  // form.customer.taxId). A template-only segment is ASSUMED layout-only
-  // under the one-sided rule, so this resolves — the documented residual
-  // ambiguity. If the rule is ever tightened to recognised layout
-  // segments only, this test must change with it.
+test("R-1 (round 3): same-name nesting, template-deeper direction, fails closed", async () => {
+  // Round 3: the round-2 residual ambiguity is PROVEN unsafe (S-1) and
+  // fixed, not documented. The template names a supplier branch the
+  // datasets omit (form.supplier.customer.taxId vs form.customer.taxId);
+  // the supplier subform binds by name (no <bind>), so it is a data
+  // segment, not layout — the scope is [form, supplier, customer] and
+  // the sibling customer leaf is out of scope. This test used to expect
+  // the guessed match; it now expects fail-closed.
   const bytes = await createXfaPdf(
     wrap(
       '<subform name="supplier"><subform name="customer"><field name="taxId"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
       "<customer><taxId>CUSTOMER-ID</taxId></customer>",
     ),
   );
-  const result = await inspectPdf(bytes);
-  assert.deepEqual(result.fields, [
-    { name: "form.customer.taxId", value: "CUSTOMER-ID", type: "text" },
-  ]);
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.supplier\.customer\.taxId.*has no data node/);
+    return true;
+  });
 });
 
 test("R-3: rich-text siblings flatten in document order (probe R2 shape)", async () => {
@@ -734,12 +739,13 @@ test("R-7: many distinct fields over many unrelated leaves complete quickly", as
   assert.equal(result.fields[fieldCount - 1]?.name, `form.f${fieldCount - 1}`);
 });
 
-test("R-7: the join-work budget fails closed on same-named candidate spam", async () => {
-  // 1,100 fields named `code` under distinct parents, each with its own
-  // matching leaf plus 1,100 same-named leaves under unrelated parents.
-  // Every field compares against all 2,200 same-named candidates, so the
-  // work budget (1,000,000 comparisons) is exceeded part-way through —
-  // fail closed on the budget instead of burning CPU.
+test("R-7 (round 3): same-named candidate spam now resolves fast and correctly", async () => {
+  // Round 3: exact scope-path matching replaced the per-field name
+  // scan, so the join-work budget it guarded is retired. 1,100 fields
+  // named `code` under distinct parents, each with its own matching
+  // leaf plus 1,100 same-named leaves under unrelated parents: every
+  // field looks up its own exact path only, so this completes quickly
+  // with the right value per field instead of failing on the budget.
   const count = 1100;
   const templateFields = Array.from(
     { length: count },
@@ -755,11 +761,15 @@ test("R-7: the join-work budget fails closed on same-named candidate spam", asyn
     (_, i) => `<t${i}><code>noise-${i}</code></t${i}>`,
   ).join("");
   const bytes = await createXfaPdf(wrap(templateFields, matching + unrelated));
-  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
-    assert.ok(error instanceof Error);
-    assert.equal((error as { status?: number }).status, 422);
-    assert.match(error.message, /work budget/);
-    return true;
+  const started = Date.now();
+  const result = await inspectPdf(bytes);
+  assert.ok(Date.now() - started < 5000, `join took ${Date.now() - started}ms`);
+  assert.equal(result.fields.length, count);
+  assert.deepEqual(result.fields[0], { name: "form.s0.code", value: "match-0", type: "text" });
+  assert.deepEqual(result.fields[count - 1], {
+    name: `form.s${count - 1}.code`,
+    value: `match-${count - 1}`,
+    type: "text",
   });
 });
 
@@ -817,4 +827,240 @@ test("decode budget: XFA packets whose aggregate decoded size exceeds the budget
     assert.match(error.message, /expands beyond the supported size/);
     return true;
   });
+});
+
+// --- B1 fix round 3 (panel re-review #2, S-1..S-5, Nov 18, 2026) ---------
+// Regression tests for the five adopted P1 findings. Probe shapes are
+// noted per test; the probe harness is panel/probe-rereview2.mts.
+
+test("S-1: a dataRef-bound subform's scope is honoured (probe A1 shape)", async () => {
+  // The supplier subform is dataRef-bound to $data.form.supplier, so
+  // the field's scope is [form, supplier] — and the supplier branch
+  // has no taxId. The sibling form.customer.taxId must NOT be claimed
+  // for it: the one-sided rule used to skip `supplier` as a
+  // template-only segment, but the subform's binding establishes that
+  // it is data scope.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="supplier"><bind match="dataRef" ref="$data.form.supplier"/><subform name="customer"><field name="taxId"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      "<supplier><customer><other>No tax ID here</other></customer></supplier><customer><taxId>CUSTOMER-ID</taxId></customer>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.supplier\.customer\.taxId.*has no data node/);
+    return true;
+  });
+});
+
+test("S-1: a bound subform's fields DO resolve under its dataRef (positive case)", async () => {
+  // The same A1 template, but the datasets DO carry the scoped node:
+  // form.supplier.taxId is inside the supplier scope, so it resolves.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="supplier"><bind match="dataRef" ref="$data.form.supplier"/><field name="taxId"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<supplier><taxId>SUPPLIER-ID</taxId></supplier><customer><taxId>CUSTOMER-ID</taxId></customer>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.supplier.taxId", value: "SUPPLIER-ID", type: "text" },
+  ]);
+});
+
+test("S-1: a dataRef-bound subform redirects scope even when its name differs", async () => {
+  // The subform is named `s` but dataRef-bound to $data.form.other:
+  // the scope is the ref's path, not the name. The field resolves to
+  // form.other.f — and NOT to a same-named leaf under form.s.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.other"/><field name="f"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<s><f>WRONG</f></s><other><f>RIGHT</f></other>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.other.f", value: "RIGHT", type: "text" }]);
+});
+
+test("S-1: a none-bound subform is transparent, like the W-9's Page1", async () => {
+  // The template nests the field under a page subform that is
+  // explicitly <bind match="none"/>; the datasets omit it. The scope
+  // is [form], so the field resolves — this is the W-9's own shape
+  // (Page1), and the transparency is established by the bind, not by
+  // the segment's name.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="Page1"><bind match="none"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<code>VALUE</code>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.code", value: "VALUE", type: "text" }]);
+});
+
+test("S-1: subform bindings that cannot establish a scope fail closed", async () => {
+  // A global-bound subform: global is a value lookup, not a scope.
+  const globalSubform = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="global"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<s><code>VALUE</code></s>",
+    ),
+  );
+  await assert.rejects(
+    inspectPdf(globalSubform),
+    /subform 'form\.s'.*cannot establish a data scope/,
+  );
+  // A dataRef-bound subform with no ref: missing scope, fail closed.
+  const missingRef = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<s><code>VALUE</code></s>",
+    ),
+  );
+  await assert.rejects(inspectPdf(missingRef), /subform 'form\.s'.*missing or empty ref/);
+  // An unknown subform bind match: unsupported scope mapping.
+  const unknownMatch = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="once"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<s><code>VALUE</code></s>",
+    ),
+  );
+  await assert.rejects(
+    inspectPdf(unknownMatch),
+    /subform 'form\.s'.*cannot establish a data scope/,
+  );
+});
+
+test("S-2: a literal dotted dataset name is rejected, never read as hierarchy (probe A2 shape)", async () => {
+  // Both branches present: the literal <a.b> must not collapse with
+  // the nested a > b into one form.a.b.code, and neither value may be
+  // reported as the other's.
+  const both = await createXfaPdf(
+    wrap(
+      '<subform name="a"><subform name="b"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      "<a.b><code>DECOY</code></a.b><a><b><code>RIGHT</code></b></a>",
+    ),
+  );
+  await assert.rejects(inspectPdf(both), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /cannot be represented in a SOM path/);
+    assert.doesNotMatch(error.message, /DECOY/);
+    return true;
+  });
+  // Only the dotted branch present: must NOT silently report DECOY as
+  // the nested template field's value.
+  const onlyDotted = await createXfaPdf(
+    wrap(
+      '<subform name="a"><subform name="b"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      "<a.b><code>DECOY</code></a.b>",
+    ),
+  );
+  await assert.rejects(inspectPdf(onlyDotted), /cannot be represented in a SOM path/);
+});
+
+test("S-2: a dotted template name is rejected the same way", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="a.b"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<code>VALUE</code>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), /cannot be represented in a SOM path/);
+});
+
+test("S-3: rich-text whitespace between elements is preserved (probe A3 shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<note><xhtml><body><p><b>A</b> <b>B</b></p></body></xhtml></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A B", type: "unsupported" }]);
+});
+
+test("S-3: pretty-printing indentation is still skipped, not kept as content", async () => {
+  // The same shape, but the whitespace between the elements holds line
+  // breaks (formatting indentation): it is dropped, as before.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<note><xhtml><body><p><b>A</b>\n  <b>B</b>\n</p></body></xhtml></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("S-4: two unbound sibling fields both survive, distinctly named (probe A4 shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="none"/><caption><value><text>First code</text></value></caption></field><field name="code"><ui><textEdit/></ui><bind match="none"/><caption><value><text>Second code</text></value></caption></field>',
+      "<other>no code data</other>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code[0]", value: "", type: "unsupported", label: "First code" },
+    { name: "form.code[1]", value: "", type: "unsupported", label: "Second code" },
+  ]);
+});
+
+test("S-4: a lone unbound field keeps its plain SOM name", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="none"/><caption><value><text>Only code</text></value></caption></field>',
+      "<other>no code data</other>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "", type: "unsupported", label: "Only code" },
+  ]);
+});
+
+test("S-5: the aggregate output-byte bound fails closed on a scaled amplification (probe A5 shape)", async () => {
+  // 10 KiB caption × 500 instances: ~5 MB of serialized labels from a
+  // small input. The 1 MiB aggregate bound must reject it before
+  // persistence or serialization. (The full 1 MiB × 10,000 shape is
+  // deliberately NOT run.)
+  const caption = "C".repeat(10 * 1024);
+  const instances = Array.from({ length: 500 }, (_, i) => `<item><code>V${i}</code></item>`).join(
+    "",
+  );
+  const bytes = await createXfaPdf(
+    wrap(
+      `<subform name="item"><field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>${caption}</text></value></caption></field></subform>`,
+      instances,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /more than 1048576 bytes of resolved fields/);
+    return true;
+  });
+});
+
+test("S-5: a bounded input stays under the byte bound and resolves", async () => {
+  // Same 500-instance shape with a short caption: ~25 KB of output,
+  // well under the 1 MiB bound — it resolves, proving the bound is a
+  // ceiling on amplification, not on repeat instances as such.
+  const instances = Array.from({ length: 500 }, (_, i) => `<item><code>V${i}</code></item>`).join(
+    "",
+  );
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="item"><field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>Code</text></value></caption></field></subform>',
+      instances,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 500);
+  assert.equal(result.fields[0]?.name, "form.item[0].code");
+  assert.equal(result.fields[0]?.value, "V0");
+  assert.equal(result.fields[0]?.label, "Code");
+  assert.equal(result.fields[499]?.name, "form.item[499].code");
 });

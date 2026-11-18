@@ -651,3 +651,105 @@ test("lineage ends at a missing ancestor and cannot loop on a cycle", async () =
     [yId, xId],
   );
 });
+
+// --- B1 fix round 3 (panel re-review #2, S-minor + test adequacy) --------
+
+test("search rejects impossible calendar dates, service-level and over HTTP", async () => {
+  const owner = "strict-date-owner";
+  await agent.files.import(owner, "xfa-static.pdf", await fixture("xfa-static.pdf"), "test");
+  // 2026 is not a leap year: Feb 30 does not exist. Date.parse would
+  // normalize it to March 2; strict validation must reject it.
+  for (const bad of [
+    "2026-02-30",
+    "2023-02-29",
+    "2026-13-01",
+    "2026-00-10",
+    "2026-04-31",
+    "2026-11-18T25:00:00.000Z",
+    "2026-11-18T12:60:00.000Z",
+    "2026-02-30T00:00:00.000Z",
+  ]) {
+    await assert.rejects(
+      agent.files.search(owner, { from: bad }),
+      (error: unknown) => {
+        assert.equal((error as { status?: number }).status, 422);
+        assert.match(
+          (error as Error).message,
+          /not a (valid ISO date|real calendar date|valid time)/,
+        );
+        return true;
+      },
+      `from=${bad}`,
+    );
+    await assert.rejects(
+      agent.files.search(owner, { to: bad }),
+      /not a (valid ISO date|real calendar date|valid time)/,
+      `to=${bad}`,
+    );
+  }
+  // The same rejections over HTTP, where the route's zod refine uses
+  // the same strict check.
+  for (const bad of ["2026-02-30", "2023-02-29"]) {
+    const response = await app.request(`/api/files/search?from=${bad}`, {
+      headers: headers(),
+    });
+    assert.equal(response.status, 422, `from=${bad}`);
+  }
+  // Leap day exists in a leap year, and valid dates still filter.
+  assert.ok((await agent.files.search(owner, { from: "2024-02-29" })).length >= 1);
+  assert.ok((await agent.files.search(owner, { to: "2026-11-18T12:00:00.000Z" })).length >= 0);
+});
+
+test("a malformed XFA import fails over HTTP and persists no row and no bytes", async () => {
+  const owner = "malformed-http-owner";
+  const filesBefore = await readdir(join(directory, "files"));
+  // Service-level first: the import rejects, and the owner's list stays empty.
+  await assert.rejects(
+    agent.files.import(
+      owner,
+      "xfa-malformed-mismatch.pdf",
+      await fixture("xfa-malformed-mismatch.pdf"),
+      "test",
+    ),
+    (error: unknown) => {
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match((error as Error).message, /mismatch.*ghostField/);
+      return true;
+    },
+  );
+  assert.deepEqual(await agent.files.list(owner), []);
+  assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
+  // Over HTTP: a multipart upload of the same malformed PDF is a 422,
+  // and neither the session owner's file list nor the bytes on disk
+  // gains anything from the attempt.
+  const listBefore: { id: string }[] = await (
+    await app.request("/api/files", { headers: headers() })
+  ).json();
+  const form = new FormData();
+  form.append(
+    "file",
+    new File(
+      [new Uint8Array(await fixture("xfa-malformed-unclosed.pdf"))],
+      "xfa-malformed-unclosed.pdf",
+      {
+        type: "application/pdf",
+      },
+    ),
+  );
+  const response = await app.request("/api/files", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  assert.equal(response.status, 422);
+  const listAfter: { id: string }[] = await (
+    await app.request("/api/files", { headers: headers() })
+  ).json();
+  // Compare ids only: each list() re-signs the content URLs with a fresh
+  // expiry, so the full rows differ run to run even when nothing changed.
+  assert.deepEqual(
+    listAfter.map((file) => file.id),
+    listBefore.map((file) => file.id),
+  );
+  assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
+});
