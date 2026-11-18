@@ -117,3 +117,88 @@ test("transaction rolls back every put when the work throws", async (t) => {
   );
   assert.equal(await db.get("owner", "notes", "n1"), null);
 });
+
+// --- B1 fix round 2 (panel re-review R-2, Nov 18, 2026) -------------------
+// These transaction tests exercise the EMBEDDED PGlite backend:
+// createStore() with no databaseUrl builds a PGlite store, which is the
+// backend the tests run against. The pg backend is NOT exercised here —
+// it needs a live Postgres, which this environment does not provide.
+// Its transaction shape (a dedicated pooled client checked out for the
+// whole transaction) is structurally immune to the interleaving below:
+// a pooled client cannot see another transaction's writes, and a plain
+// pool.query can never land on the transaction's client. The PGlite
+// backend needed the fix because it is a single connection shared by
+// every query.
+
+// R-2: overlapping transactions stay independent (probe R7 shape).
+test("overlapping transactions do not commit each other's rows", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const gate = new Promise<void>((resolve) => setTimeout(resolve, 50));
+  const a = db.transaction(async (tx) => {
+    await tx.put("owner-a", "files", { id: "a1", text: "A" });
+    await gate; // yield: B's whole transaction runs here
+    throw new Error("audit write failed");
+  });
+  const b = db.transaction(async (tx) => {
+    await tx.put("owner-b", "files", { id: "b1", text: "B" });
+    await tx.put("system", "file-pull-audit", { id: "audit-b", text: "B" });
+  });
+  const results = await Promise.allSettled([a, b]);
+  assert.equal(results[0].status, "rejected");
+  assert.equal(results[1].status, "fulfilled");
+  // A's row must be gone: B's COMMIT must not have committed it, and
+  // A's ROLLBACK must have undone it.
+  assert.equal(await db.get("owner-a", "files", "a1"), null);
+  assert.deepEqual(await db.get("owner-b", "files", "b1"), { id: "b1", text: "B" });
+  assert.deepEqual(await db.get("system", "file-pull-audit", "audit-b"), {
+    id: "audit-b",
+    text: "B",
+  });
+});
+
+test("an ordinary write issued mid-transaction is not swept into it", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  const gate = new Promise<void>((resolve) => setTimeout(resolve, 50));
+  const doomed = db.transaction(async (tx) => {
+    await tx.put("owner-c", "files", { id: "c1", text: "C" });
+    await gate;
+    throw new Error("rollback me");
+  });
+  // Issue the plain write while the transaction is open: on the shared
+  // single connection it used to join the open transaction and be rolled
+  // back with it, even though its own call fulfilled.
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  const plain = db.put("owner-d", "files", { id: "d1", text: "D" });
+  const results = await Promise.allSettled([doomed, plain]);
+  assert.equal(results[0].status, "rejected");
+  assert.equal(results[1].status, "fulfilled");
+  assert.equal(await db.get("owner-c", "files", "c1"), null);
+  assert.deepEqual(await db.get("owner-d", "files", "d1"), { id: "d1", text: "D" });
+});
+
+test("nested transaction calls join the ambient transaction", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  await db.transaction(async (tx) => {
+    await tx.put("owner", "notes", { id: "n1", text: "outer" });
+    await tx.transaction(async (inner) => {
+      await inner.put("owner", "notes", { id: "n2", text: "inner" });
+    });
+  });
+  assert.deepEqual(await db.get("owner", "notes", "n1"), { id: "n1", text: "outer" });
+  assert.deepEqual(await db.get("owner", "notes", "n2"), { id: "n2", text: "inner" });
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      await tx.put("owner", "notes", { id: "n3", text: "outer" });
+      await tx.transaction(async (inner) => {
+        await inner.put("owner", "notes", { id: "n4", text: "inner" });
+      });
+      throw new Error("boom");
+    }),
+    /boom/,
+  );
+  assert.equal(await db.get("owner", "notes", "n3"), null);
+  assert.equal(await db.get("owner", "notes", "n4"), null);
+});

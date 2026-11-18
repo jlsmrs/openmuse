@@ -15,6 +15,7 @@ import type { Artifact } from "../packages/domain/src/index.ts";
 let db: Store;
 let app: Awaited<ReturnType<typeof createApp>>["app"];
 let agent: AgentService;
+let auth: Auth;
 let config: Config;
 let token: string;
 let directory: string;
@@ -36,7 +37,7 @@ before(async () => {
     googleRedirectUri: "http://localhost:8787/api/google/callback",
     allowedOrigins: ["http://localhost:8081"],
   };
-  ({ app, agent } = await createApp(db, config));
+  ({ app, agent, auth } = await createApp(db, config));
   const response = await app.request("/api/session", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -285,6 +286,13 @@ test("pull copies a PDF across owners with lineage, source, and an audit entry",
   assert.equal((await agent.files.get("summerstead", source.id)).parentId, undefined);
   // The pulled URL is signed for the target owner.
   assert.match(pulled.url, new RegExp(`/api/files/${pulled.id}/content`));
+  // The signature itself binds the TARGET owner, not just the URL path:
+  // verify() returns the signing owner, and the same URL with the owner
+  // swapped to the source fails verification.
+  assert.equal(auth.verify(new URL(pulled.url)), "veritas");
+  const tampered = new URL(pulled.url);
+  tampered.searchParams.set("owner", "summerstead");
+  assert.throws(() => auth.verify(tampered), /Invalid access link/);
   const audits = await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION);
   const audit = audits.find((entry) => entry.fileId === pulled.id);
   assert.ok(audit);
@@ -436,4 +444,210 @@ test("pull route copies across owners and enforces its guards over HTTP", async 
     body: JSON.stringify({ toOwner: "veritas" }),
   });
   assert.equal(missing.status, 404);
+});
+
+// --- B1 fix round 2 (panel re-review R-9 + test adequacy, Nov 18, 2026) ---
+
+test("R-9: legacy rows without formKind report formKind none in list and search", async () => {
+  const legacy = {
+    id: randomUUID(),
+    name: "old-form.pdf",
+    mimeType: "application/pdf",
+    size: 1234,
+    pageCount: 2,
+    fields: [],
+    url: "",
+    createdAt: "2026-11-01T10:00:00.000Z",
+    source: "test",
+  } satisfies Artifact;
+  await db.put("legacy-owner", "files", legacy);
+  const listed = await agent.files.list("legacy-owner");
+  assert.equal(listed.find((file) => file.id === legacy.id)?.formKind, "none");
+  const found = await agent.files.search("legacy-owner", { formKind: "none" });
+  assert.ok(found.some((file) => file.id === legacy.id));
+  assert.equal(found.find((file) => file.id === legacy.id)?.formKind, "none");
+  // The fallback is a projection, not a backfill: the stored row itself
+  // still has no formKind on it.
+  const stored = await db.get<Artifact>("legacy-owner", "files", legacy.id);
+  assert.equal(stored?.formKind, undefined);
+});
+
+test("field-less XFA is searchable by name and pulls like any other file", async () => {
+  const owner = "fieldless-owner";
+  const fieldless = await agent.files.import(
+    owner,
+    "xfa-fieldless.pdf",
+    await fixture("xfa-fieldless.pdf"),
+    "test",
+  );
+  assert.deepEqual(
+    (await agent.files.search(owner, { q: "xfa-fieldless" })).map((file) => file.id),
+    [fieldless.id],
+  );
+  assert.deepEqual(
+    (await agent.files.search(owner, { formKind: "xfa-static" })).map((file) => file.id),
+    [fieldless.id],
+  );
+  const pulled = await agent.files.pull(owner, fieldless.id, "veritas");
+  assert.equal(pulled.formKind, "xfa-static");
+  assert.deepEqual(pulled.fields, []);
+  assert.equal(pulled.parentId, fieldless.id);
+  assert.equal(pulled.source, `Pulled from ${owner}/${fieldless.id}`);
+  assert.deepEqual(
+    new Uint8Array(await agent.files.bytes("veritas", pulled.id)),
+    new Uint8Array(await fixture("xfa-fieldless.pdf")),
+  );
+  const audits = await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION);
+  assert.ok(audits.some((entry) => entry.fileId === pulled.id));
+});
+
+test("pull is type-agnostic: image, audio, video, and unrecognized types pull directly", async () => {
+  const owner = "media-owner";
+  const sources: { name: string; bytes: Uint8Array; mimeType: string }[] = [
+    {
+      name: "photo.png",
+      bytes: new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]),
+      mimeType: "image/png",
+    },
+    {
+      name: "song.mp3",
+      bytes: new Uint8Array([...new TextEncoder().encode("ID3"), 0, 0, 0, 0]),
+      mimeType: "audio/mpeg",
+    },
+    {
+      name: "clip.mp4",
+      bytes: new Uint8Array([0, 0, 0, 0x18, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d]),
+      mimeType: "video/mp4",
+    },
+    {
+      name: "blob.xyz",
+      bytes: new Uint8Array([1, 2, 3, 4, 5]),
+      mimeType: "application/octet-stream",
+    },
+  ];
+  const imported: { artifact: Artifact; bytes: Uint8Array }[] = [];
+  for (const source of sources) {
+    const artifact = await agent.files.import(owner, source.name, source.bytes, "test");
+    assert.equal(artifact.mimeType, source.mimeType, source.name);
+    imported.push({ artifact, bytes: source.bytes });
+  }
+  const auditsBefore = await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION);
+  const pulledIds: string[] = [];
+  for (const { artifact, bytes } of imported) {
+    const pulled = await agent.files.pull(owner, artifact.id, "veritas");
+    assert.equal(pulled.mimeType, artifact.mimeType);
+    assert.equal(pulled.parentId, artifact.id);
+    assert.deepEqual(new Uint8Array(await agent.files.bytes("veritas", pulled.id)), bytes);
+    pulledIds.push(pulled.id);
+  }
+  const auditsAfter = await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION);
+  assert.equal(auditsAfter.length, auditsBefore.length + imported.length);
+  for (const pulledId of pulledIds) {
+    assert.ok(auditsAfter.some((entry) => entry.fileId === pulledId));
+  }
+});
+
+test("search date filters use fixed boundary instants, not the current day", async () => {
+  const owner = "fixed-date-owner";
+  const rows: { id: string; createdAt: string }[] = [
+    { id: randomUUID(), createdAt: "2026-11-18T00:00:00.000Z" },
+    { id: randomUUID(), createdAt: "2026-11-18T23:59:59.999Z" },
+    { id: randomUUID(), createdAt: "2026-11-19T00:00:00.000Z" },
+    { id: randomUUID(), createdAt: "2026-11-17T23:59:59.999Z" },
+  ];
+  for (const [index, row] of rows.entries()) {
+    await db.put(owner, "files", {
+      id: row.id,
+      name: `fixed-${index}.txt`,
+      mimeType: "text/plain",
+      size: 1,
+      pageCount: 0,
+      fields: [],
+      formKind: "none",
+      url: "",
+      createdAt: row.createdAt,
+      source: "test",
+    } satisfies Artifact);
+  }
+  const [idA, idB, idC, idD] = rows.map((row) => row.id);
+  const ids = (files: Artifact[]) => files.map((file) => file.id).sort();
+  const sorted = (...idsToSort: string[]) => [...idsToSort].sort();
+  // A bare `to` date is inclusive of the whole day: A and B match, C
+  // (the next midnight) does not, D (before) does.
+  assert.deepEqual(
+    ids(await agent.files.search(owner, { to: "2026-11-18" })),
+    sorted(idA, idB, idD),
+  );
+  // A bare `from` date means the start of that day: D drops out.
+  assert.deepEqual(
+    ids(await agent.files.search(owner, { from: "2026-11-18" })),
+    sorted(idA, idB, idC),
+  );
+  assert.deepEqual(
+    ids(await agent.files.search(owner, { from: "2026-11-18", to: "2026-11-18" })),
+    sorted(idA, idB),
+  );
+  // A full-timestamp `to` is inclusive of the instant only: B (23:59)
+  // is past noon, so only A and D match.
+  assert.deepEqual(
+    ids(await agent.files.search(owner, { to: "2026-11-18T12:00:00.000Z" })),
+    sorted(idA, idD),
+  );
+  assert.deepEqual(
+    ids(await agent.files.search(owner, { from: "2026-11-18T23:59:59.999Z" })),
+    sorted(idB, idC),
+  );
+});
+
+test("lineage ends at a missing ancestor and cannot loop on a cycle", async () => {
+  const owner = "lineage-edge-owner";
+  const orphan = {
+    id: randomUUID(),
+    name: "orphan.txt",
+    mimeType: "text/plain",
+    size: 1,
+    pageCount: 0,
+    fields: [],
+    formKind: "none",
+    url: "",
+    createdAt: "2026-11-18T00:00:00.000Z",
+    source: "test",
+    parentId: randomUUID(),
+  } satisfies Artifact;
+  await db.put(owner, "files", orphan);
+  // The parent id names no stored row: the chain is just the file itself.
+  assert.deepEqual(
+    (await agent.files.lineage(owner, orphan.id)).map((file) => file.id),
+    [orphan.id],
+  );
+  const xId = randomUUID();
+  const yId = randomUUID();
+  const base: Omit<Artifact, "id" | "name" | "parentId"> = {
+    mimeType: "text/plain",
+    size: 1,
+    pageCount: 0,
+    fields: [],
+    formKind: "none",
+    url: "",
+    createdAt: "2026-11-18T00:00:00.000Z",
+    source: "test",
+  };
+  await db.put(owner, "files", {
+    ...base,
+    id: xId,
+    name: "x.txt",
+    parentId: yId,
+  } satisfies Artifact);
+  await db.put(owner, "files", {
+    ...base,
+    id: yId,
+    name: "y.txt",
+    parentId: xId,
+  } satisfies Artifact);
+  // X's parent is Y and Y's parent is X: the walk must terminate.
+  const chain = await agent.files.lineage(owner, xId);
+  assert.deepEqual(
+    chain.map((file) => file.id),
+    [yId, xId],
+  );
 });
