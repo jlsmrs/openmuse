@@ -12,6 +12,7 @@ import {
   emailDraftSchema,
   proposalSchema,
 } from "../../../packages/domain/src/index.ts";
+import { PdfError } from "../../../packages/integrations/src/pdf.ts";
 import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
 import { createAuth } from "./auth.ts";
@@ -90,6 +91,24 @@ export async function createApp(
     if (error instanceof z.ZodError)
       return c.json({ error: error.issues.map((i) => i.message).join("; ") }, 422);
     if (error instanceof AppError) return c.json({ error: error.message }, error.status);
+    if (error instanceof PdfError) {
+      // Bounded diagnostic detail only: the cause's name (when it is a
+      // plain identifier) and the parser's numeric byte offset, extracted
+      // from the message — never the message text itself, never file
+      // bytes, and never a stack trace.
+      const causeName =
+        error.cause instanceof Error && /^[\w.]{1,40}$/.test(error.cause.name)
+          ? error.cause.name
+          : "Error";
+      const offset =
+        error.cause instanceof Error ? /"offset":(\d+)/.exec(error.cause.message)?.[1] : undefined;
+      console.error(
+        offset
+          ? `[OpenMuse] PdfError: ${causeName} offset=${offset}`
+          : `[OpenMuse] PdfError: ${causeName}`,
+      );
+      return c.json({ error: error.message }, error.status);
+    }
     if (error.name === "RecurringEventError") return c.json({ error: error.message }, 422);
     if (error instanceof SyntaxError) return c.json({ error: "Invalid request data" }, 400);
     // Provider and document errors are useful, but raw stack traces and token-bearing responses are not.
