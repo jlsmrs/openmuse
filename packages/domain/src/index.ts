@@ -89,14 +89,31 @@ export interface Artifact {
   createdAt: string;
   source: string;
   parentId?: string;
-  fields?: { name: string; value: string; type: "text" | "checkbox" | "unsupported" }[];
+  fields?: {
+    name: string;
+    value: string;
+    type: "text" | "checkbox" | "unsupported";
+    /** Dropdown/radio option list (XFA choiceList / exclGroup). */
+    options?: string[];
+    /** Template caption text, when present. */
+    label?: string;
+    /** Checkbox on-values, one per template occurrence (XFA only). */
+    onValues?: string[];
+  }[];
   /** Form flavour from inspectPdf ("none" for non-PDFs and PDFs with no form). */
   formKind?: FormKind;
   /**
    * Post-fill field map, reserved for the B2 fill build: accepted and
    * persisted (and copied by pull) but never populated by B1 code paths.
    */
-  appliedFields?: { name: string; value: string; type: "text" | "checkbox" | "unsupported" }[];
+  appliedFields?: {
+    name: string;
+    value: string;
+    type: "text" | "checkbox" | "unsupported";
+    options?: string[];
+    label?: string;
+    onValues?: string[];
+  }[];
 }
 export interface BrowserSession {
   id: string;
