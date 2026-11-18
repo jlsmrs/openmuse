@@ -807,6 +807,60 @@ test("a malformed XFA import fails over HTTP and persists no row and no bytes", 
   assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
 });
 
+test("a failed XFA import logs no field value (captured-log assertion, round 5)", async () => {
+  // The only log sites on the import/PdfError path are app.ts onError
+  // (cause name + numeric offset only — never the message text, never
+  // file bytes) and log.ts backgroundFailure (error name + code only,
+  // used by pull cleanup, not import). A template/datasets mismatch
+  // whose datasets carry a distinctive secret value must therefore
+  // leave no trace of that value in the server log — nor in the 422
+  // response body, which names the field, not its value.
+  const secret = "SECRET-VALUE-7F3A9-DO-NOT-LOG";
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form><other>${secret}</other></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    const form = new FormData();
+    form.append(
+      "file",
+      new File([new Uint8Array(bytes)], "xfa-secret-value.pdf", {
+        type: "application/pdf",
+      }),
+    );
+    const response = await app.request("/api/files", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    });
+    assert.equal(response.status, 422);
+    const body = await response.text();
+    assert.doesNotMatch(body, new RegExp(secret));
+    assert.match(body, /has no data node/);
+  } finally {
+    console.error = originalError;
+  }
+  // Non-vacuous: the PdfError log line itself must have been captured
+  // (the error path really ran through onError), while the secret
+  // appears nowhere in what was captured.
+  const logged = captured.join("\n");
+  assert.match(logged, /PdfError/);
+  assert.doesNotMatch(logged, new RegExp(secret));
+});
+
 test("an output-limit import fails over HTTP and persists no row and no bytes", async () => {
   // M6c, round 4: round 3 added the malformed-XML HTTP test only; the
   // 1 MiB output-byte bound had no HTTP coverage. One field whose
