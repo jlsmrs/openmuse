@@ -5,6 +5,35 @@ import pg from "pg";
 import { backgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
+
+/**
+ * A promise-chain mutex: each holder runs alone, in call order. Used to
+ * serialize every operation on the embedded PGlite connection (see
+ * createStore): PGlite is a single connection, and a plain query issued
+ * while a transaction is open on that connection joins the open
+ * transaction — it can be committed by another transaction's COMMIT or
+ * rolled back by its ROLLBACK. The mutex keeps a whole transaction
+ * (including its awaits) and every ordinary query mutually exclusive, so
+ * neither can leak into the other.
+ */
+function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<void> = Promise.resolve();
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = tail;
+    tail = previous.then(() => gate);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
+
 interface Database {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
   /**
@@ -12,9 +41,15 @@ interface Database {
    * commits together or rolls back together. The pg implementation
    * checks a single client out of the pool for the whole transaction
    * (pool.query would not be atomic — BEGIN and the writes could land on
-   * different clients); PGlite is a single connection, so sequential
-   * BEGIN/COMMIT on it is atomic. A nested call just joins the ambient
-   * transaction.
+   * different clients). The PGlite implementation uses PGlite's
+   * transaction API with its transaction-scoped query handle, and the
+   * whole transaction is additionally serialized against ALL other
+   * access to the embedded connection (see createMutex): sequential
+   * BEGIN/COMMIT on the single connection is NOT atomic under async
+   * callbacks — an await inside one transaction lets another
+   * transaction's queries interleave, and a plain query issued
+   * mid-transaction joins the open transaction. A nested call just
+   * joins the ambient transaction.
    */
   transaction: <T>(fn: (query: Database["query"]) => Promise<T>) => Promise<T>;
   close: () => Promise<void>;
@@ -266,19 +301,18 @@ export async function createStore(
     if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
     const embedded = new PGlite(options.dataDir);
     await embedded.waitReady;
+    // One lock for the whole embedded connection: a transaction callback
+    // holds it from its first query to its commit/rollback, and every
+    // ordinary query holds it for its single statement. The lock is held
+    // only by the outermost operation — the transaction-scoped query
+    // handle below never re-acquires it, so there is no re-entrancy.
+    const exclusive = createMutex();
     database = {
-      query: (sql, params) => embedded.query<Row>(sql, params),
-      transaction: async (fn) => {
-        await embedded.query("BEGIN");
-        try {
-          const result = await fn((sql, params) => embedded.query<Row>(sql, params));
-          await embedded.query("COMMIT");
-          return result;
-        } catch (error) {
-          await embedded.query("ROLLBACK").catch(() => undefined);
-          throw error;
-        }
-      },
+      query: (sql, params) => exclusive(() => embedded.query<Row>(sql, params)),
+      transaction: async (fn) =>
+        exclusive(() =>
+          embedded.transaction(async (tx) => fn((sql, params) => tx.query<Row>(sql, params))),
+        ),
       close: () => embedded.close(),
     };
   }
