@@ -7,11 +7,38 @@ import { backgroundFailure } from "./log.ts";
 type Row = { data: Record<string, unknown> };
 interface Database {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  /**
+   * Run `fn` inside one database transaction: every query `fn` issues
+   * commits together or rolls back together. The pg implementation
+   * checks a single client out of the pool for the whole transaction
+   * (pool.query would not be atomic — BEGIN and the writes could land on
+   * different clients); PGlite is a single connection, so sequential
+   * BEGIN/COMMIT on it is atomic. A nested call just joins the ambient
+   * transaction.
+   */
+  transaction: <T>(fn: (query: Database["query"]) => Promise<T>) => Promise<T>;
   close: () => Promise<void>;
 }
 
 export class Store {
   constructor(private readonly db: Database) {}
+  /**
+   * Run `work` with a transactional view of this store: every put/remove
+   * inside `work` commits together or rolls back together. Used by
+   * Files.pull so the artifact copy and its audit entry are one unit —
+   * a failed audit write can never leave a visible, unaudited copy.
+   */
+  async transaction<T>(work: (tx: Store) => Promise<T>): Promise<T> {
+    return this.db.transaction(async (query) => {
+      const txDatabase: Database = {
+        query,
+        // Already inside a transaction: join it.
+        transaction: (fn) => fn(query),
+        close: async () => {},
+      };
+      return work(new Store(txDatabase));
+    });
+  }
   /** Liveness probe: true when the database answers, false otherwise. Never throws. */
   async ping(): Promise<boolean> {
     try {
@@ -217,13 +244,41 @@ export async function createStore(
   let database: Database;
   if (options.databaseUrl) {
     const pool = createPool(options.databaseUrl);
-    database = { query: async (sql, params) => pool.query(sql, params), close: () => pool.end() };
+    database = {
+      query: async (sql, params) => pool.query(sql, params),
+      transaction: async (fn) => {
+        const client = await pool.connect();
+        try {
+          await client.query("BEGIN");
+          const result = await fn((sql, params) => client.query(sql, params));
+          await client.query("COMMIT");
+          return result;
+        } catch (error) {
+          await client.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        } finally {
+          client.release();
+        }
+      },
+      close: () => pool.end(),
+    };
   } else {
     if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
     const embedded = new PGlite(options.dataDir);
     await embedded.waitReady;
     database = {
       query: (sql, params) => embedded.query<Row>(sql, params),
+      transaction: async (fn) => {
+        await embedded.query("BEGIN");
+        try {
+          const result = await fn((sql, params) => embedded.query<Row>(sql, params));
+          await embedded.query("COMMIT");
+          return result;
+        } catch (error) {
+          await embedded.query("ROLLBACK").catch(() => undefined);
+          throw error;
+        }
+      },
       close: () => embedded.close(),
     };
   }

@@ -9,6 +9,7 @@ import type { Store } from "./db.ts";
 import { isExtractableDocumentMime } from "./engine/document-text.ts";
 import { isConvertibleImageMime, isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
+import { backgroundFailure } from "./log.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -211,6 +212,36 @@ export function deterministicFileId(owner: string, operationKey: string): string
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** One row of a file's lineage: provenance only. No field values, no
+ * applied field map, and no signed URL ever cross owners here — the
+ * chain (ids, names, owners, times) is what lineage reconstructs, and
+ * the full Artifact rows stay behind the owner-scoped `get`. */
+export interface FileLineageEntry {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  pageCount: number;
+  formKind: FormKind;
+  source: string;
+  parentId?: string;
+  createdAt: string;
+}
+
+function toLineageEntry(file: Artifact): FileLineageEntry {
+  return {
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    size: file.size,
+    pageCount: file.pageCount,
+    formKind: file.formKind ?? "none",
+    source: file.source,
+    ...(file.parentId !== undefined ? { parentId: file.parentId } : {}),
+    createdAt: file.createdAt,
+  };
+}
+
 export class Files {
   constructor(
     private readonly db: Store,
@@ -351,6 +382,11 @@ export class Files {
    * filters. Owner-scoped: another owner's files can never match.
    * Returned rows keep the existing Artifact shape — no snippet field,
    * so field values (SSNs/EINs on a W-9) never leak into list surfaces.
+   * Date-interval semantics: `from` is inclusive of its start (a bare
+   * date means the start of that day); `to` is inclusive of the whole
+   * day when given as a bare date (2026-11-18 matches files created at
+   * any time that day) and inclusive of the instant when given as a full
+   * timestamp. `from` after `to` is a 422.
    */
   async search(
     owner: string,
@@ -358,7 +394,10 @@ export class Files {
   ): Promise<Artifact[]> {
     const needle = query.q?.trim().toLowerCase();
     const from = query.from === undefined ? Number.NaN : Date.parse(query.from);
-    const to = query.to === undefined ? Number.NaN : Date.parse(query.to);
+    let to = query.to === undefined ? Number.NaN : Date.parse(query.to);
+    if (Number.isFinite(to) && /^\d{4}-\d{2}-\d{2}$/.test(query.to ?? "")) to += 86400000 - 1;
+    if (Number.isFinite(from) && Number.isFinite(to) && from > to)
+      throw new AppError("Search date range is invalid: 'from' must be on or before 'to'", 422);
     return (await this.list(owner)).filter((file) => {
       if (query.formKind !== undefined && (file.formKind ?? "none") !== query.formKind)
         return false;
@@ -381,7 +420,11 @@ export class Files {
    * PDF-specific logic lives anywhere in this path. The source row is
    * untouched and the copy gets a fresh id, `parentId` = source id, and
    * `source` = "Pulled from <source-owner>/<id>". The audit entry is
-   * written with the copy: if the copy fails, no audit entry exists.
+   * written in the same database transaction as the copy, so the two
+   * commit or roll back together: a failed audit write can never leave
+   * a visible, unaudited copy. The bytes file is written before the
+   * transaction and removed again if the transaction fails (a removal
+   * failure is logged loudly, never swallowed).
    */
   async pull(owner: string, id: string, toOwner: string): Promise<Artifact> {
     if (typeof toOwner !== "string" || toOwner.trim() === "" || toOwner !== toOwner.trim())
@@ -412,22 +455,28 @@ export class Files {
       source: `Pulled from ${owner}/${id}`,
       parentId: id,
     };
+    const audit: FilePullAudit = {
+      id: randomUUID(),
+      who: owner,
+      fileId: newId,
+      fileName: source.name,
+      sourceId: id,
+      from: owner,
+      to: toOwner,
+      when,
+    };
     try {
-      await this.db.put(toOwner, "files", artifact);
-      const audit: FilePullAudit = {
-        id: randomUUID(),
-        who: owner,
-        fileId: newId,
-        fileName: source.name,
-        sourceId: id,
-        from: owner,
-        to: toOwner,
-        when,
-      };
-      await this.db.put("system", FILE_PULL_AUDIT_COLLECTION, audit);
+      await this.db.transaction(async (tx) => {
+        await tx.put(toOwner, "files", artifact);
+        await tx.put("system", FILE_PULL_AUDIT_COLLECTION, audit);
+      });
     } catch (error) {
-      await this.db.remove(toOwner, "files", newId).catch(() => undefined);
-      await rm(path, { force: true }).catch(() => undefined);
+      // The transaction rolled the copy and the audit entry back
+      // together; the bytes file is not part of it, so remove it — and
+      // log loudly if even the removal fails, never swallow it.
+      await rm(path, { force: true }).catch((removeError: unknown) =>
+        backgroundFailure("file pull cleanup", removeError),
+      );
       throw error;
     }
     return this.signed(toOwner, artifact);
@@ -435,24 +484,24 @@ export class Files {
   /**
    * Full lineage of a file, oldest → newest, by walking parentId links
    * across owners (a hop lives under its target owner, so the walk reads
-   * the whole files table, not one owner's rows). Rows are returned as
-   * stored (unsigned): signing another owner's row for this caller would
-   * be wrong. A missing or deleted ancestor ends the chain; a cycle
-   * cannot loop forever.
+   * the whole files table, not one owner's rows). Rows are
+   * provenance-only (see FileLineageEntry): the chain, the owners, and
+   * the times — never field values or signed URLs. A missing or deleted
+   * ancestor ends the chain; a cycle cannot loop forever.
    */
-  async lineage(owner: string, id: string): Promise<Artifact[]> {
+  async lineage(owner: string, id: string): Promise<FileLineageEntry[]> {
     const start = await this.get(owner, id);
     const byId = new Map(
       (await this.db.scan<Artifact>("files")).map((row) => [row.value.id, row.value]),
     );
-    const chain: Artifact[] = [start];
+    const chain: FileLineageEntry[] = [toLineageEntry(start)];
     const seen = new Set([start.id]);
     let current = start;
     while (current.parentId !== undefined && !seen.has(current.parentId)) {
       const parent = byId.get(current.parentId);
       if (!parent) break;
       seen.add(parent.id);
-      chain.push(parent);
+      chain.push(toLineageEntry(parent));
       current = parent;
     }
     return chain.reverse();
