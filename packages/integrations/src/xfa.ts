@@ -25,6 +25,15 @@ import type { FormKind } from "../../domain/src/index.ts";
  * - `decodePDFRawStream(stream).decode()` returns the decoded packet
  *   bytes; decoding runs inside pdf.ts's decode budget (see
  *   withDecodeBudget), so a hostile packet cannot expand without bound.
+ *
+ * The parser runs with `preserveOrder: true`, so the parsed tree is an
+ * ordered node list, not a key-grouped object: sibling and text order
+ * are document order throughout (rich text flattens to "ABC", a
+ * `global` bind takes the first same-named leaf in document order).
+ * The ordered tree is built once per packet by `convertEntries`, which
+ * is also the whole-document depth gate and the namespace-collision
+ * gate — every later walk runs over a tree that is already
+ * depth-bounded and collision-free.
  */
 export class XfaError extends Error {
   readonly status = 422;
@@ -46,6 +55,14 @@ const MAX_XFA_DEPTH = 100;
  * report more than this many fields fails closed instead.
  */
 const MAX_JOINED_FIELDS = 10000;
+/**
+ * Hard work bound for the SOM join: one structural path comparison per
+ * same-named candidate leaf (R-7). Leaves are indexed by name, so
+ * unrelated leaves cost nothing; a form whose same-named candidates
+ * would need more than this many comparisons fails closed instead of
+ * burning CPU in the request path.
+ */
+const MAX_JOIN_WORK = 1000000;
 
 export type XfaFieldType = "text" | "checkbox" | "unsupported";
 
@@ -68,50 +85,155 @@ const xmlParser = new XMLParser({
   parseAttributeValue: false,
   trimValues: false,
   processEntities: true,
+  // Ordered output: sibling/text order is document order. Without this
+  // the parser groups same-named siblings into arrays, so neither rich
+  // text ("ABC" vs "ACB") nor first-in-document-order `global` picks
+  // can be recovered from the parsed tree.
+  preserveOrder: true,
 });
-
-function asArray<T>(value: T | T[] | undefined): T[] {
-  if (value === undefined) return [];
-  return Array.isArray(value) ? value : [value];
-}
 
 type XmlRecord = Record<string, unknown>;
 
+/**
+ * A record is a plain object — never an array. Arrays are repeated
+ * elements (or repeated attributes), not singletons: treating one as a
+ * record let duplicate <bind>/<ui>/<caption> elements silently pass as
+ * a single binding or UI (R-5).
+ */
 function isRecord(value: unknown): value is XmlRecord {
-  return typeof value === "object" && value !== null;
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
- * Concatenate every text leaf under a node (captions, rich-text values),
- * in parser entry order. Fails closed (throws) when the depth guard is
- * hit. Mixed content has a documented parser limitation: fast-xml-parser
- * merges the text around child elements into a single #text value, so
- * their document order is lost. For field VALUES (strict) that is a
- * fail-closed 422 rather than an invented order; for captions (lenient)
- * the flattened label is best-effort — the parser exposes #text last, so
- * free text lands after the styled spans — and the label is display-only.
- * Whitespace-only #text (pretty-printing between elements) carries no
- * order-sensitive content and is skipped in strict mode.
+ * One element of the ordered XML tree: its qualified tag name as
+ * written, its local name (after the last ":"), its string attributes,
+ * and its mixed content — element children and text, in document
+ * order. Keeping text interleaved with elements (instead of merging it
+ * into one #text value) is what makes rich-text order recoverable.
  */
-function nodeText(node: unknown, depth = 0, strict = false): string {
+interface XElement {
+  name: string;
+  local: string;
+  attrs: Record<string, string>;
+  content: Array<XElement | string>;
+}
+
+function elementChildren(element: XElement): XElement[] {
+  return element.content.filter((item): item is XElement => typeof item !== "string");
+}
+
+function childrenNamed(element: XElement, local: string): XElement[] {
+  return elementChildren(element).filter((child) => child.local === local);
+}
+
+/**
+ * The single child element with this local name, or undefined when
+ * there is none. More than one is malformed XFA for a singleton slot
+ * (bind/ui/caption/value/data): fail closed naming the element instead
+ * of letting the first (or an array read as a record) win silently.
+ */
+function singletonChild(element: XElement, local: string, context: string): XElement | undefined {
+  const found = childrenNamed(element, local);
+  if (found.length > 1)
+    throw new XfaError(`XFA packet is malformed: ${context} has more than one <${local}> element`);
+  return found[0];
+}
+
+/** A string attribute (`@_name`, `@_match`, `@_ref`), or undefined. */
+function attr(element: XElement, name: string): string | undefined {
+  const value = element.attrs[`@_${name}`];
+  return typeof value === "string" ? value : undefined;
+}
+
+/**
+ * Convert one preserveOrder entry to an ordered-tree node, a text
+ * string, or null (processing instructions, comments, and anything
+ * else that carries no data). Recursion is depth-bounded by
+ * `convertEntries`, which throws at MAX_XFA_DEPTH.
+ */
+function convertEntry(entry: unknown, packetName: string, depth: number): XElement | string | null {
+  if (!isRecord(entry)) return null;
+  const keys = Object.keys(entry);
+  if (keys.includes("#comment")) return null;
+  const textKey = keys.find((key) => key === "#text" || key === "#cdata");
+  if (textKey !== undefined) {
+    const value = entry[textKey];
+    return typeof value === "string" ? value : "";
+  }
+  const tagKey = keys.find((key) => key !== ":@");
+  if (tagKey === undefined) return null;
+  // Processing instructions (<?xml ...?>) and declarations carry no data.
+  if (tagKey.startsWith("?") || tagKey.startsWith("!")) return null;
+  const rawChildren = entry[tagKey];
+  const childEntries = Array.isArray(rawChildren) ? rawChildren : [];
+  const rawAttrs = isRecord(entry[":@"]) ? entry[":@"] : {};
+  const attrs: Record<string, string> = {};
+  for (const [key, value] of Object.entries(rawAttrs)) {
+    if (typeof value === "string") attrs[key] = value;
+  }
+  return {
+    name: tagKey,
+    local: tagKey.split(":").at(-1) ?? tagKey,
+    attrs,
+    content: convertEntries(childEntries, packetName, depth + 1),
+  };
+}
+
+/**
+ * Convert a preserveOrder entry list to ordered-tree nodes. This is the
+ * preprocessing pass, so it carries both whole-document gates (R-8,
+ * R-4): the depth guard throws the malformed-XFA error at
+ * MAX_XFA_DEPTH before any later walk can reach a stack failure, and a
+ * namespace collision — two sibling elements whose different qualified
+ * names normalize to the same local name (e.g. `<a:code>` and
+ * `<b:code>`) — fails closed instead of silently overwriting, because
+ * the discarded node would be invisible to repeat handling and to the
+ * public-name collision check.
+ */
+function convertEntries(
+  entries: unknown[],
+  packetName: string,
+  depth: number,
+): Array<XElement | string> {
+  if (depth > MAX_XFA_DEPTH) throw new XfaError(`XFA ${packetName} packet is nested too deeply`);
+  const out: Array<XElement | string> = [];
+  for (const entry of entries) {
+    const converted = convertEntry(entry, packetName, depth);
+    if (converted !== null) out.push(converted);
+  }
+  const seen = new Map<string, string>();
+  for (const item of out) {
+    if (typeof item === "string") continue;
+    const previous = seen.get(item.local);
+    if (previous !== undefined && previous !== item.name)
+      throw new XfaError(
+        `XFA ${packetName} packet has a namespace collision on element '${item.local}': '${previous}' and '${item.name}' normalize to the same name`,
+      );
+    seen.set(item.local, item.name);
+  }
+  return out;
+}
+
+/**
+ * Concatenate the text under a node in document order. Whitespace-only
+ * text between elements is pretty-printing, not content, and is
+ * skipped; text inside a leaf (no element siblings) is kept verbatim,
+ * so dataset whitespace (" 001 ") is preserved exactly. Fails closed
+ * (throws) when the depth guard is hit — a local defense; the
+ * conversion pass already bounds the whole document.
+ */
+function nodeText(node: XElement | string, depth = 0): string {
   if (typeof node === "string") return node;
-  if (Array.isArray(node)) return node.map((item) => nodeText(item, depth, strict)).join("");
-  if (!isRecord(node)) return "";
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA packet is nested too deeply");
-  const text = typeof node["#text"] === "string" ? node["#text"] : undefined;
-  const elementEntries = Object.entries(node).filter(
-    ([key]) => !key.startsWith("@_") && key !== "#text",
-  );
-  if (strict && text !== undefined && text.trim() !== "" && elementEntries.length > 0)
-    throw new XfaError(
-      "XFA packet has ambiguous mixed content: text interleaved with child elements cannot be ordered",
-    );
+  const children = elementChildren(node);
   let out = "";
-  for (const [, value] of elementEntries) out += nodeText(value, depth + 1, strict);
-  if (elementEntries.length === 0) {
-    out += text ?? "";
-  } else if (!strict && text !== undefined) {
-    out += text;
+  for (const item of node.content) {
+    if (typeof item === "string") {
+      if (item.trim() === "" && children.length > 0) continue;
+      out += item;
+    } else {
+      out += nodeText(item, depth + 1);
+    }
   }
   return out;
 }
@@ -174,6 +296,16 @@ export function readXfaPackets(doc: PDFDocument): Map<string, Uint8Array> {
     try {
       decoded = decodePDFRawStream(streamObject).decode();
     } catch (error) {
+      // The decode budget throws a PdfError with one fixed message
+      // ("PDF content expands beyond the supported size"); let it
+      // through unwrapped, so budget exhaustion is reported as budget
+      // exhaustion — wrapping it would mask it as a generic decode
+      // failure and hide which guard fired.
+      if (
+        error instanceof Error &&
+        error.message === "PDF content expands beyond the supported size"
+      )
+        throw error;
       throw new XfaError(`XFA form is malformed: packet '${name}' could not be decoded`, {
         cause: error,
       });
@@ -191,25 +323,13 @@ export function readXfaPackets(doc: PDFDocument): Map<string, Uint8Array> {
 }
 
 /**
- * Strip namespace prefixes (xfa:, xhtml:) from element keys so prefixed
- * roots like <xfa:template> are recognised. Attribute keys (@_*) and
- * #text are left alone. Distinct-prefixed siblings that normalise to the
- * same key collapse (last wins) — acceptable for XFA packets, whose
- * element names are unprefixed in practice.
+ * Parse one XFA packet to its ordered root elements. Well-formedness is
+ * validated explicitly before parsing (the parser alone accepts a
+ * template missing only its final closing tag), and namespace prefixes
+ * are stripped only by the local-name mapping in the converter — a
+ * prefixed root like <xfa:template> is recognised by its local name.
  */
-function normalizeXmlKeys(node: unknown): unknown {
-  if (Array.isArray(node)) return node.map(normalizeXmlKeys);
-  if (!isRecord(node)) return node;
-  const out: XmlRecord = {};
-  for (const [key, value] of Object.entries(node)) {
-    const normalized =
-      key.startsWith("@_") || key === "#text" ? key : (key.split(":").at(-1) ?? key);
-    out[normalized] = normalizeXmlKeys(value);
-  }
-  return out;
-}
-
-function parseXfaXml(packetName: string, bytes: Uint8Array): XmlRecord {
+function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
   let text: string;
   try {
     text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
@@ -238,8 +358,10 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XmlRecord {
   } catch (error) {
     throw new XfaError(`XFA packet '${packetName}' is not parseable XML`, { cause: error });
   }
-  if (!isRecord(parsed)) throw new XfaError(`XFA packet '${packetName}' is not parseable XML`);
-  return normalizeXmlKeys(parsed) as XmlRecord;
+  if (!Array.isArray(parsed)) throw new XfaError(`XFA packet '${packetName}' is not parseable XML`);
+  return convertEntries(parsed, packetName, 0).filter(
+    (item): item is XElement => typeof item !== "string",
+  );
 }
 
 type BindKind = "default" | "global" | "none" | "dataRef" | "unsupported";
@@ -264,19 +386,20 @@ interface TemplateField {
  * coerced to "default", so an XFA-defined value like match="once" cannot
  * silently acquire a binding it was never given.
  */
-function parseBind(bindNode: XmlRecord): {
+function parseBind(bindNode: XElement | undefined): {
   bind: BindKind;
   ref?: string;
   rawMatch?: string;
 } {
-  const rawMatch = bindNode["@_match"];
+  if (bindNode === undefined) return { bind: "default" };
+  const rawMatch = attr(bindNode, "match");
   const bind: BindKind =
     rawMatch === "global" || rawMatch === "none" || rawMatch === "dataRef"
       ? rawMatch
       : rawMatch === undefined || rawMatch === "default"
         ? "default"
         : "unsupported";
-  const refValue = bindNode["@_ref"];
+  const refValue = attr(bindNode, "ref");
   const ref = typeof refValue === "string" && refValue !== "" ? refValue : undefined;
   return {
     bind,
@@ -292,37 +415,45 @@ function fieldTypeFromUi(uiKind: string): XfaFieldType {
 }
 
 /** Choice-list option texts from the field-level `<items><text>…`. Accepts
- * several <items> elements (the parser produces an array for them) and
+ * several <items> elements (the parser produces one per element) and
  * merges their texts in order instead of silently dropping to []. */
-function itemTexts(node: XmlRecord): string[] {
+function itemTexts(node: XElement): string[] {
   const out: string[] = [];
-  for (const items of asArray(node.items)) {
-    if (!isRecord(items)) continue;
-    out.push(...asArray(items.text).filter((text): text is string => typeof text === "string"));
+  for (const items of childrenNamed(node, "items")) {
+    for (const text of childrenNamed(items, "text")) out.push(nodeText(text));
   }
   return out;
 }
 
-function buildTemplateField(node: XmlRecord, somPath: string): TemplateField | undefined {
-  const name = node["@_name"];
+function buildTemplateField(node: XElement, somPath: string): TemplateField | undefined {
+  const name = attr(node, "name");
   if (typeof name !== "string" || name === "") return undefined;
   const leafName = name;
-  const uiNode = isRecord(node.ui) ? node.ui : {};
-  const uiKind =
-    Object.keys(uiNode).find((key) => !key.startsWith("@_") && key !== "#text") ?? "none";
-  const bindNode = isRecord(node.bind) ? node.bind : {};
+  const fieldPath = somPath === "" ? leafName : `${somPath}.${leafName}`;
+  const context = `field '${fieldPath}'`;
+  const uiNode = singletonChild(node, "ui", context);
+  const uiChildren = uiNode ? elementChildren(uiNode) : [];
+  // More than one UI element in one field is malformed: reading the
+  // first key off an array-valued ui used to yield a nonsense uiKind.
+  if (uiChildren.length > 1)
+    throw new XfaError(
+      `XFA packet is malformed: ${context} has more than one user-interface element`,
+    );
+  const uiKind = uiChildren[0]?.local ?? "none";
+  const bindNode = singletonChild(node, "bind", context);
   const { bind, ref, rawMatch } = parseBind(bindNode);
   const items = itemTexts(node);
   let onValues: string[] | undefined;
   // On-values live in <items> only for checkButtons; a choiceList's
   // <items> are its options, not on-values.
   if (uiKind === "checkButton" && items.length > 0) onValues = [items[0]];
-  const caption = isRecord(node.caption) ? node.caption : undefined;
-  const captionValue = caption !== undefined ? nodeText(caption.value) : "";
+  const caption = singletonChild(node, "caption", context);
+  const captionValue =
+    caption !== undefined ? nodeText(singletonChild(caption, "value", context) ?? caption) : "";
   const label = captionValue !== "" ? normalizeSpace(captionValue) : undefined;
   const options = uiKind === "choiceList" ? itemTexts(node) : [];
   return {
-    somPath: somPath === "" ? leafName : `${somPath}.${leafName}`,
+    somPath: fieldPath,
     leafName,
     ui: fieldTypeFromUi(uiKind),
     bind,
@@ -338,81 +469,80 @@ function buildTemplateField(node: XmlRecord, somPath: string): TemplateField | u
  * Walk the template tree collecting every <field> (and every <exclGroup>,
  * reported as one unsupported field whose options are its radio choices).
  * Repeated occurrences of one field collapse later, in the join.
+ * Depth accounting: the conversion pass already bounds the whole
+ * document to MAX_XFA_DEPTH, so this walk's own guard is defense in
+ * depth — including for field subtrees (ui/items/captions) this walk
+ * never recurses into, which the conversion pass covers.
  */
 function collectTemplateFields(
-  node: unknown,
+  node: XElement,
   path: string,
   depth: number,
   out: TemplateField[],
 ): void {
-  if (!isRecord(node)) return;
   // Fail closed like the datasets walk: a form whose only fields are too
   // deep is a 422, never a silent field-less report.
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA template packet is nested too deeply");
-  for (const [key, value] of Object.entries(node)) {
-    if (key.startsWith("@_") || key === "#text") continue;
-    if (key === "subform") {
-      for (const subform of asArray(value)) {
-        if (!isRecord(subform)) continue;
-        const name = subform["@_name"];
-        const childPath =
-          typeof name === "string" && name !== "" ? (path === "" ? name : `${path}.${name}`) : path;
-        collectTemplateFields(subform, childPath, depth + 1, out);
-      }
-    } else if (key === "field") {
-      for (const fieldNode of asArray(value)) {
-        if (!isRecord(fieldNode)) continue;
-        const field = buildTemplateField(fieldNode, path);
-        if (field) out.push(field);
-      }
-    } else if (key === "exclGroup") {
-      for (const group of asArray(value)) {
-        if (!isRecord(group)) continue;
-        const name = group["@_name"];
-        if (typeof name !== "string" || name === "") continue;
-        const groupPath = path === "" ? name : `${path}.${name}`;
-        const options: string[] = [];
-        const childBinds: { bind: BindKind; ref: string | undefined }[] = [];
-        for (const optionField of asArray(group.field)) {
-          if (!isRecord(optionField)) continue;
-          const built = buildTemplateField(optionField, path);
-          if (built) {
-            options.push(built.onValues?.[0] ?? built.leafName);
-            childBinds.push({ bind: built.bind, ref: built.ref });
-          }
+  for (const child of elementChildren(node)) {
+    if (child.local === "subform") {
+      const name = attr(child, "name");
+      const childPath =
+        typeof name === "string" && name !== "" ? (path === "" ? name : `${path}.${name}`) : path;
+      collectTemplateFields(child, childPath, depth + 1, out);
+    } else if (child.local === "field") {
+      const field = buildTemplateField(child, path);
+      if (field) out.push(field);
+    } else if (child.local === "exclGroup") {
+      const name = attr(child, "name");
+      if (typeof name !== "string" || name === "") continue;
+      const groupPath = path === "" ? name : `${path}.${name}`;
+      const options: string[] = [];
+      const childBinds: { bind: BindKind; ref: string | undefined }[] = [];
+      for (const optionField of childrenNamed(child, "field")) {
+        const built = buildTemplateField(optionField, path);
+        if (built) {
+          options.push(built.onValues?.[0] ?? built.leafName);
+          childBinds.push({ bind: built.bind, ref: built.ref });
         }
-        // The group's own <bind> governs the group field; the children's
-        // bindings govern only their option identity, never the value.
-        // With no group binding, the children must agree — if they
-        // disagree, fail closed instead of letting the last child win.
-        let bind: BindKind = "default";
-        let ref: string | undefined;
-        const groupBindNode = isRecord(group.bind) ? group.bind : undefined;
-        if (groupBindNode) {
-          ({ bind, ref } = parseBind(groupBindNode));
-        } else if (childBinds.length > 0) {
-          const first = childBinds[0];
-          if (childBinds.some((child) => child.bind !== first.bind || child.ref !== first.ref))
-            throw new XfaError(
-              `XFA template/datasets mismatch: exclGroup '${groupPath}' has no group binding and its option fields disagree`,
-            );
-          bind = first.bind;
-          ref = first.ref;
-        }
-        const caption = isRecord(group.caption) ? group.caption : undefined;
-        const captionValue = caption !== undefined ? nodeText(caption.value) : "";
-        out.push({
-          somPath: groupPath,
-          leafName: name,
-          ui: "unsupported",
-          bind,
-          ref,
-          options: options.length > 0 ? options : undefined,
-          label: captionValue !== "" ? normalizeSpace(captionValue) : undefined,
-        });
       }
-    } else if (isRecord(value) || Array.isArray(value)) {
-      collectTemplateFields(value, path, depth + 1, out);
+      // The group's own <bind> governs the group field; the children's
+      // bindings govern only their option identity, never the value.
+      // With no group binding, the children must agree — if they
+      // disagree, fail closed instead of letting the last child win.
+      let bind: BindKind = "default";
+      let ref: string | undefined;
+      const groupBindNode = singletonChild(child, "bind", `exclGroup '${groupPath}'`);
+      if (groupBindNode) {
+        ({ bind, ref } = parseBind(groupBindNode));
+      } else if (childBinds.length > 0) {
+        const first = childBinds[0];
+        if (
+          childBinds.some(
+            (childBind) => childBind.bind !== first.bind || childBind.ref !== first.ref,
+          )
+        )
+          throw new XfaError(
+            `XFA template/datasets mismatch: exclGroup '${groupPath}' has no group binding and its option fields disagree`,
+          );
+        bind = first.bind;
+        ref = first.ref;
+      }
+      const caption = singletonChild(child, "caption", `exclGroup '${groupPath}'`);
+      const captionValue =
+        caption !== undefined
+          ? nodeText(singletonChild(caption, "value", `exclGroup '${groupPath}'`) ?? caption)
+          : "";
+      out.push({
+        somPath: groupPath,
+        leafName: name,
+        ui: "unsupported",
+        bind,
+        ref,
+        options: options.length > 0 ? options : undefined,
+        label: captionValue !== "" ? normalizeSpace(captionValue) : undefined,
+      });
+    } else {
+      collectTemplateFields(child, path, depth + 1, out);
     }
   }
 }
@@ -434,45 +564,41 @@ function stripIndices(path: string): string {
 }
 
 /**
- * Walk <xfa:data> collecting leaf data nodes. Repeated elements get an
- * index in the path (form.repeat[0].item) so repeating subforms stay
- * distinct; a lone element keeps its plain name.
+ * Walk <xfa:data> collecting leaf data nodes, in document order.
+ * Repeated elements get an index in the path (form.repeat[0].item) so
+ * repeating subforms stay distinct; a lone element keeps its plain
+ * name. Sibling order is document order — the grouped-object walk used
+ * to visit every `a` before every `b`, so a `global` bind could pick a
+ * later leaf over an earlier one.
  */
-function collectDataLeaves(node: unknown, path: string, depth: number, out: DataLeaf[]): void {
+function collectDataLeaves(node: XElement, path: string, depth: number, out: DataLeaf[]): void {
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA datasets packet is nested too deeply");
-  if (typeof node === "string") {
-    // Dataset whitespace is significant: the parser is configured with
-    // trimValues: false, and no trimming happens here either.
-    out.push({ path, value: node, markup: false });
-    return;
-  }
-  if (!isRecord(node)) {
-    out.push({ path, value: "", markup: false });
-    return;
-  }
-  const children = Object.entries(node).filter(([key]) => !key.startsWith("@_") && key !== "#text");
+  const children = elementChildren(node);
   if (children.length === 0) {
-    const text = typeof node["#text"] === "string" ? node["#text"] : "";
-    out.push({ path, value: text, markup: false });
+    // A leaf's value is its direct text, verbatim: dataset whitespace
+    // is significant (the parser is configured with trimValues: false,
+    // and no trimming happens here either).
+    const value = node.content.filter((item): item is string => typeof item === "string").join("");
+    out.push({ path, value, markup: false });
     return;
   }
   // Rich-text values are leaves: their flattened text content, flagged.
   // Only actual rich-text containers count (an <xhtml> subtree or an
   // <exData> element) — a bare colon in a key used to trigger this too.
-  // The flattened value keeps the text as parsed (no whitespace
-  // normalisation); block boundaries carry no separator in the flattened
-  // value, and interleaved mixed content fails closed (strict nodeText)
-  // because the parser cannot order it.
-  if (children.some(([key]) => key === "xhtml" || key === "exData")) {
-    out.push({ path, value: nodeText(node, 0, true), markup: true });
+  // The flattened value keeps the text in document order (no whitespace
+  // normalisation); block boundaries carry no separator.
+  if (children.some((child) => child.local === "xhtml" || child.local === "exData")) {
+    out.push({ path, value: nodeText(node), markup: true });
     return;
   }
-  for (const [key, value] of children) {
-    const items = asArray(value);
-    items.forEach((item, index) => {
-      const segment = items.length > 1 ? `${key}[${index}]` : key;
-      collectDataLeaves(item, path === "" ? segment : `${path}.${segment}`, depth + 1, out);
-    });
+  const counts = new Map<string, number>();
+  for (const child of children) counts.set(child.local, (counts.get(child.local) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  for (const child of children) {
+    const index = seen.get(child.local) ?? 0;
+    seen.set(child.local, index + 1);
+    const segment = (counts.get(child.local) ?? 1) > 1 ? `${child.local}[${index}]` : child.local;
+    collectDataLeaves(child, path === "" ? segment : `${path}.${segment}`, depth + 1, out);
   }
 }
 
@@ -487,8 +613,13 @@ function isSubsequence(shorter: string[], longer: string[]): boolean {
 /**
  * Normalise a dataRef to a stripped SOM path, or fail closed naming the
  * field and the ref: a missing, empty, or unparseable ref never falls back
- * to name matching. Indexed refs ($data.form.repeat[1].itemName) are
- * normalised by stripping [N] segments, like dataset paths.
+ * to name matching. The ORIGINAL ref grammar is validated BEFORE any
+ * normalization: the prefix must be `$data.` or bare, and every segment
+ * must be a name with at most one trailing `[N]` index selector. An
+ * index embedded inside a name (`cust[0]omer`) is unparseable — stripping
+ * it first used to silently repair it into a different, valid reference
+ * (`customer`). Indexed refs (`$data.form.repeat[1].itemName`) are
+ * normalised by stripping `[N]` segments, like dataset paths.
  */
 function parseDataRef(field: TemplateField): string {
   const ref = field.ref;
@@ -496,13 +627,42 @@ function parseDataRef(field: TemplateField): string {
     throw new XfaError(
       `XFA template/datasets mismatch: field '${field.somPath}' has a dataRef binding with a missing or empty ref`,
     );
-  const withoutPrefix = ref.replace(/^\$data\./, "").replace(/^\$/, "");
-  const stripped = stripIndices(withoutPrefix);
-  if (!/^[A-Za-z_][\w-]*(\.[A-Za-z_][\w-]*)*$/.test(stripped))
+  const withoutPrefix = ref.startsWith("$data.") ? ref.slice("$data.".length) : ref;
+  const segments = withoutPrefix.split(".");
+  if (segments.some((segment) => !/^[A-Za-z_][\w-]*(\[\d+\])?$/.test(segment)))
     throw new XfaError(
       `XFA template/datasets mismatch: field '${field.somPath}' has an unparseable dataRef '${ref}'`,
     );
-  return stripped;
+  return stripIndices(withoutPrefix);
+}
+
+/**
+ * The join index, built once per inspect (R-7): leaves by leaf name and
+ * by stripped path, in document order, plus the running count of
+ * structural comparisons spent. Indexing means a field only ever
+ * compares against same-named leaves — unrelated leaves cost nothing
+ * — and the work budget bounds even the same-named worst case.
+ */
+interface JoinIndex {
+  byName: Map<string, DataLeaf[]>;
+  byPath: Map<string, DataLeaf[]>;
+  work: number;
+}
+
+function buildJoinIndex(leaves: DataLeaf[]): JoinIndex {
+  const byName = new Map<string, DataLeaf[]>();
+  const byPath = new Map<string, DataLeaf[]>();
+  for (const leaf of leaves) {
+    const name = leafNameOf(leaf.path);
+    const named = byName.get(name);
+    if (named) named.push(leaf);
+    else byName.set(name, [leaf]);
+    const stripped = stripIndices(leaf.path);
+    const pathed = byPath.get(stripped);
+    if (pathed) pathed.push(leaf);
+    else byPath.set(stripped, [leaf]);
+  }
+  return { byName, byPath, work: 0 };
 }
 
 /**
@@ -510,39 +670,46 @@ function parseDataRef(field: TemplateField): string {
  * - dataRef: the explicit SOM path, index-stripped, exact-matched.
  * - global: the first same-named leaf in document order, single field —
  *   the XFA semantic for global binding, distinct from default.
- * - default: the data node under the matching subform path. The match is
- *   structural, not name-only: the stripped leaf path and the template
- *   path must be equal up to subform segments present on one side only
- *   (one path is a subsequence of the other). Literal path equality was
- *   considered and rejected: the W-9's template nests fields under
- *   Page1 (topmostSubform.Page1.f1_01) while its datasets omit that
- *   subform (topmostSubform.f1_01), so literal equality would reject the
- *   real-world form. Among candidates the closest structural match wins
- *   (fewest skipped segments); repeat instances of one path all resolve;
- *   distinct paths tied for closest fail closed as ambiguous. A
- *   same-named leaf in an unrelated branch (customer vs supplier) is
- *   never a subsequence match, so it can never be claimed.
+ * - default: ONE-SIDED structural match — the dataset path (stripped,
+ *   minus leaf) must be a subsequence of the template path (minus
+ *   leaf). The template may carry extra segments the datasets omit
+ *   (the W-9 nests fields under Page1, which its datasets omit), but
+ *   the datasets must never carry a data-scope segment the template
+ *   does not name: a same-named leaf in an unrelated branch (customer
+ *   vs supplier, in either nesting direction from the dataset side)
+ *   can never be claimed. Among candidates the closest structural
+ *   match wins (fewest template-only segments skipped); repeat
+ *   instances of one path all resolve; distinct paths tied for closest
+ *   fail closed as ambiguous.
+ * Residual ambiguity, recorded explicitly rather than hidden: a
+ * template-only segment is ASSUMED layout-only. A template field under
+ * a real data branch whose datasets omit that branch still matches —
+ * the rule cannot distinguish a layout subform (Page1) from a data
+ * subform the datasets happen to omit. The datasets side is the sound
+ * half: no dataset segment may go unnamed by the template.
  */
-function findLeaves(field: TemplateField, leaves: DataLeaf[]): DataLeaf[] {
+function findLeaves(field: TemplateField, index: JoinIndex): DataLeaf[] {
   if (field.bind === "dataRef") {
     const target = parseDataRef(field);
-    return leaves.filter((leaf) => stripIndices(leaf.path) === target);
+    return index.byPath.get(target) ?? [];
   }
   if (field.bind === "global") {
-    const first = leaves.find((leaf) => leafNameOf(leaf.path) === field.leafName);
+    const first = (index.byName.get(field.leafName) ?? [])[0];
     return first ? [first] : [];
   }
-  // default
-  const templateParts = field.somPath.split(".");
+  // default: one-sided — dataset path (minus leaf) ⊆ template path (minus leaf).
+  const templateParent = field.somPath.split(".").slice(0, -1);
   const candidates: { leaf: DataLeaf; gap: number; stripped: string }[] = [];
-  for (const leaf of leaves) {
-    if (leafNameOf(leaf.path) !== field.leafName) continue;
+  for (const leaf of index.byName.get(field.leafName) ?? []) {
+    index.work += 1;
+    if (index.work > MAX_JOIN_WORK)
+      throw new XfaError(
+        `XFA join exceeded the work budget of ${MAX_JOIN_WORK} structural comparisons; refusing to keep matching`,
+      );
     const stripped = stripIndices(leaf.path);
-    const leafParts = stripped.split(".");
-    const shorter = templateParts.length <= leafParts.length ? templateParts : leafParts;
-    const longer = templateParts.length <= leafParts.length ? leafParts : templateParts;
-    if (!isSubsequence(shorter, longer)) continue;
-    candidates.push({ leaf, gap: longer.length - shorter.length, stripped });
+    const leafParent = stripped.split(".").slice(0, -1);
+    if (!isSubsequence(leafParent, templateParent)) continue;
+    candidates.push({ leaf, gap: templateParent.length - leafParent.length, stripped });
   }
   if (candidates.length === 0) return [];
   const bestGap = Math.min(...candidates.map((candidate) => candidate.gap));
@@ -605,6 +772,7 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
     if (!existing.label && field.label) existing.label = field.label;
     if (!existing.options && field.options) existing.options = field.options;
   }
+  const index = buildJoinIndex(leaves);
   const out: XfaField[] = [];
   const resolvedByName = new Map<string, string>();
   const push = (field: XfaField, somPath: string): void => {
@@ -640,7 +808,7 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       push(unbound(field), field.somPath);
       continue;
     }
-    const matches = findLeaves(field, leaves);
+    const matches = findLeaves(field, index);
     if (matches.length === 0)
       throw new XfaError(
         `XFA template/datasets mismatch: field '${field.somPath}' has no data node`,
@@ -661,14 +829,14 @@ export function inspectXfa(doc: PDFDocument): {
   const datasetsBytes = packets.get("datasets");
   if (!datasetsBytes) throw new XfaError("XFA form is malformed: missing 'datasets' packet");
   const templateParsed = parseXfaXml("template", templateBytes);
-  const templateRoot = templateParsed.template;
-  if (!isRecord(templateRoot))
+  const templateRoot = templateParsed.find((element) => element.local === "template");
+  if (!templateRoot)
     throw new XfaError("XFA form is malformed: template packet has no <template> element");
   const datasetsParsed = parseXfaXml("datasets", datasetsBytes);
-  const datasetsRoot = datasetsParsed.datasets;
-  if (!isRecord(datasetsRoot))
+  const datasetsRoot = datasetsParsed.find((element) => element.local === "datasets");
+  if (!datasetsRoot)
     throw new XfaError("XFA form is malformed: datasets packet has no <datasets> element");
-  const dataRoot = datasetsRoot.data;
+  const dataRoot = singletonChild(datasetsRoot, "data", "the datasets packet");
   if (dataRoot === undefined)
     throw new XfaError("XFA form is malformed: datasets packet has no <data> element");
   const templateFields: TemplateField[] = [];
