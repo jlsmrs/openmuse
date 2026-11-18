@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, before, test } from "node:test";
 import { createApp } from "../apps/server/src/app.ts";
+import type { Auth } from "../apps/server/src/auth.ts";
 import type { Config } from "../apps/server/src/config.ts";
 import { createStore, type Store } from "../apps/server/src/db.ts";
 import type { AgentService } from "../apps/server/src/engine/service.ts";
-import { FILE_PULL_AUDIT_COLLECTION, type FilePullAudit } from "../apps/server/src/files.ts";
+import { FILE_PULL_AUDIT_COLLECTION, type FilePullAudit, Files } from "../apps/server/src/files.ts";
 import type { Artifact } from "../packages/domain/src/index.ts";
 
 let db: Store;
@@ -49,6 +50,38 @@ after(async () => {
   await db.close();
   await rm(directory, { recursive: true, force: true });
 });
+
+/** A Store that fails every write to the pull-audit collection AND every
+ * files-row removal, including writes made inside a transaction — so the
+ * atomicity test can prove the copy and its audit entry commit or roll
+ * back together. The pre-fix pull swallowed a failed rollback remove,
+ * which left a visible, unaudited copy in exactly this double fault. */
+function failingAuditStore(store: Store): Store {
+  const wrap = (target: Store): Store =>
+    new Proxy(target, {
+      get(targetStore, property, receiver) {
+        if (property === "put") {
+          return async (owner: string, kind: string, value: { id: string }) => {
+            if (kind === FILE_PULL_AUDIT_COLLECTION)
+              throw new Error("audit write failed (forced by test)");
+            return targetStore.put(owner, kind, value);
+          };
+        }
+        if (property === "remove") {
+          return async (owner: string, kind: string, id: string) => {
+            if (kind === "files") throw new Error("rollback remove failed (forced by test)");
+            return targetStore.remove(owner, kind, id);
+          };
+        }
+        if (property === "transaction") {
+          return async (work: (tx: Store) => Promise<unknown>) =>
+            targetStore.transaction(async (tx) => work(wrap(tx)));
+        }
+        return Reflect.get(targetStore, property, receiver);
+      },
+    });
+  return wrap(store);
+}
 
 test("W-9 imports with formKind persisted and field-less XFA stores with fields []", async () => {
   const w9 = await agent.files.import("veritas", "fw9.pdf", await fixture("fw9.pdf"), "test");
@@ -143,6 +176,91 @@ test("search route validates query params and stays owner-scoped", async () => {
     headers: headers(),
   });
   assert.equal(badDate.status, 422);
+});
+
+test("pull is atomic: a failed audit write leaves no visible, unaudited copy", async () => {
+  const source = await agent.files.import(
+    "atomic-owner",
+    "fw9.pdf",
+    await fixture("fw9.pdf"),
+    "test",
+  );
+  const failingFiles = new Files(failingAuditStore(db), config, {
+    sign: (_owner: string, path: string) => path,
+  } as unknown as Auth);
+  const auditsBefore = (await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION)).length;
+  const filesBefore = await readdir(join(directory, "files"));
+  await assert.rejects(
+    failingFiles.pull("atomic-owner", source.id, "veritas"),
+    /audit write failed/,
+  );
+  // No copy is visible under the target owner…
+  assert.deepEqual(
+    (await agent.files.list("veritas")).filter((file) => file.parentId === source.id),
+    [],
+  );
+  // …no audit entry was written…
+  assert.equal(
+    (await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION)).length,
+    auditsBefore,
+  );
+  // …and the bytes file written before the failed transaction was removed.
+  assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
+});
+
+test("lineage returns provenance-only rows: no field values cross owners", async () => {
+  const source = await agent.files.import(
+    "lineage-a",
+    "xfa-static.pdf",
+    await fixture("xfa-static.pdf"),
+    "test",
+  );
+  const hopB = await agent.files.pull("lineage-a", source.id, "lineage-b");
+  const hopC = await agent.files.pull("lineage-b", hopB.id, "lineage-c");
+  const chain = await agent.files.lineage("lineage-c", hopC.id);
+  assert.deepEqual(
+    chain.map((file) => file.id),
+    [source.id, hopB.id, hopC.id],
+  );
+  const allowed = new Set([
+    "id",
+    "name",
+    "mimeType",
+    "size",
+    "pageCount",
+    "formKind",
+    "source",
+    "parentId",
+    "createdAt",
+  ]);
+  for (const row of chain) {
+    for (const key of Object.keys(row)) assert.ok(allowed.has(key), `lineage row leaks ${key}`);
+  }
+  // The static fixture's field values must not appear anywhere in the chain.
+  assert.ok(!JSON.stringify(chain).includes("Joshua Lewis Summers"));
+  assert.ok(!JSON.stringify(chain).includes("josh@example.com"));
+});
+
+test("search rejects from after to and treats to as inclusive of the whole day", async () => {
+  const owner = "date-owner";
+  const file = await agent.files.import(
+    owner,
+    "xfa-static.pdf",
+    await fixture("xfa-static.pdf"),
+    "test",
+  );
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  assert.ok((await agent.files.search(owner, { to: today })).some((row) => row.id === file.id));
+  assert.deepEqual(await agent.files.search(owner, { to: yesterday }), []);
+  await assert.rejects(
+    agent.files.search(owner, { from: today, to: yesterday }),
+    /from.*on or before.*to/i,
+  );
+  const badRange = await app.request(`/api/files/search?from=${today}&to=${yesterday}`, {
+    headers: headers(),
+  });
+  assert.equal(badRange.status, 422);
 });
 
 test("pull copies a PDF across owners with lineage, source, and an audit entry", async () => {

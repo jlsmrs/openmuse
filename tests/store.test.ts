@@ -91,3 +91,29 @@ test("a partial (subset) expectation does not count as a match", async (t) => {
     messages: ["a", "b"],
   });
 });
+
+// P1-9 fix round: Store.transaction commits or rolls back as one unit, so
+// Files.pull can write the artifact copy and its audit entry atomically.
+test("transaction commits every put inside it", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  await db.transaction(async (tx) => {
+    await tx.put("owner", "notes", { id: "n1", text: "first" });
+    await tx.put("owner", "notes", { id: "n2", text: "second" });
+  });
+  assert.deepEqual(await db.get("owner", "notes", "n1"), { id: "n1", text: "first" });
+  assert.deepEqual(await db.get("owner", "notes", "n2"), { id: "n2", text: "second" });
+});
+
+test("transaction rolls back every put when the work throws", async (t) => {
+  const db = await createStore();
+  t.after(() => db.close());
+  await assert.rejects(
+    db.transaction(async (tx) => {
+      await tx.put("owner", "notes", { id: "n1", text: "first" });
+      throw new Error("boom");
+    }),
+    /boom/,
+  );
+  assert.equal(await db.get("owner", "notes", "n1"), null);
+});

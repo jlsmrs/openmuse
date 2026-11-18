@@ -113,6 +113,9 @@ export interface XfaFixtureOptions {
   datasetsXml?: string;
   includeTemplate?: boolean;
   includeDatasets?: boolean;
+  /** Explicit packet list, replacing the template/datasets pair (e.g. to
+   * build a PDF with a duplicate packet name). */
+  packets?: [string, string][];
 }
 
 /**
@@ -146,9 +149,11 @@ export async function createXfaPdf(options: XfaFixtureOptions = {}): Promise<Uin
   const acroForm = doc.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict);
   if (!acroForm) throw new Error("fixture: AcroForm dict was not created");
   const encoder = new TextEncoder();
-  const packets: [string, string][] = [];
-  if (options.includeTemplate !== false) packets.push(["template", templateXml]);
-  if (options.includeDatasets !== false) packets.push(["datasets", datasetsXml]);
+  const packets: [string, string][] = options.packets ?? [];
+  if (options.packets === undefined) {
+    if (options.includeTemplate !== false) packets.push(["template", templateXml]);
+    if (options.includeDatasets !== false) packets.push(["datasets", datasetsXml]);
+  }
   const xfaArray = PDFArray.withContext(doc.context);
   for (const [name, xml] of packets) {
     const stream = doc.context.flateStream(encoder.encode(xml));
