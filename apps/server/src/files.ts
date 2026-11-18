@@ -228,6 +228,51 @@ export interface FileLineageEntry {
   createdAt: string;
 }
 
+/**
+ * Strict ISO date/datetime validation for search `from`/`to` (re-review
+ * #2 minor): `Date.parse` alone is not calendar-strict — "2026-02-30"
+ * normalizes to March 2 instead of rejecting. Only ISO date-only
+ * (YYYY-MM-DD) and ISO datetimes are accepted, and the calendar date
+ * must really exist (month 1–12, day within the month, leap years
+ * honoured) with a valid time of day. Returns the epoch-ms instant, or
+ * throws a 422 naming the value.
+ */
+export function parseSearchDate(value: string): number {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const match =
+    dateOnly ??
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      value,
+    );
+  if (!match) throw new AppError(`Search date '${value}' is not a valid ISO date`, 422);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  if (month < 1 || month > 12 || day < 1 || day > new Date(Date.UTC(year, month, 0)).getUTCDate())
+    throw new AppError(`Search date '${value}' is not a real calendar date`, 422);
+  if (match[4] !== undefined) {
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = match[6] === undefined ? 0 : Number(match[6]);
+    if (hour > 23 || minute > 59 || second > 59)
+      throw new AppError(`Search date '${value}' is not a valid time`, 422);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed))
+    throw new AppError(`Search date '${value}' is not a valid ISO date`, 422);
+  return parsed;
+}
+
+/** True when the value is a strict ISO date/datetime (see parseSearchDate). */
+export function isValidSearchDate(value: string): boolean {
+  try {
+    parseSearchDate(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function toLineageEntry(file: Artifact): FileLineageEntry {
   return {
     id: file.id,
@@ -400,15 +445,17 @@ export class Files {
    * date means the start of that day); `to` is inclusive of the whole
    * day when given as a bare date (2026-11-18 matches files created at
    * any time that day) and inclusive of the instant when given as a full
-   * timestamp. `from` after `to` is a 422.
+   * timestamp. `from` after `to` is a 422, and so is a date that is not
+   * a real calendar date (`2026-02-30` normalizes under `Date.parse`,
+   * so bounds are validated strictly — see parseSearchDate).
    */
   async search(
     owner: string,
     query: { q?: string; formKind?: FormKind; from?: string; to?: string },
   ): Promise<Artifact[]> {
     const needle = query.q?.trim().toLowerCase();
-    const from = query.from === undefined ? Number.NaN : Date.parse(query.from);
-    let to = query.to === undefined ? Number.NaN : Date.parse(query.to);
+    const from = query.from === undefined ? Number.NaN : parseSearchDate(query.from);
+    let to = query.to === undefined ? Number.NaN : parseSearchDate(query.to);
     if (Number.isFinite(to) && /^\d{4}-\d{2}-\d{2}$/.test(query.to ?? "")) to += 86400000 - 1;
     if (Number.isFinite(from) && Number.isFinite(to) && from > to)
       throw new AppError("Search date range is invalid: 'from' must be on or before 'to'", 422);

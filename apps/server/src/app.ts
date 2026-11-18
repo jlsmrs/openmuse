@@ -24,7 +24,7 @@ import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
-import { Files } from "./files.ts";
+import { Files, isValidSearchDate } from "./files.ts";
 import { GeneratedImages } from "./generated-images.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import {
@@ -345,14 +345,8 @@ export async function createApp(
       .object({
         q: z.string().max(500).optional(),
         formKind: z.enum(["acroform", "xfa-static", "xfa-dynamic", "none"]).optional(),
-        from: z
-          .string()
-          .refine((value) => Number.isFinite(Date.parse(value)), "from must be a valid date")
-          .optional(),
-        to: z
-          .string()
-          .refine((value) => Number.isFinite(Date.parse(value)), "to must be a valid date")
-          .optional(),
+        from: z.string().refine(isValidSearchDate, "from must be a valid date").optional(),
+        to: z.string().refine(isValidSearchDate, "to must be a valid date").optional(),
       })
       .parse(c.req.query());
     return c.json(await files.search(c.get("owner"), query));
