@@ -1,0 +1,52 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >> endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >> endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >> endobj
+9 0 obj
+69 endobj
+6 0 obj
+<< /Length 9 0 R >>
+stream
+AAAA
+endstream
+endobj
+40 0 obj
+<< /Length 137 >>
+stream
+
+% real tail
+
+endstream endobj
+5 0 % ordinary header comment
+obj
+<< /Length 48 >>
+stream
+BT /F1 24 Tf 100 700 Td <5245414C50414745> Tj ET
+endstream endobj
+11 0 obj
+<< /V 2 /R 3 /Length 128 /P 4294967292 /Filter /Standard /O <CE9D51ECC479711BE707AD379A54A0F4B30916D3240087ECA5E23F15B28393F3> /U <2F56D8B649FC1A88606315B4CAAD178100000000000000000000000000000000> >>
+endobj
+xref
+0 12
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000185 00000 n 
+0000000451 00000 n 
+0000000329 00000 n 
+0000000000 65535 f 
+0000000000 65535 f 
+0000000311 00000 n 
+0000000000 65535 f 
+0000000575 00000 n 
+trailer
+<< /Size 12 /Root 1 0 R /Encrypt 11 0 R /ID [<68AF1A2E328A0DFAED2DFC1781F6E69D><68AF1A2E328A0DFAED2DFC1781F6E69D>] >>
+startxref
+791
+%%EOF
