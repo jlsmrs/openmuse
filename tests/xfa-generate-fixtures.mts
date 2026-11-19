@@ -3,9 +3,11 @@
  *   ./node_modules/.bin/tsx tests/xfa-generate-fixtures.mts
  * The encrypted fixture needs pypdf (python3 -c "import pypdf").
  */
+import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { XMLParser, XMLValidator } from "fast-xml-parser";
 import {
   createXfaPdf,
   dynamicDatasetsXml,
@@ -81,7 +83,25 @@ execFileSync(
 );
 console.log("xfa-encrypted.pdf written");
 
-// Sanity: the dynamic generator's own XML round-trips through the parser.
-void dynamicTemplateXml;
-void dynamicDatasetsXml;
-void staticDatasetsXml;
+// Sanity (round 6, test adequacy): the generator's own XML really
+// round-trips through the parser — the old comment claimed this while
+// the following lines were bare `void` references that checked
+// nothing. Each generated packet must be valid XML whose parsed root
+// is the expected element.
+const parser = new XMLParser({ preserveOrder: true });
+for (const [name, xml, root] of [
+  ["dynamic template", dynamicTemplateXml(), "template"],
+  ["dynamic datasets", dynamicDatasetsXml(), "datasets"],
+  ["static template", staticTemplateXml(), "template"],
+  ["static datasets", staticDatasetsXml(), "datasets"],
+  ["field-less template", fieldlessTemplateXml(), "template"],
+  ["field-less datasets", fieldlessDatasetsXml(), "datasets"],
+] as const) {
+  assert.equal(XMLValidator.validate(xml), true, `${name} is not valid XML`);
+  const parsed: unknown[] = parser.parse(xml);
+  const first = parsed[0] as Record<string, unknown> | undefined;
+  const tagKey = first === undefined ? undefined : Object.keys(first).find((key) => key !== ":@");
+  // Compare local names: the datasets root is qualified (<xfa:datasets>).
+  assert.equal(tagKey?.split(":").at(-1), root, `${name} parses to the wrong root`);
+  console.log(`sanity: ${name} round-trips through the parser (root <${root}>)`);
+}

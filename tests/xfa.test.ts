@@ -1461,6 +1461,10 @@ test("U-2b: a long shared scope times many fields completes fast (probe U2b shap
   // code called JSON.stringify(scope) per occurrence in the collapse
   // identity; scopes are now interned ids, so the shared scope is
   // never re-serialized. All 2,000 occurrences collapse to one field.
+  // The collapse itself is asserted deterministically below; the 5 s
+  // bound is a gross-slowness guard only — there is no work counter
+  // to assert against, so timing is the only performance signal here
+  // (round 6, test adequacy).
   const longSeg = "s".repeat(8 * 1024);
   const fields = Array.from(
     { length: 2000 },
@@ -1483,11 +1487,13 @@ test("U-2b: a long shared scope times many fields completes fast (probe U2b shap
 
 test("U-2: a wide tree under one long parent scope completes fast", async () => {
   // One 8 KiB parent scope with 100 child subforms, each with one
-  // field. The walk carries segment arrays and joins a path only
-  // when a field is built, so the parent scope's characters are never
-  // re-joined per child; the retained field paths (~820 KB total)
-  // stay under the aggregate template-path bound, and the output
-  // (~830 KB) stays under the 1 MiB output bound.
+  // field. The walk carries parent-linked scopes (materialized once
+  // per distinct scope, memoized), so the parent scope's characters
+  // are never copied per child; the retained field paths (~820 KB
+  // total) stay under the aggregate template-path bound, and the
+  // output (~830 KB) stays under the 1 MiB output bound. The field
+  // results are asserted deterministically below; the 5 s bound is a
+  // gross-slowness guard only (round 6, test adequacy).
   const longParent = "p".repeat(8 * 1024);
   const count = 100;
   const templateFields = Array.from(
@@ -1525,8 +1531,12 @@ test("U-3: many indexed fields over one repeated-path bucket complete quickly (p
   // Scaled probe: 1,000 fields × 4,000 persons. The old code filtered
   // the entire 4,000-leaf bucket per field (~1.6 s and growing with
   // fields × bucket size); the occurrence index narrows each lookup
-  // to its one branch first, so this completes in well under a second
-  // with the right value per field.
+  // to its one branch first. The deterministic signal is completion
+  // itself: a whole-bucket scan would examine 1,000 × 4,000 =
+  // 4,000,000 candidates and trip the 1,000,000 comparison budget,
+  // so returning all 1,000 fields proves the narrowing. The 5 s bound
+  // is a gross-slowness guard only (round 6, test adequacy; was a
+  // 1 s performance assertion).
   const nFields = 1000;
   const nPersons = 4000;
   const templateFields = Array.from(
@@ -1547,7 +1557,7 @@ test("U-3: many indexed fields over one repeated-path bucket complete quickly (p
   });
   const started = Date.now();
   const result = await inspectPdf(bytes);
-  assert.ok(Date.now() - started < 1000, `U3 inspect took ${Date.now() - started}ms`);
+  assert.ok(Date.now() - started < 5000, `U3 inspect took ${Date.now() - started}ms`);
   assert.equal(result.fields.length, nFields);
   assert.deepEqual(result.fields[0], {
     name: "form.person[0].code",
@@ -1815,4 +1825,398 @@ test("T-3 (round 5): template paths over 4 MiB in aggregate fail closed", async 
     assert.match(error.message, /template paths exceed 4194304 bytes/);
     return true;
   });
+});
+
+// --- B1 fix round 6 (panel re-review #5, chunked Astra, Nov 19, 2026) --------
+// Each test below is a regression test for an adopted P1 finding; the
+// probe shape it mirrors (panel/probe-rereview5.mts) is noted.
+
+test("A-1 (round 6): a many-segment dataRef fails closed deterministically, field-less (probe V1 shape)", async () => {
+  // 10,000 segments on a field-less subform: the old code folded it
+  // one segment at a time through a scope array copied per segment
+  // (quadratic, 275 ms) and no bound ever tripped, because
+  // countTemplatePath only charges built fields. The ref is now
+  // rejected at parse time (limit 100 segments) in milliseconds.
+  for (const n of [10000, 20000]) {
+    const ref = `$data.${Array(n).fill("a").join(".")}`;
+    const bytes = await createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        `<subform name="s"><bind match="dataRef" ref="${ref}"/></subform>` +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok></form></xfa:data></xfa:datasets>',
+    });
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, new RegExp(`dataRef with ${n} segments \\(limit 100\\)`));
+      return true;
+    });
+  }
+});
+
+test("A-1 (round 6): a many-segment dataRef fails closed with a field under it too", async () => {
+  // The same bound applies when the long-ref subform HAS a field: the
+  // rejection happens at parse time, before the field is ever built.
+  const ref = `$data.${Array(5000).fill("a").join(".")}`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<subform name="s"><bind match="dataRef" ref="${ref}"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /dataRef with 5000 segments \(limit 100\)/);
+    return true;
+  });
+});
+
+test("A-1 (round 6): a 101-segment dataRef fails closed, a 98-segment ref resolves (boundary)", async () => {
+  // The parse bound is 100 segments; the deepest resolvable leaf path
+  // is 98 (the <xfa:datasets> + <xfa:data> wrappers consume depth in
+  // the conversion pass — verified empirically: 98 resolves, 99-deep
+  // datasets trip the depth gate). So the boundary has three distinct
+  // outcomes, all deterministic: 98 resolves, 100 parses but matches
+  // nothing, 101 is rejected at parse time.
+  const nested = (depth: number, leaf: string): string => {
+    let open = "";
+    let close = "";
+    for (let i = 0; i < depth; i++) {
+      open += `<a${i}>`;
+      close = `</a${i}>${close}`;
+    }
+    return `<form>${open}${leaf}${close}</form>`;
+  };
+  const segments = (count: number): string =>
+    ["form", ...Array.from({ length: count - 2 }, (_, i) => `a${i}`), "code"].join(".");
+  // 98 segments: form + a0..a95 + code, nested 96 deep under <form>.
+  const ok = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.${segments(98)}"/></field>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      nested(96, "<code>DEEP</code>") +
+      "</xfa:data></xfa:datasets>",
+  });
+  const result = await inspectPdf(ok);
+  assert.deepEqual(result.fields, [{ name: `${segments(98)}`, value: "DEEP", type: "text" }]);
+  // 100 segments: parses (at the limit) but can never match a leaf.
+  const noMatch = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.${segments(100)}"/></field>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(noMatch), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  // 101 segments: one too many, rejected at parse time.
+  const tooLong = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.${segments(101)}"/></field>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(tooLong), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /dataRef with 101 segments \(limit 100\)/);
+    return true;
+  });
+});
+
+test("A-2 (round 6): a 256 KiB selector fails closed deterministically (probe V2 shape)", async () => {
+  // One person, 5,000 <code> leaves, a 256 KiB zero selector: the old
+  // code re-parsed the selector (regex + Number) for every candidate
+  // (8,299 ms vs 397 ms for "[0]"). The selector is now rejected at
+  // parse time — over-long digit run — before any lookup runs.
+  const zeroSelector = "0".repeat(256 * 1024);
+  const codes = "<code>V</code>".repeat(5000);
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[${zeroSelector}].code"/></field></subform>` +
+      "</subform></template>",
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person>${codes}</person></form></xfa:data></xfa:datasets>`,
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /out-of-range \[N\] selector/);
+    return true;
+  });
+});
+
+test("A-2 (round 6): selector bounds — [1000000] parses but matches nothing, [1000001] fails closed at parse", async () => {
+  // The value ceiling is 1,000,000: the maximum is accepted at parse
+  // time and fails closed at lookup (no such occurrence), while one
+  // past it — and an 8-digit leading-zero run with value 1 — are
+  // rejected at parse time.
+  const atMax = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[1000000].code"/></field>',
+      "<person><code>ONLY</code></person>",
+    ),
+  );
+  await assert.rejects(inspectPdf(atMax), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  for (const selector of ["1000001", "00000001"]) {
+    const bytes = await createXfaPdf(
+      wrap(
+        `<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[${selector}].code"/></field>`,
+        "<person><code>ONLY</code></person>",
+      ),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /out-of-range \[N\] selector/);
+      return true;
+    });
+  }
+});
+
+test("A-3 (round 6): xml:space=preserve on the datasets form ancestor keeps the newline (probe V3a shape)", async () => {
+  // Astra's exact shape: preserve sits on <form>, above the nodeText
+  // entry point at <note>. The state is now carried through the
+  // datasets walk, so the value is "A\nB", not "AB".
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form xml:space="preserve"><note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "unsupported" }]);
+  // Control: the same markup without xml:space still reports "AB".
+  const control = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note>`,
+    ),
+  );
+  const controlResult = await inspectPdf(control);
+  assert.deepEqual(controlResult.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("A-3 (round 6): xml:space on the datasets roots reaches the walk, and default resets it", async () => {
+  // Preserve on <xfa:data> — above the walk's entry point at <data> —
+  // reaches the rich text; a default on the <form> below it resets
+  // the state back, so the same markup reports "AB".
+  const preserved = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data xml:space="preserve">' +
+      `<form><note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  const preservedResult = await inspectPdf(preserved);
+  assert.deepEqual(preservedResult.fields, [
+    { name: "form.note", value: "A\nB", type: "unsupported" },
+  ]);
+  const reset = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data xml:space="preserve">' +
+      `<form xml:space="default"><note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  const resetResult = await inspectPdf(reset);
+  assert.deepEqual(resetResult.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("A-3 (round 6): xml:space=preserve on a template items ancestor keeps the newline in options (probe V3b shape)", async () => {
+  // The preserve sits on <items>, above itemTexts()' entry point at
+  // the <text> child. Options are ["A\nB"], not ["AB"].
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="pick"><ui><choiceList/></ui><bind match="none"/><items xml:space="preserve"><text><b>A</b>\n<b>B</b></text></items></field>',
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.pick", value: "", type: "unsupported", options: ["A\nB"] },
+  ]);
+  // Control: the same items without xml:space still report ["AB"].
+  const control = await createXfaPdf(
+    wrap(
+      '<field name="pick"><ui><choiceList/></ui><bind match="none"/><items><text><b>A</b>\n<b>B</b></text></items></field>',
+      "<ok>V</ok>",
+    ),
+  );
+  const controlResult = await inspectPdf(control);
+  assert.deepEqual(controlResult.fields, [
+    { name: "form.pick", value: "", type: "unsupported", options: ["AB"] },
+  ]);
+});
+
+test("A-3 (round 6): a caption under xml:space=preserve keeps its newlines (probe V3c shape)", async () => {
+  // DECIDED (round 6, SPEC §1 step 4): a caption under
+  // xml:space="preserve" keeps its whitespace verbatim — the document
+  // says it is significant — while a caption without preserve still
+  // normalizes, as before.
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="note"><ui><textEdit/></ui><bind match="none"/><caption xml:space="preserve"><value><p><b>A</b>\n<b>B</b></p></value></caption></field>`,
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "A\nB" },
+  ]);
+  // Control: the same caption without preserve normalizes to "AB".
+  const control = await createXfaPdf(
+    wrap(
+      `<field name="note"><ui><textEdit/></ui><bind match="none"/><caption><value><p><b>A</b>\n<b>B</b></p></value></caption></field>`,
+      "<ok>V</ok>",
+    ),
+  );
+  const controlResult = await inspectPdf(control);
+  assert.deepEqual(controlResult.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "AB" },
+  ]);
+});
+
+test("A-3 (round 6): xml:space=preserve on the template root reaches a field caption", async () => {
+  // State set on <template> itself — the template walk's root — must
+  // reach the fields below it, not just state set on nearer ancestors.
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xml:space="preserve"><subform name="form" layout="tb">' +
+      `<field name="note"><ui><textEdit/></ui><bind match="none"/><caption><value><p><b>A</b>\n<b>B</b></p></value></caption></field>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "A\nB" },
+  ]);
+});
+
+test("A-4 (round 6): overlapping scopes merge to one field with unioned on-values (probe V4 shape)", async () => {
+  // Astra's exact construction: two subforms named s, dataRef-bound
+  // to $data.form.person and $data.form.person[0], each with a
+  // checkButton field code; one person, one code 0. The old code
+  // reported the same public name twice (onValues ["1"] and ["2"]);
+  // the resolved node is the identity, so they merge to one field.
+  const sub = (ref: string, on: string) =>
+    `<subform name="s"><bind match="dataRef" ref="${ref}"/>` +
+    `<field name="code"><ui><checkButton/></ui><bind match="dataRef" ref="code"/>` +
+    `<items><text>${on}</text><text>0</text></items></field></subform>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      sub("$data.form.person", "1") +
+      sub("$data.form.person[0]", "2") +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person.code", value: "0", type: "checkbox", onValues: ["1", "2"] },
+  ]);
+});
+
+test("A-4 (round 6): overlapping scopes with conflicting options fail closed", async () => {
+  // Same overlapping shape, but the two occurrences disagree about
+  // the node's options: that is incompatible metadata for one data
+  // node, not a merge — fail closed instead of letting one side win.
+  const sub = (ref: string, options: string) =>
+    `<subform name="s"><bind match="dataRef" ref="${ref}"/>` +
+    `<field name="code"><ui><choiceList/></ui><bind match="dataRef" ref="code"/>` +
+    `<items>${options}</items></field></subform>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      sub("$data.form.person", "<text>Red</text><text>Green</text>") +
+      sub("$data.form.person[0]", "<text>Red</text><text>Blue</text>") +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>Red</code></person></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /conflicting options/);
+    return true;
+  });
+});
+
+test("A-4 (round 6): overlapping scopes with conflicting labels fail closed", async () => {
+  // Same overlapping shape, but the two occurrences caption the node
+  // differently: incompatible metadata, fail closed.
+  const sub = (ref: string, label: string) =>
+    `<subform name="s"><bind match="dataRef" ref="${ref}"/>` +
+    `<field name="code"><ui><checkButton/></ui><bind match="dataRef" ref="code"/>` +
+    `<items><text>1</text><text>0</text></items><caption><value>${label}</value></caption></field></subform>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      sub("$data.form.person", "First label") +
+      sub("$data.form.person[0]", "Second label") +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /conflicting labels/);
+    return true;
+  });
+});
+
+test("A-4 (round 6): overlapping scopes merge for unnamed fields too", async () => {
+  // Unnamed checkButton fields (derived name from the bare ref's last
+  // segment) under the same overlapping scopes: the same resolved
+  // node, so they merge exactly like the named shape.
+  const sub = (ref: string, on: string) =>
+    `<subform name="s"><bind match="dataRef" ref="${ref}"/>` +
+    `<field><ui><checkButton/></ui><bind match="dataRef" ref="code"/>` +
+    `<items><text>${on}</text><text>0</text></items></field></subform>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      sub("$data.form.person", "1") +
+      sub("$data.form.person[0]", "2") +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person.code", value: "0", type: "checkbox", onValues: ["1", "2"] },
+  ]);
 });

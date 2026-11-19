@@ -247,6 +247,56 @@ test("pull is atomic: a failed audit write leaves no visible, unaudited copy", a
   assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
 });
 
+// B1 fix round 6 (panel re-review #5, chunk B, Nov 19, 2026) ----------------
+// Probe B1 shape: a Store whose transaction commits the callback's work
+// and THEN throws, simulating a lost COMMIT acknowledgement. The copy
+// row and its audit entry stay committed, so the bytes file must NOT
+// be deleted — deleting it would leave a committed artifact pointing
+// at missing bytes. Only a failure inside the work callback
+// establishes a rollback (see the atomicity test above, where the
+// bytes ARE removed).
+test("pull retains the bytes when the transaction outcome is indeterminate (B-1, round 6)", async () => {
+  const source = await agent.files.import(
+    "indeterminate-owner",
+    "fw9.pdf",
+    await fixture("fw9.pdf"),
+    "test",
+  );
+  const wrapped: Store = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "transaction") {
+        return async (work: (tx: Store) => Promise<unknown>) => {
+          await target.transaction(work);
+          throw new Error("COMMIT acknowledgement lost (simulated)");
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const wrappedFiles = new Files(wrapped, config, {
+    sign: (_owner: string, path: string) => path,
+  } as unknown as Auth);
+  await assert.rejects(
+    wrappedFiles.pull("indeterminate-owner", source.id, "bob"),
+    /COMMIT acknowledgement lost/,
+  );
+  // The copy is committed under the target owner…
+  const copies = (await agent.files.list("bob")).filter((file) => file.parentId === source.id);
+  assert.equal(copies.length, 1);
+  const copy = copies[0];
+  assert.ok(copy);
+  // …its audit entry is committed…
+  assert.equal(
+    (await db.list<FilePullAudit>("system", FILE_PULL_AUDIT_COLLECTION)).filter(
+      (audit) => audit.fileId === copy.id,
+    ).length,
+    1,
+  );
+  // …and the copy's bytes are still readable, byte-identical to the source.
+  const bytes = await new Files(db, config, auth).bytes("bob", copy.id);
+  assert.deepEqual(Buffer.from(bytes), await fixture("fw9.pdf"));
+});
+
 test("lineage returns provenance-only rows: no field values cross owners", async () => {
   const source = await agent.files.import(
     "lineage-a",
@@ -855,9 +905,14 @@ test("a failed XFA import logs no field value (captured-log assertion, round 5)"
   }
   // Non-vacuous: the PdfError log line itself must have been captured
   // (the error path really ran through onError), while the secret
-  // appears nowhere in what was captured.
+  // appears nowhere in what was captured. The exact prefix is
+  // asserted here too (round 6, test adequacy): the line must start
+  // with `[OpenMuse] PdfError:` — the round-5 assertion matched only
+  // /PdfError/ anywhere in the log.
   const logged = captured.join("\n");
-  assert.match(logged, /PdfError/);
+  const pdfLines = logged.split("\n").filter((line) => line.includes("PdfError"));
+  assert.equal(pdfLines.length, 1);
+  assert.match(pdfLines[0], /^\[OpenMuse\] PdfError: [\w.]{1,40}( offset=\d+)?$/);
   assert.doesNotMatch(logged, new RegExp(secret));
 });
 

@@ -131,19 +131,34 @@ test("transaction rolls back every put when the work throws", async (t) => {
 // every query.
 
 // R-2: overlapping transactions stay independent (probe R7 shape).
+// Explicit synchronization gates, not timer gates (round 6, test
+// adequacy): A's callback signals once its put has landed, the test
+// then issues B while A is still open, and only then releases A to
+// fail. No setTimeout is involved, so the intended overlap is
+// arranged deterministically instead of hoped for within 50 ms.
 test("overlapping transactions do not commit each other's rows", async (t) => {
   const db = await createStore();
   t.after(() => db.close());
-  const gate = new Promise<void>((resolve) => setTimeout(resolve, 50));
+  let releaseA!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseA = resolve;
+  });
+  let signalPut!: () => void;
+  const putDone = new Promise<void>((resolve) => {
+    signalPut = resolve;
+  });
   const a = db.transaction(async (tx) => {
     await tx.put("owner-a", "files", { id: "a1", text: "A" });
-    await gate; // yield: B's whole transaction runs here
+    signalPut();
+    await gate; // yield: B's whole transaction is issued here
     throw new Error("audit write failed");
   });
+  await putDone;
   const b = db.transaction(async (tx) => {
     await tx.put("owner-b", "files", { id: "b1", text: "B" });
     await tx.put("system", "file-pull-audit", { id: "audit-b", text: "B" });
   });
+  releaseA();
   const results = await Promise.allSettled([a, b]);
   assert.equal(results[0].status, "rejected");
   assert.equal(results[1].status, "fulfilled");
@@ -160,17 +175,29 @@ test("overlapping transactions do not commit each other's rows", async (t) => {
 test("an ordinary write issued mid-transaction is not swept into it", async (t) => {
   const db = await createStore();
   t.after(() => db.close());
-  const gate = new Promise<void>((resolve) => setTimeout(resolve, 50));
+  // Same explicit gates as the test above (round 6, test adequacy):
+  // the plain write is issued only after the transaction's put has
+  // deterministically landed, while the transaction is still open.
+  let releaseDoomed!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    releaseDoomed = resolve;
+  });
+  let signalPut!: () => void;
+  const putDone = new Promise<void>((resolve) => {
+    signalPut = resolve;
+  });
   const doomed = db.transaction(async (tx) => {
     await tx.put("owner-c", "files", { id: "c1", text: "C" });
+    signalPut();
     await gate;
     throw new Error("rollback me");
   });
+  await putDone;
   // Issue the plain write while the transaction is open: on the shared
   // single connection it used to join the open transaction and be rolled
   // back with it, even though its own call fulfilled.
-  await new Promise<void>((resolve) => setTimeout(resolve, 10));
   const plain = db.put("owner-d", "files", { id: "d1", text: "D" });
+  releaseDoomed();
   const results = await Promise.allSettled([doomed, plain]);
   assert.equal(results[0].status, "rejected");
   assert.equal(results[1].status, "fulfilled");
