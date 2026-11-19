@@ -493,13 +493,37 @@ function isXmlWhitespace(text: string): boolean {
  * text node between elements is kept when it holds no line break: a
  * same-line space (`<b>A</b> <b>B</b>` → `"A B"`) is deliberate content,
  * not formatting. A whitespace-only node WITH a line break is
- * pretty-printing indentation and is skipped, as before. Text inside a
+ * pretty-printing indentation and is skipped, as before — unless it
+ * holds a non-XML-whitespace character (B-7, round 15): `item.trim()`
+ * treats NBSP as whitespace, so a segment like `"&#160;\n"` was
+ * dropped; the predicate is now isXmlWhitespace(), so NBSP (and any
+ * other non-XML-whitespace character) is preserved. Text inside a
  * leaf (no element siblings) is kept verbatim, so dataset whitespace
  * (" 001 ") is preserved exactly. Fails closed (throws) when the depth
  * guard is hit — a local defense; the conversion pass already bounds
  * the whole document.
+ *
+ * (B-2, round 15) The skeleton-whitespace strip is POSITION-based,
+ * not local-name-based: `skeleton` is true only for a node at a
+ * position isXhtmlDocument() verified as the classified frame — the
+ * frame root itself, an <html> child of the frame (or of another
+ * skeleton <html>), or a <head> child of the frame or of a skeleton
+ * <html>. Body-content elements that merely share those local names
+ * (a <head> inside <body>, a nested <xhtml> in body content) are
+ * flattened with their text intact. Template items and captions call
+ * this with no skeleton context (skeleton=false), so the strip never
+ * applies there at all.
+ *
+ * (B-4, round 15) A skeleton-position <head> subtree is excluded
+ * from flattening entirely: head content is XHTML metadata, not body
+ * content, so a nested <title>/<span> under a skeleton <head> must
+ * not enter the value (direct non-whitespace text under a skeleton
+ * <head> still fails closed at classification time — see
+ * isXhtmlDocument — this only removes the nested content that the
+ * classifier does not reject). A body-content <head> is flattened
+ * normally.
  */
-function nodeText(node: XElement | string, depth = 0, preserve = false): string {
+function nodeText(node: XElement | string, depth = 0, preserve = false, skeleton = false): string {
   if (typeof node === "string") return node;
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA packet is nested too deeply");
   // Whitespace preservation is inherited (U-5, round 5): an
@@ -513,26 +537,43 @@ function nodeText(node: XElement | string, depth = 0, preserve = false): string 
   let out = "";
   for (const item of node.content) {
     if (typeof item === "string") {
-      // (A-4, round 14) Formatting whitespace directly under a
-      // skeleton element (xhtml/html/head) never enters the flattened
-      // value: it is the author's indentation between skeleton
-      // elements, not body content — a same-line space there must
-      // behave like the newline indentation the existing rule already
-      // skips, or the value depends on formatting style (" Inside "
-      // vs "Inside" for identical content). This applies even under
-      // xml:space="preserve": preserve governs actual body content
-      // (text inside <body>, kept verbatim below), not the skeleton
-      // framing around it. Direct text under <body> itself is content
-      // and is untouched by this rule.
+      // (A-4, round 14; position-scoped B-2, round 15) Formatting
+      // whitespace directly under a skeleton-position element
+      // (xhtml/html/head at a verified frame position) never enters
+      // the flattened value: it is the author's indentation between
+      // skeleton elements, not body content — a same-line space there
+      // must behave like the newline indentation the existing rule
+      // already skips, or the value depends on formatting style
+      // (" Inside " vs "Inside" for identical content). This applies
+      // even under xml:space="preserve": preserve governs actual body
+      // content (text inside <body>, kept verbatim below), not the
+      // skeleton framing around it. Direct text under <body> itself
+      // is content and is untouched by this rule. A body-content
+      // element named head/html/xhtml is NOT a skeleton position, so
+      // its whitespace text is kept by the rules below.
       if (
+        skeleton &&
         (node.local === "xhtml" || node.local === "html" || node.local === "head") &&
         isXmlWhitespace(item)
       )
         continue;
-      if (!keep && item.trim() === "" && children.length > 0 && /[\n\r]/.test(item)) continue;
+      if (!keep && isXmlWhitespace(item) && children.length > 0 && /[\n\r]/.test(item)) continue;
       out += item;
     } else {
-      out += nodeText(item, depth + 1, keep);
+      // A skeleton-position <head> contributes nothing to the value
+      // (B-4): its whole subtree is metadata, not body content.
+      if (skeleton && (node.local === "xhtml" || node.local === "html") && item.local === "head")
+        continue;
+      // Skeleton position propagates only through the frame: a child
+      // is at a skeleton position when its parent is, and the parent
+      // is the frame root (xhtml) or a skeleton <html> — so an <html>
+      // or <head> nested under <body> (or under a body-content
+      // <xhtml>) is body content, not skeleton.
+      const childSkeleton =
+        skeleton &&
+        (node.local === "xhtml" || node.local === "html") &&
+        (item.local === "html" || item.local === "head");
+      out += nodeText(item, depth + 1, keep, childSkeleton);
     }
   }
   return out;
@@ -550,7 +591,12 @@ function normalizeSpace(text: string): string {
  * whitespace-only text between elements under default handling — but
  * keeps the preserve/default boundary per segment instead of merging
  * everything into one string, so normalizePreserving() can normalize
- * only the default segments.
+ * only the default segments. This is the caption path: captions
+ * carry no skeleton context, so no skeleton rule applies here at
+ * all (B-2, round 15) — only the newline-skip rule, which (B-7,
+ * round 15) uses isXmlWhitespace() like nodeText()'s, so a
+ * non-XML-whitespace segment such as NBSP+newline is preserved
+ * instead of being dropped by trim().
  */
 function collectTextSegments(
   node: XElement | string,
@@ -567,7 +613,7 @@ function collectTextSegments(
   const children = elementChildren(node);
   for (const item of node.content) {
     if (typeof item === "string") {
-      if (!keep && item.trim() === "" && children.length > 0 && /[\n\r]/.test(item)) continue;
+      if (!keep && isXmlWhitespace(item) && children.length > 0 && /[\n\r]/.test(item)) continue;
       out.push({ text: item, keep });
     } else {
       collectTextSegments(item, keep, out, depth + 1);
@@ -1360,6 +1406,42 @@ class ScopeInterner {
 }
 
 /**
+ * Namespace-URI interning (B-6, round 15): repeat agreement used to
+ * re-compare raw URI strings per matched leaf per segment position, so
+ * a long URI shared by many repeat matches was re-compared in full
+ * once per match — the structural-comparison budget counts
+ * comparisons, not URI byte lengths, so that work was uncharged
+ * (1,000 repeat matches sharing a 5 KiB URI measured ~6x a short-URI
+ * control, extrapolating to ~7 s at the 10,000-field output cap).
+ * Each distinct URI is now canonicalized ONCE, at leaf construction,
+ * to a small integer id; the join compares ids (see
+ * assertExpandedNamesAgree), so repeat-agreement work is O(matches ×
+ * depth) integer comparisons, independent of URI length, and the
+ * structural-comparison budget (1,000,000) bounds it. The URI
+ * byte-length work happens once per leaf segment at construction —
+ * linear in the dataset tree size, itself bounded by the 10 MiB
+ * packet cap — never per match. No-namespace is id 0, shared. An
+ * unbound segment (B-5) is never interned to an id: its namespace is
+ * UNKNOWN, not "none", and assertExpandedNamesAgree fails closed on
+ * it via the parallel nsUnbound array instead of letting it agree
+ * with id 0.
+ */
+class NamespaceInterner {
+  private nextId = 1;
+  private readonly ids = new Map<string, number>();
+
+  idFor(ns: string | undefined): number {
+    if (ns === undefined) return 0;
+    let id = this.ids.get(ns);
+    if (id === undefined) {
+      id = this.nextId++;
+      this.ids.set(ns, id);
+    }
+    return id;
+  }
+}
+
+/**
  * A name that becomes a SOM path segment must be representable in a
  * dotted SOM path (S-2): a literal "." / "[" / "]" in a name would make
  * two distinct nodes collapse to one path string (a literal `<a.b>`
@@ -1417,7 +1499,11 @@ function fieldTypeFromUi(uiKind: string): XfaFieldType {
  * merges their texts in order instead of silently dropping to [].
  * `preserve` is the effective xml:space state at the field (A-3,
  * round 6); each <items> element's own attribute overrides it, so
- * state set on an <items> ancestor reaches the <text> children. */
+ * state set on an <items> ancestor reaches the <text> children.
+ * Template items carry NO skeleton context (B-2, round 15): nodeText()
+ * is called with skeleton=false, so an element named <head> inside
+ * an <items><text> keeps its text — the skeleton strip applies only
+ * at verified rich-text frame positions, never in template text. */
 function itemTexts(node: XElement, preserve = false): string[] {
   const out: string[] = [];
   for (const items of childrenNamed(node, "items")) {
@@ -1760,6 +1846,26 @@ interface DataLeaf {
    * that prints a segment stay exactly as before.
    */
   namespaces: Array<string | undefined>;
+  /**
+   * Interned identity of each segment's namespace, parallel to
+   * `namespaces` (B-6, round 15): assigned once per leaf at
+   * construction by the inspect's NamespaceInterner, so repeat
+   * agreement compares integer ids, never raw URI strings (see
+   * assertExpandedNamesAgree). No-namespace is 0.
+   */
+  nsIds: number[];
+  /**
+   * Whether each segment's prefix was UNBOUND (B-5, round 15),
+   * parallel to `namespaces`: true when the segment's name carries a
+   * prefix with no binding in scope. Its namespace is UNKNOWN, not
+   * "none" — `namespaces` alone cannot say so, because an unbound
+   * prefix and no namespace both resolve to `undefined`, and the
+   * old code let an unbound leaf "agree" with a no-namespace leaf
+   * in repeat validation. An unbound segment fails closed when
+   * compared (see assertExpandedNamesAgree); it never agrees with a
+   * known URI or with no-namespace.
+   */
+  nsUnbound: boolean[];
   value: string;
   /** True when the value carried markup (xhtml rich text). */
   markup: boolean;
@@ -1903,18 +2009,26 @@ function isXhtmlDocument(element: XElement): boolean {
   // dataGroup marking, and an <html> element's children are
   // <head>/<body> only. Iterative — the tree is already
   // depth-bounded by conversion, but no walk here assumes that.
-  // Each pending entry carries its parent's local name, so the <head>
-  // text rule can tell a skeleton-position <head> (under <html> or
-  // <xhtml>) from a <head> nested inside body content, whose text is
-  // body content, not skeleton text.
-  const pending: Array<{ element: XElement; parentLocal: string }> = children.map((child) => ({
+  // (B-2, round 15) Each pending entry carries whether its element
+  // is at a SKELETON position — a direct child of the classified
+  // frame root, or a child of a skeleton-position <html>. Skeleton
+  // position propagates only through <html> elements from the frame
+  // root, so a <head> or <html> nested inside <body> content (or
+  // inside a body-content <xhtml>) is body content, not skeleton:
+  // its text is never recorded here, and flattening keeps it (see
+  // nodeText). The namespace / dataGroup / <html>-child shape
+  // defeats stay whole-subtree — they are classification evidence
+  // about the container, not text positions — while the text
+  // recording below is position-scoped: only text directly under a
+  // skeleton-position <xhtml>/<html>/<head> can throw.
+  const pending: Array<{ element: XElement; skeleton: boolean }> = children.map((child) => ({
     element: child,
-    parentLocal: "xhtml",
+    skeleton: true,
   }));
   while (pending.length > 0) {
-    const { element: descendant, parentLocal } = pending.pop() as {
+    const { element: descendant, skeleton } = pending.pop() as {
       element: XElement;
-      parentLocal: string;
+      skeleton: boolean;
     };
     if (descendant.nsUnbound || descendant.ns !== element.ns) defeated = true;
     if (dataNodeValue(descendant) === "dataGroup") defeated = true;
@@ -1925,18 +2039,16 @@ function isXhtmlDocument(element: XElement): boolean {
     )
       defeated = true;
     // Record, never throw mid-walk: the <html>-level text check runs
-    // at EVERY <html> in the subtree, at any depth, and the <head>
-    // check at every skeleton-position <head> — but only the final
-    // decision below may throw, once qualification is settled.
-    if (skeletonTextAt === undefined && descendant.local === "html") {
+    // at every SKELETON-position <html>, and the <head> check at
+    // every skeleton-position <head> — but only the final decision
+    // below may throw, once qualification is settled. A <head> or
+    // <html> in body content carries no skeleton flag, so its text
+    // is body content and is never recorded.
+    if (skeletonTextAt === undefined && descendant.local === "html" && skeleton) {
       if (descendant.content.some((item) => typeof item === "string" && !isXmlWhitespace(item)))
         skeletonTextAt = "html";
     }
-    if (
-      skeletonTextAt === undefined &&
-      descendant.local === "head" &&
-      (parentLocal === "html" || parentLocal === "xhtml")
-    ) {
+    if (skeletonTextAt === undefined && descendant.local === "head" && skeleton) {
       if (descendant.content.some((item) => typeof item === "string" && !isXmlWhitespace(item)))
         skeletonTextAt = "head";
     }
@@ -1947,7 +2059,7 @@ function isXhtmlDocument(element: XElement): boolean {
     // and under every packet cap, so it must succeed, not fail
     // closed on an engine limit (A-1, round 12).
     for (const child of grandChildren)
-      pending.push({ element: child, parentLocal: descendant.local });
+      pending.push({ element: child, skeleton: skeleton && descendant.local === "html" });
   }
   // Decide only after the whole subtree has been walked: a defeat
   // anywhere means ordinary data (return false, no throw), and the
@@ -2060,6 +2172,8 @@ function collectDataLeaves(
   depth: number,
   out: DataLeaf[],
   preserve = false,
+  unboundPath: boolean[] = [],
+  interner: NamespaceInterner = new NamespaceInterner(),
 ): void {
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA datasets packet is nested too deeply");
   // Effective xml:space at this element (A-3, round 6): state set on
@@ -2083,7 +2197,14 @@ function collectDataLeaves(
     // is significant (the parser is configured with trimValues: false,
     // and no trimming happens here either).
     const value = node.content.filter((item): item is string => typeof item === "string").join("");
-    out.push({ segments: path, namespaces: nsPath, value, markup: false });
+    out.push({
+      segments: path,
+      namespaces: nsPath,
+      nsIds: nsPath.map((ns) => interner.idFor(ns)),
+      nsUnbound: unboundPath,
+      value,
+      markup: false,
+    });
     return;
   }
   // Rich-text values are leaves (A-1, round 8): a node is a rich-text
@@ -2134,6 +2255,19 @@ function collectDataLeaves(
   // parent whose only direct text is NBSP is likewise not a clean
   // rich-text leaf, and recurses instead of flattening the NBSP
   // into the value.
+  // (B-3, round 15) The flattened value comes from the CLASSIFIED
+  // inner <xhtml> node, never from the <exData> wrapper around it:
+  // flattening the wrapper carried its own direct whitespace into
+  // the value (" Inside " for same-line spaces, "\nInside\n" under
+  // preserve), because nodeText() has no reason to strip text
+  // directly under an element named exData. The wrapper's effective
+  // xml:space state is carried into the inner node instead, so a
+  // preserve on the wrapper still governs the body content below
+  // it. (Merely adding exData to a generic local-name stripper
+  // would extend the position-blind defect B-2 removes — the strip
+  // applies only at verified skeleton positions, and the wrapper
+  // is not one.) The bare-<xhtml> case is unchanged: the container
+  // itself is the classified node.
   if (
     dataNode !== "dataGroup" &&
     !exDataDefeated(node) &&
@@ -2141,10 +2275,15 @@ function collectDataLeaves(
     node.content.every((item) => typeof item !== "string" || isXmlWhitespace(item)) &&
     isRichTextContainer(children[0])
   ) {
+    const container = children[0];
+    const inner = container.local === "exData" ? elementChildren(container)[0] : container;
+    const flattenKeep = container.local === "exData" ? effectiveSpace(container, keep) : keep;
     out.push({
       segments: path,
       namespaces: nsPath,
-      value: nodeText(children[0], 0, keep),
+      nsIds: nsPath.map((ns) => interner.idFor(ns)),
+      nsUnbound: unboundPath,
+      value: nodeText(inner, 0, flattenKeep, true),
       markup: true,
     });
     return;
@@ -2160,7 +2299,16 @@ function collectDataLeaves(
     const index = seen.get(child.local) ?? 0;
     seen.set(child.local, index + 1);
     const segment = (counts.get(child.local) ?? 1) > 1 ? `${child.local}[${index}]` : child.local;
-    collectDataLeaves(child, [...path, segment], [...nsPath, child.ns], depth + 1, out, keep);
+    collectDataLeaves(
+      child,
+      [...path, segment],
+      [...nsPath, child.ns],
+      depth + 1,
+      out,
+      keep,
+      [...unboundPath, child.nsUnbound],
+      interner,
+    );
   }
 }
 
@@ -2325,7 +2473,14 @@ function matchesSelectors(
  * narrowing, each examination is O(selector positions) with O(1)
  * occurrence checks (a segment not ending in "]" has no selector; a
  * trailing "[N]" puts the bracket within a few characters of the
- * end);
+ * end). Namespace-URI comparison is part of that bounded work (B-6,
+ * round 15): each distinct URI is canonicalized once per inspect to
+ * an integer id at leaf construction (NamespaceInterner — the URI
+ * byte-length work is linear in the dataset tree size, bounded by
+ * the packet caps), and repeat agreement compares ids, never raw URI
+ * strings, so its cost is O(matches × depth) integer comparisons
+ * charged to the same 1,000,000 budget — a long URI shared by many
+ * repeat matches cannot multiply the join work by its length;
  * (c) duplicate work is bounded two ways: mergeDuplicate() keeps
  * persistent merge state (one dedup Set per resolved field, created
  * once) and returns the exact serialized byte delta of the merge, so
@@ -2606,10 +2761,10 @@ function lookupSelectors(index: JoinIndex, selectors: string[], budget: JoinBudg
 }
 
 /**
- * (A-3, round 14) Repeat instances of one stripped path must share
- * one expanded name at every segment position, or they are not
- * repeats of one field — fail closed instead of reporting them as
- * `form.person[0].code` / `[1].code`. The convertEntries sibling
+ * (A-3, round 14; B-5/B-6, round 15) Repeat instances of one stripped
+ * path must share one expanded name at every segment position, or they
+ * are not repeats of one field — fail closed instead of reporting them
+ * as `form.person[0].code` / `[1].code`. The convertEntries sibling
  * gate (C1, round 13) cannot cover this: the colliding leaves sit
  * under DIFFERENT parents, so they are never siblings in one
  * conversion list, and the stripped-path bucket in buildJoinIndex
@@ -2620,6 +2775,19 @@ function lookupSelectors(index: JoinIndex, selectors: string[], budget: JoinBudg
  * it. It runs for `default` and for unindexed/selector `dataRef`
  * lookups, both of which assemble repeat instances; `global` returns
  * a single leaf by definition, so there is nothing to compare.
+ * joinFields also calls it across the resolution units of one
+ * template field (B-1, round 15), where the same pooled set is
+ * compared — see there.
+ *
+ * Comparison is on interned namespace IDS (B-6), never raw URI
+ * strings: each leaf's nsIds were assigned once at construction, so
+ * this loop is O(matches × depth) integer comparisons, independent
+ * of URI length, and the structural-comparison budget bounds it.
+ * An UNBOUND segment (B-5) fails closed when compared: its namespace
+ * is unknown, not "none", so it never agrees with a known URI, with
+ * no-namespace, or with another unbound segment — the old code read
+ * both unbound and no-namespace as `undefined` and let them agree.
+ *
  * Boundary, stated plainly: a `[N]` selector that narrows to ONE
  * occurrence resolves that occurrence alone — selector-addressed
  * leaves are not assembled as repeats, so a single selected leaf in
@@ -2631,12 +2799,19 @@ function assertExpandedNamesAgree(field: TemplateField, matches: DataLeaf[]): vo
   if (matches.length < 2) return;
   const first = matches[0];
   for (const match of matches.slice(1)) {
-    const length = Math.max(first.namespaces.length, match.namespaces.length);
+    const length = Math.max(
+      first.namespaces.length,
+      match.namespaces.length,
+      first.nsUnbound.length,
+      match.nsUnbound.length,
+    );
     for (let position = 0; position < length; position++) {
-      const firstNs = first.namespaces[position];
-      const matchNs = match.namespaces[position];
-      if (firstNs !== matchNs) {
-        const local = stripSegmentIndex(first.segments[position] ?? "");
+      const local = stripSegmentIndex(first.segments[position] ?? "");
+      if (first.nsUnbound[position] === true || match.nsUnbound[position] === true)
+        throw new XfaError(
+          `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report them as repeats of one field`,
+        );
+      if ((first.nsIds[position] ?? 0) !== (match.nsIds[position] ?? 0)) {
         throw new XfaError(
           `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes in different namespaces for segment '${shortName(local)}'; refusing to report them as repeats of one field`,
         );
@@ -2814,6 +2989,13 @@ function mergeDuplicate(previous: ResolvedFieldEntry, incoming: XfaField): numbe
  * on-values are merged onto it. For `default` the identity includes
  * the inherited scope (T-1, round 4): same somPath under different
  * scopes binds different data nodes and must NOT collapse.
+ * Units of one template field that resolve to repeats of it are
+ * compared ACROSS units too (B-1, round 15): same template SOM path
+ * AND same stripped dataset path must agree on expanded name at every
+ * segment position, or the inspect fails closed — per-unit agreement
+ * alone cannot see two scoped units assembling repeats from different
+ * namespaces. Units bound to different dataset paths are intentional
+ * bindings, not repeats, and are never compared.
  * A group of UNBOUND occurrences (bind none, or an unknown match)
  * never shares a data node, so it must NOT collapse: each occurrence
  * is reported as its own field, with an occurrence index on the
@@ -2841,8 +3023,13 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   }
   // Collapse each group to its resolution units: one unit for a bound
   // group (merged), one unit per occurrence for an unbound group.
+  // unitGroups keeps each group's units together (B-1, round 15):
+  // the cross-unit agreement check needs the units of ONE template
+  // field as a set, not the flat unit list.
   const units: TemplateField[] = [];
+  const unitGroups: Array<{ somPath: string; units: TemplateField[] }> = [];
   for (const [somPath, occurrences] of groups) {
+    const groupUnits: TemplateField[] = [];
     const first = occurrences[0];
     for (const field of occurrences) {
       if (field.bind !== first.bind || field.ref !== first.ref || field.ui !== first.ui)
@@ -2854,11 +3041,13 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       // No shared data node: keep every occurrence. A lone occurrence
       // keeps the plain somPath name; several get occurrence indices.
       occurrences.forEach((field, index) => {
-        units.push({
+        groupUnits.push({
           ...field,
           ...(occurrences.length > 1 ? { somPath: `${somPath}[${index}]` } : {}),
         });
       });
+      unitGroups.push({ somPath, units: groupUnits });
+      units.push(...groupUnits);
       continue;
     }
     // Bound occurrences collapse to one unit ONLY when they share one
@@ -2960,8 +3149,10 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
         }
       }
       merged.onValues = onValues;
-      units.push(merged);
+      groupUnits.push(merged);
     }
+    unitGroups.push({ somPath, units: groupUnits });
+    units.push(...groupUnits);
   }
   // No template fields, no index (T-3, round 4): the join index was
   // built unconditionally, so a field-less template still paid the
@@ -3057,26 +3248,72 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
     if (field.label) result.label = field.label;
     return result;
   };
-  for (const field of units) {
-    if (field.bind === "none") {
-      // No data binding: never consult the datasets, even when a
-      // same-named node exists.
-      push(unbound(field), field.somPath);
-      continue;
+  // Resolve group by group (B-1, round 15): every unit of ONE template
+  // field is resolved before any of its fields is pushed, so the
+  // cross-unit agreement check below sees the whole assembled set.
+  // findLeaves() already compares expanded names WITHIN one unit's
+  // matches; two units of one template field can still assemble
+  // repeats of it from different namespaces (two <subform name="s">
+  // dataRef-scoped to person[0]/person[1], each resolving one
+  // <p:code> leaf in a different namespace) and report them as
+  // form.person[0].code / [1].code — indistinguishable from genuine
+  // repeats, and invisible to the per-unit check. So the units'
+  // matches are pooled by STRIPPED dataset path and compared across
+  // units too: same template SOM path AND same stripped dataset path
+  // must agree on expanded name at every segment position. Units
+  // bound to DIFFERENT dataset paths are intentional bindings to
+  // different data nodes, not repeats, and are never compared — the
+  // pool key is what scopes the check. (The single-selector boundary
+  // does not cover this: a [N] selector narrowing to ONE leaf makes
+  // no claim of repeats, but two units collectively reporting
+  // repeats of one template field do.) The pooled key strings are
+  // bounded by the aggregate internal-path bound: the stripped-path
+  // bytes of every leaf were already charged per leaf in
+  // buildJoinIndex, so the total key material here cannot exceed it.
+  for (const { units: groupUnits } of unitGroups) {
+    const resolved: Array<{ field: TemplateField; matches: DataLeaf[] }> = [];
+    for (const field of groupUnits) {
+      if (field.bind === "none" || field.bind === "unsupported") {
+        resolved.push({ field, matches: [] });
+        continue;
+      }
+      resolved.push({ field, matches: findLeaves(field, index, budget) });
     }
-    if (field.bind === "unsupported") {
-      // Unknown bind match: report the field as unsupported, never guess
-      // a binding. (The raw match value has no field on XfaField to
-      // carry it; the unsupported type is the signal.)
-      push(unbound(field), field.somPath);
-      continue;
+    // A unit with no data node fails closed in unit order, as before.
+    for (const { field, matches } of resolved) {
+      if (field.bind !== "none" && field.bind !== "unsupported" && matches.length === 0)
+        throw new XfaError(
+          `XFA template/datasets mismatch: field '${shortName(field.somPath)}' has no data node`,
+        );
     }
-    const matches = findLeaves(field, index, budget);
-    if (matches.length === 0)
-      throw new XfaError(
-        `XFA template/datasets mismatch: field '${shortName(field.somPath)}' has no data node`,
-      );
-    for (const match of matches) push(toXfaField(field, match), field.somPath);
+    const pooled = new Map<string, DataLeaf[]>();
+    for (const { matches } of resolved) {
+      for (const leaf of matches) {
+        const key = strippedSegments(leaf.segments).join(".");
+        const bucket = pooled.get(key);
+        if (bucket) bucket.push(leaf);
+        else pooled.set(key, [leaf]);
+      }
+    }
+    for (const leaves of pooled.values()) {
+      assertExpandedNamesAgree(groupUnits[0], leaves);
+    }
+    for (const { field, matches } of resolved) {
+      if (field.bind === "none") {
+        // No data binding: never consult the datasets, even when a
+        // same-named node exists.
+        push(unbound(field), field.somPath);
+        continue;
+      }
+      if (field.bind === "unsupported") {
+        // Unknown bind match: report the field as unsupported, never guess
+        // a binding. (The raw match value has no field on XfaField to
+        // carry it; the unsupported type is the signal.)
+        push(unbound(field), field.somPath);
+        continue;
+      }
+      for (const match of matches) push(toXfaField(field, match), field.somPath);
+    }
   }
   // Final output-byte verification (A-1, round 7): the running
   // outBytes accounting is exact-incremental, but the 1 MiB guarantee
@@ -3122,6 +3359,18 @@ export function inspectXfa(doc: PDFDocument): {
   const leaves: DataLeaf[] = [];
   // xml:space state at the datasets roots (A-3, round 6): the walk
   // starts at <data>, but the state may be set on <datasets> above it.
-  collectDataLeaves(dataRoot, [], [], 0, leaves, effectiveSpace(datasetsRoot, false));
+  // One namespace interner per inspect (B-6, round 15): every leaf
+  // built by this walk canonicalizes its segment URIs through it, so
+  // repeat agreement compares ids, never raw URI strings.
+  collectDataLeaves(
+    dataRoot,
+    [],
+    [],
+    0,
+    leaves,
+    effectiveSpace(datasetsRoot, false),
+    [],
+    new NamespaceInterner(),
+  );
   return { fields: joinFields(templateFields, leaves), formKind: xfaFormKind(doc) ?? "xfa-static" };
 }
