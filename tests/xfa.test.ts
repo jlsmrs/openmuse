@@ -4711,12 +4711,15 @@ test("Test adequacy (round 14): wide XHTML failing late still fails closed (Sonn
   // late, after the whole wide subtree has been walked. The
   // ordinary-data walk that follows produces ~190k leaves, so the
   // aggregate join-index bound (4 MiB of internal paths) fires
-  // before lookup runs — the asserted outcome is that bound, NOT the
-  // convertEntries gate and NOT a skeleton-text throw. The small
-  // companion test below pins the "no data node" outcome the
-  // ordinary-data walk produces when the leaf set fits the index
-  // bound. Only the fail-closed outcome is asserted here, not a
-  // fabricated scalar and no RangeError.
+  // before lookup runs — each leaf charges 28 bytes (27 for the
+  // stripped path `form.note.xhtml.html.body.p` + 1 for the leaf
+  // name `p`, which buildJoinIndex charges too), so ~190k leaves
+  // charge ~5.3 MB against the 4 MiB bound. The asserted outcome is
+  // that bound, NOT the convertEntries gate and NOT a skeleton-text
+  // throw. The small companion test below pins the "no data node"
+  // outcome the ordinary-data walk produces when the leaf set fits
+  // the index bound. Only the fail-closed outcome is asserted here,
+  // not a fabricated scalar and no RangeError.
   const bytes = await createXfaPdf(
     wrap(
       '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
@@ -4989,9 +4992,10 @@ test("A-2 (round 14): U+2028 line separator under <html> fails closed", async ()
 test("A-2 (round 14): NBSP as a parent's only direct text disqualifies the rich-text leaf", async () => {
   // The XML-whitespace predicate in the caller's own-text guard: a
   // parent whose only direct text is NBSP is not a clean rich-text
-  // leaf (trim() would have called it whitespace and flattened the
-  // NBSP into the value). It recurses as ordinary data instead, so
-  // the field bound to the parent has no data node.
+  // leaf (trim() would have called it whitespace, so the leaf
+  // resolved "Inside" with the NBSP silently dropped as formatting).
+  // It recurses as ordinary data instead, so the field bound to the
+  // parent has no data node.
   const bytes = await createXfaPdf(
     wrap(
       '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
@@ -5190,4 +5194,447 @@ test("Test adequacy (round 14): small wide-and-failing-late shape reaches the cl
     assert.match(error.message, /mismatch.*form\.note.*has no data node/);
     return true;
   });
+});
+
+// --- B1 fix round 15 (re-review #14, cross-check panel, Nov 19, 2026) -----
+// Regression tests for the seven converged P1s (B-1 cross-unit namespace
+// agreement, B-2 position-based skeleton rule, B-3 exData wrapper framing,
+// B-4 head-subtree text, B-5 unbound prefix in repeat agreement, B-6
+// namespace-URI comparison work, B-7 NBSP+newline body content) plus the
+// re-review's comment nits (fixed in place, see below). Probe shapes are
+// noted per test.
+
+test("B-1 (round 15): two scoped units assembling repeats from different namespaces fail closed (probe V1 shape)", async () => {
+  // Two <subform name="s"> units dataRef-scoped to person[0] and
+  // person[1], each resolving one <p:code> leaf in a DIFFERENT
+  // namespace, used to report as form.person[0].code / [1].code —
+  // indistinguishable from genuine repeats. The per-unit agreement
+  // check cannot see it (one match per unit), so the units' matches
+  // are pooled by stripped dataset path and compared across units.
+  // The stated [N] boundary does not cover this: a single selector
+  // narrowing to one leaf makes no claim of repeats, but two units
+  // collectively reporting repeats of one template field do.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[1]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><p:code xmlns:p="urn:first">FIRST</p:code></person><person><p:code xmlns:p="urn:second">SECOND</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.s\.code.*different namespaces/);
+    return true;
+  });
+});
+
+test("B-1 (round 15): two scoped units in the same namespace still report as [0]/[1] (probe V1b control)", async () => {
+  // Positive control for the V1 regression: the same shape with BOTH
+  // codes in urn:first is genuine repeats through the scoped units
+  // and must still report as form.person[0].code / [1].code.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[1]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><p:code xmlns:p="urn:first">FIRST</p:code></person><person><p:code xmlns:p="urn:first">SECOND</p:code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[0].code", value: "FIRST", type: "text" },
+    { name: "form.person[1].code", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("B-1 (round 15): units bound to different dataset paths are not compared (intentional bindings)", async () => {
+  // Scope guard for the cross-unit check: two units of one template
+  // field bound to DIFFERENT dataset paths (form.a.code vs
+  // form.b.code, in different namespaces) are intentional bindings
+  // to different data nodes, not repeats, and must still resolve —
+  // the pool key is the stripped dataset path, so they are never
+  // compared against each other.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.a"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.b"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<a><p:code xmlns:p="urn:first">FIRST</p:code></a><b><p:code xmlns:p="urn:second">SECOND</p:code></b>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.a.code", value: "FIRST", type: "text" },
+    { name: "form.b.code", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("B-2 (round 15): a <head> nested in body content keeps its text (probe V3 shape)", async () => {
+  // The round-14 skeleton strip was local-name-based: a <head> inside
+  // <body> — body content, not skeleton — had its whitespace-only
+  // text stripped ("A" instead of " A "). Skeleton position is now
+  // carried from the classified frame, so body-content elements
+  // named head/html/xhtml keep their text.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body><h:head xml:space="preserve"> <h:b>A</h:b> </h:head></h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: " A ", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): a <head> in body content keeps inter-element spaces (probe V4 shape)", async () => {
+  // Same position defect with sibling <b> elements: the space between
+  // them is body content under a body-content <head>, not skeleton
+  // formatting — "A B", not "AB".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><head xml:space="preserve"><b>A</b> <b>B</b></head></body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A B", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): whitespace under a body-content <head> is kept (probe V5 shape)", async () => {
+  // <body xml:space="preserve">A<head> </head>B</body>: the <head>
+  // is body content, so its whitespace-only text is content — "A B",
+  // not "AB".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body xml:space="preserve">A<head> </head>B</body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A B", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): an inner <xhtml> in body content is not skeleton text (probe V7 shape)", async () => {
+  // The reverse direction: the classifier tracked only the immediate
+  // parent's local name, so a <head> under an inner <xhtml> inside
+  // body content triggered the skeleton-text 422. The inner <xhtml>
+  // is body content, so its <head> text flattens as body content.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><xhtml><head>CONTENT</head></xhtml></body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "CONTENT", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): whitespace under an inner body-content <xhtml> is body content (probe V7b shape)", async () => {
+  // Same shape as V7 with whitespace-only head text. The space is
+  // body content now, not skeleton formatting, so the value is " "
+  // (round-14 code reported "" — the strip that produced it was the
+  // position-blind rule this round removes).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><xhtml><head> </head></xhtml></body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: " ", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): text under a body-content <html> is kept, not rejected", async () => {
+  // The <html>-direction of the same false rejection: an <html>
+  // nested inside <body> is body content, so its direct text neither
+  // throws as skeleton text nor gets stripped.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><html>TEXT</html></body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "TEXT", type: "unsupported" }]);
+});
+
+test("B-2 (round 15): template <items> text never applies the skeleton rule", async () => {
+  // Template items carry no skeleton context at all: a <head> inside
+  // an <items><text> used to have its space stripped ("Label"), but
+  // it is template text, not rich-text framing — the space is kept.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="agree"><ui><checkButton/></ui><items><text><head> </head>Label</text></items><bind match="global"/></field>',
+      `<agree>Label</agree>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.agree", value: "Label", type: "checkbox", onValues: [" Label"] },
+  ]);
+});
+
+test("B-3 (round 15): same-line spaces under an <exData> wrapper do not leak (probe V2 shape)", async () => {
+  // collectDataLeaves flattened the WRAPPER, not the classified inner
+  // xhtml, so the wrapper's own direct spaces entered the value
+  // (" Inside "). The classified inner node is flattened now, so the
+  // wrapper framing contributes nothing.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html"> <xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml> </exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-3 (round 15): newlines under an <exData> wrapper do not leak even with preserve (probe V2b shape)", async () => {
+  // Same leak with preserve newlines around the inner xhtml:
+  // "\nInside\n" used to be reported. Flattening the inner node
+  // (with the wrapper's effective xml:space state carried into it)
+  // reports "Inside".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html" xml:space="preserve">\n<xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml>\n</exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-3 (round 15): bare xhtml with same-line spaces still flattens clean (probe V2c control)", async () => {
+  // Control for the V2/V2b regressions: a bare <xhtml> (no wrapper)
+  // with same-line spaces beside it already flattened to "Inside"
+  // — the wrapper fix must not change the bare case.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note> <xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml> </note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-3 (round 15): a preserve on the <exData> wrapper still governs body content", async () => {
+  // The wrapper's effective xml:space state is carried into the inner
+  // node, not dropped with the wrapper: a newline between two <p>
+  // elements inside a preserve wrapper's body is kept ("A\nB").
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html" xml:space="preserve"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><p>A</p>\n<p>B</p></body></xhtml></exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "unsupported" }]);
+});
+
+test("B-3 (round 15): newlines inside a default <exData> wrapper body are still skipped (control)", async () => {
+  // Control for the preserve-carry test: without preserve anywhere,
+  // the same newline between two <p> elements is formatting and is
+  // skipped ("AB") — carrying the wrapper state must not invent a
+  // preserve where there is none.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><p>A</p>\n<p>B</p></body></xhtml></exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("B-4 (round 15): text nested in a skeleton <head> does not enter the value (probe V6 shape)", async () => {
+  // A-5 covered only DIRECT text under <head>; nodeText() recursively
+  // flattened the head's descendants, so a nested <title> leaked
+  // ("OUTSIDEInside"). Head content is legitimate XHTML metadata,
+  // not malformed input, so the head subtree is excluded from
+  // flattening (not failed closed) — the value is the body text.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:head><h:title>OUTSIDE</h:title></h:head><h:body>Inside</h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-4 (round 15): a nested <span> in a skeleton <head> does not enter the value (probe V6b shape)", async () => {
+  // Same leak through a non-title descendant: a <span> under the
+  // skeleton <head> is head content too, and is excluded the same way.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:head><h:span>OUTSIDE</h:span></h:head><h:body>Inside</h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-4 (round 15): whitespace plus a nested title under a skeleton <head> still flattens to the body", async () => {
+  // The head-subtree exclusion also covers the whitespace-only direct
+  // text beside the nested title: neither the spaces nor the title
+  // enter the value, and the whitespace does not throw (it is
+  // XML-whitespace skeleton text, accepted as before).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:head> <h:title>TITLE</h:title> </h:head><h:body>Inside</h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("B-5 (round 15): an unbound prefix never agrees with no namespace in repeat validation", async () => {
+  // DataLeaf carried only child.ns, so an unbound prefix (namespace
+  // UNKNOWN) read as undefined and "agreed" with no-namespace:
+  // <code>FIRST</code> + <p:code>SECOND</p:code> with p UNDECLARED
+  // reported as [0]/[1] repeats. The unknown state is now carried
+  // into repeat validation and fails closed when compared.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><code>FIRST</code></person><person><p:code>SECOND</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.person\.code.*unknown.*unbound prefix/);
+    return true;
+  });
+});
+
+test("B-5 (round 15): no-namespace vs a declared namespace still fails closed as a disagreement (control)", async () => {
+  // Control for the unbound regression: the same shape with p
+  // DECLARED (xmlns:p="urn:second") is the round-14 U1 disagreement
+  // with the first leaf in no namespace — it must still fail closed,
+  // now with the different-namespaces message rather than the
+  // unknown-namespace one.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><code>FIRST</code></person><person><p:code xmlns:p="urn:second">SECOND</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.person\.code.*different namespaces/);
+    return true;
+  });
+});
+
+test("B-5 (round 15): two unbound prefixes never agree with each other either", async () => {
+  // Both repeats carry the same undeclared prefix, but the namespace
+  // is still unknown on both sides — two unknowns that might be
+  // different namespaces cannot be established as repeats, so the
+  // comparison fails closed rather than assuming the spelling
+  // establishes identity.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><p:code>FIRST</p:code></person><person><p:code>SECOND</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.person\.code.*unknown.*unbound prefix/);
+    return true;
+  });
+});
+
+test("B-6 (round 15): many repeat matches sharing a long URI still resolve (interned comparison)", async () => {
+  // Repeat agreement used to re-compare raw URI strings per matched
+  // leaf per segment, so a long URI shared by many matches multiplied
+  // the join work by its length (1,000 matches sharing a 5 KiB URI
+  // measured ~6x a short-URI control). URIs are now interned to ids
+  // once per inspect at leaf construction and compared as ids, so
+  // 200 repeats sharing a ~4 KiB URI resolve exactly like short-URI
+  // repeats. No timing assertion: the property under test is that
+  // the comparison path completes correctly without tripping the
+  // structural budget — the timing shape is pinned by the probe
+  // harness, not by a wall-clock assertion in the suite.
+  const longUri = `urn:${"x".repeat(4000)}`;
+  const persons = Array.from(
+    { length: 200 },
+    (_, index) => `<person><p:code xmlns:p="${longUri}">V${index}</p:code></person>`,
+  ).join("");
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      persons,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 200);
+  assert.deepEqual(result.fields[0], { name: "form.person[0].code", value: "V0", type: "text" });
+  assert.deepEqual(result.fields[199], {
+    name: "form.person[199].code",
+    value: "V199",
+    type: "text",
+  });
+});
+
+test("B-7 (round 15): NBSP+newline body content is preserved, not dropped (probe T3 shape)", async () => {
+  // nodeText()'s newline-skip rule used trim(), which treats NBSP as
+  // whitespace, so "&#160;\n" between two <p> elements was dropped
+  // ("AB"). The rule now uses isXmlWhitespace(), so a segment holding
+  // a non-XML-whitespace character is preserved verbatim.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body><h:p>A</h:p>&#160;\n<h:p>B</h:p></h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A \nB", type: "unsupported" }]);
+});
+
+test("B-7 (round 15): plain space+newline body content is still skipped as formatting (control)", async () => {
+  // Control for the T3 regression: a plain space plus newline between
+  // the same <p> elements IS XML whitespace, so it is still skipped
+  // as pretty-printing indentation ("AB", by design).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body><h:p>A</h:p> \n<h:p>B</h:p></h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("B-7 (round 15): NBSP+newline in a caption is preserved through normalization (caption variant)", async () => {
+  // The same trim() rule lived in collectTextSegments(), the caption
+  // path: NBSP+newline between two <b> elements was dropped ("AB").
+  // The segment is now preserved, and caption normalization collapses
+  // the NBSP+newline run to a single space ("A B").
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><caption><value><b>A</b>&#160;\n<b>B</b></value></caption><bind match="default"/></field>',
+      `<note>X</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "X", type: "text", label: "A B" }]);
+});
+
+test("B-7 (round 15): plain space+newline in a caption is still skipped (caption control)", async () => {
+  // Control for the caption variant: a plain space plus newline is
+  // XML whitespace, so it is still skipped and the caption flattens
+  // to "AB".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><caption><value><b>A</b> \n<b>B</b></value></caption><bind match="default"/></field>',
+      `<note>X</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "X", type: "text", label: "AB" }]);
 });
