@@ -3531,11 +3531,13 @@ test("A-3 (round 9): the single-pass scanner is linear on the repeated-opener sh
   // Deterministic work counter, never a wall-clock threshold: the
   // round-8 regex strips scanned the remaining suffix from every
   // candidate opener (n=2000 → 11 ms, n=8000 → 125 ms, ~11–14x for
-  // 4x input). A single forward scan examines each character at most
-  // twice, so the step count is linear in the input (4x input → ~4x
-  // steps) and bounded by twice the input length. The "&#0;" sits
-  // inside the comment, where it is literal text — the scan must not
-  // throw on this shape.
+  // 4x input). A single forward scan is linear in the input (4x
+  // input → ~4x steps), and the step count is a linear-work PROXY
+  // (round 10 precision correction), not literally a count of every
+  // examined character — delimiter lookahead and the characters
+  // inside a matched delimiter are not individually charged. The
+  // "&#0;" sits inside the comment, where it is literal text — the
+  // scan must not throw on this shape.
   const scanDatasets = (n: number) =>
     `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><!-- &#0; ${"<![CDATA[".repeat(n)} --><note>V</note></form></xfa:data></xfa:datasets>`;
   const text2000 = scanDatasets(2000);
@@ -3751,4 +3753,305 @@ test("Test adequacy (round 9): control — small labels let the later conflictin
     assert.match(error.message, /conflicting labels/);
     return true;
   });
+});
+
+// --- B1 fix round 10 (panel re-review #9, Nov 19, 2026) --------------------
+// Regression tests for the adopted chunk-A findings (A-1..A-3), the
+// test-adequacy items, and the probe shapes in panel/probe-rereview9.mts.
+
+test("A-1 (round 10): a prefixed company-namespaced container is ordinary data (Z1)", async () => {
+  // Astra #1 / Sol A9-1: <c:xhtml xmlns:c="urn:company:data"> with
+  // <c:body>/<c:head> children. The round-9 classifier read only the
+  // literal `xmlns` attribute, so the prefixed namespace was invisible
+  // and the parent flattened to form.note = "FIRSTSECOND". Now the
+  // container's RESOLVED namespace (prefix binding) defeats the
+  // classification: the parent has no data node, and the children
+  // stay addressable.
+  const datasets = `<note><c:xhtml xmlns:c="urn:company:data"><c:body>FIRST</c:body><c:head>SECOND</c:head></c:xhtml></note>`;
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 10): an inherited company default namespace defeats rich text (Z1b)", async () => {
+  // The company namespace is declared as the DEFAULT namespace on
+  // the parent <note>; the <xhtml> child inherits it. The round-9
+  // SPEC called inherited namespaces a limit — both reviewers ruled
+  // documenting the limit does not make silent fabrication safe, and
+  // the parent's xmlns IS in the tree, so the walk carries it: the
+  // child resolves to the company namespace and the parent has no
+  // data node, with the children addressable as before.
+  const datasets = `<note xmlns="urn:company:data"><xhtml><body>FIRST</body><head>SECOND</head></xhtml></note>`;
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 10): a genuine XHTML-prefixed container stays rich text, even with an unrelated default namespace (Z1c, Z1d)", async () => {
+  // Z1c converse: the container resolves its PREFIX to the XHTML
+  // namespace, so the unrelated default namespace does not govern
+  // it — the round-9 code rejected this shape ("no data node"), a
+  // false negative. Z1d control: the same container with no
+  // competing default namespace. Both stay rich text "A".
+  for (const datasets of [
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml" xmlns="urn:company:data"><h:body>A</h:body></h:xhtml></note>`,
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:body>A</h:body></h:xhtml></note>`,
+  ]) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    const result = await inspectPdf(bytes);
+    assert.deepEqual(result.fields, [{ name: "form.note", value: "A", type: "unsupported" }]);
+  }
+  // Same converse for a wrapper: an <exData> declaring an unrelated
+  // default namespace around a genuinely XHTML-prefixed inner
+  // <xhtml> is rich text — the wrapper's default namespace defeats
+  // the classification only insofar as the inner element inherits
+  // it, and this inner element does not.
+  const wrapperBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData xmlns="urn:company:data" contentType="text/html"><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:body>A</h:body></h:xhtml></exData></note>`,
+    ),
+  );
+  const wrapperResult = await inspectPdf(wrapperBytes);
+  assert.deepEqual(wrapperResult.fields, [{ name: "form.note", value: "A", type: "unsupported" }]);
+});
+
+test("A-1 (round 10): a skeleton-shaped container with an unbound prefix fails closed", async () => {
+  // An unbound prefix is an UNKNOWN namespace, not "none": <x:xhtml>
+  // with no binding for `x` anywhere in scope must not classify as
+  // rich text merely because its local names look like a skeleton.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><x:xhtml><x:body>FIRST</x:body><x:head>SECOND</x:head></x:xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-2 (round 10): an alternate prefix for the XFA data namespace still marks a dataGroup (Z2, Z2b)", async () => {
+  // Astra #2: `d:dataNode="dataGroup"` with xmlns:d bound to the XFA
+  // data namespace is the SAME attribute as xfa:dataNode in XML
+  // terms — the round-9 code looked up the literal spelling only, so
+  // a prefix change bypassed the Y2 fix. Both the empty-group shape
+  // and the group-marked rich-text-shaped container now fail closed.
+  const emptyBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:d="http://www.xfa.org/schema/xfa-data/1.0/" d:dataNode="dataGroup"/>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(emptyBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  // Control (Z2c): the literal spelling still fails closed (the
+  // round-9 Y2 shape).
+  const literalBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xfa:dataNode="dataGroup"/>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(literalBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  // Container variant (Z2b): the group-marked container flattens no
+  // more, and its body stays addressable through a dataRef.
+  const containerDatasets = `<note xmlns:d="http://www.xfa.org/schema/xfa-data/1.0/" d:dataNode="dataGroup"><xhtml><html><head></head><body>A</body></html></xhtml></note>`;
+  const containerBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      containerDatasets,
+    ),
+  );
+  await assert.rejects(inspectPdf(containerBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const deepBytes = await createXfaPdf(
+    wrap(
+      '<field name="b"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.note.xhtml.html.body"/></field>',
+      containerDatasets,
+    ),
+  );
+  const deepResult = await inspectPdf(deepBytes);
+  assert.deepEqual(deepResult.fields, [
+    { name: "form.note.xhtml.html.body", value: "A", type: "text" },
+  ]);
+});
+
+test("A-2 (round 10): a dataNode prefix bound to another namespace is not a group marking", async () => {
+  // Expanded-name semantics cut both ways: `d:dataNode` where `d`
+  // is bound to a company namespace is {urn:company:data}dataNode,
+  // NOT the XFA marking — so an empty element carrying it is an
+  // ordinary scalar leaf with value "", not a group. A literal
+  // spelling check would have failed this closed; a prefix-blind
+  // check would have too.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:d="urn:company:data" d:dataNode="dataGroup"/>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "", type: "text" }]);
+});
+
+test("A-3 (round 10): a numeric reference cannot repair a malformed split entity (Z3, Z3b, Z3c)", async () => {
+  // The scanner decodes numeric references BEFORE the only
+  // well-formedness check, so `&am&#112;;` used to decode to `&amp;`
+  // and report "&" for malformed input. Entity syntax is now
+  // established on the ORIGINAL text first: a split entity fails
+  // closed in text (Z3, Z3b) and in a quoted attribute value (Z3c).
+  for (const datasets of [`<note>&am&#112;;</note>`, `<note>&a&#109;p;</note>`]) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /malformed entity reference/);
+      return true;
+    });
+  }
+  const attrBytes = await createXfaPdf(
+    wrap(
+      '<field name="&am&#112;;"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note>V</note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(attrBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /malformed entity reference/);
+    return true;
+  });
+  // An undeclared named entity and an unterminated predefined one
+  // are malformed the same way (no DTD can declare anything else —
+  // DOCTYPE is refused outright).
+  for (const datasets of [`<note>&foo;</note>`, `<note>&amp</note>`]) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /malformed entity reference/);
+      return true;
+    });
+  }
+  // Controls: a legal numeric reference still decodes (Z3d), and the
+  // predefined named entities still decode in text.
+  const controlBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="named"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note>A&#65;B&amp;C</note><named>&quot;hi&quot; &apos;x&apos;</named>`,
+    ),
+  );
+  const control = await inspectPdf(controlBytes);
+  assert.deepEqual(control.fields, [
+    { name: "form.note", value: "AAB&C", type: "text" },
+    { name: "form.named", value: `"hi" 'x'`, type: "text" },
+  ]);
+});
+
+test("Test adequacy (round 10): numeric quote references decode in attributes, captions, and items", async () => {
+  // A decoded quote is re-emitted as its named entity by the scanner
+  // and decoded by the parser, so it can never break attribute
+  // quoting — pin that directly, in all three places a quote
+  // reference can reach output. Attribute values: a field name
+  // spelled with &#34; / &#39; (bind none, so no dataset leaf with a
+  // quote in its name is needed).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="a&#34;b"><ui><textEdit/></ui><bind match="none"/></field>' +
+        '<field name="c&#39;d"><ui><textEdit/></ui><bind match="none"/></field>' +
+        '<field name="note"><ui><textEdit/></ui><bind match="default"/><caption><value><text>Say &#34;hi&#34;</text></value></caption></field>' +
+        '<field name="pick"><ui><choiceList/></ui><bind match="none"/><items><text>it&#39;s</text><text>say &#34;hi&#34;</text></items></field>',
+      `<note>V</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: `form.a"b`, value: "", type: "unsupported" },
+    { name: `form.c'd`, value: "", type: "unsupported" },
+    { name: "form.note", value: "V", type: "text", label: `Say "hi"` },
+    {
+      name: "form.pick",
+      value: "",
+      type: "unsupported",
+      options: ["it's", `say "hi"`],
+    },
+  ]);
+});
+
+test("Test adequacy (round 10): a decoded CR reports as LF (documented parser corner)", async () => {
+  // &#13; decodes to a raw CR pre-parse, but the parser normalizes
+  // line endings on input, so it reports as LF, not CR. Accepted
+  // corner, pinned so a future parser change cannot silently change
+  // the reported value.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note>A&#13;B</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "text" }]);
 });
