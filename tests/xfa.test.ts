@@ -4055,3 +4055,259 @@ test("Test adequacy (round 10): a decoded CR reports as LF (documented parser co
   const result = await inspectPdf(bytes);
   assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "text" }]);
 });
+
+// --- B1 fix round 11 (re-review #10, Sol alone, Nov 19, 2026) ---------------
+// Regression tests for the two adopted P1s (A-1 namespace-map copying,
+// A-2 second-level skeleton checks) plus the malformed-entity matrix in
+// both lexical contexts. Fixtures are built in-test with the repo's own
+// generator so the discriminating shape is visible in the test.
+
+test("A-1 (round 11): a wide namespace environment x many declaring siblings fails closed (W1)", async () => {
+  // Sol's construction, scaled down: a template root declaring 1,000
+  // distinct prefixes, with 2,000 sibling empty elements each
+  // declaring xmlns:q — 2M copied map entries on round-10 code
+  // (838 ms, heap +91 MiB; the full 10,000 x 50,000 construction is
+  // ~500M entries). Depth does not bound this: the tree is shallow
+  // and field-less, and conversion runs before field collection, so
+  // no join/output budget protects it. The cumulative budget fails
+  // closed with a 422 before the over-budget copy is made.
+  const decls = Array.from({ length: 1000 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const sibs = Array.from(
+    { length: 2000 },
+    (_, i) => `<subform name="s${i}" xmlns:q="urn:q"></subform>`,
+  ).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      `<subform name="form" layout="tb" ${decls}>${sibs}</subform></template>`,
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><note/></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /too many namespace bindings/);
+    return true;
+  });
+});
+
+test("A-1 (round 11): a wide namespace environment under the budget still inspects (W1a control)", async () => {
+  // Same shape at 200 prefixes x 500 declaring siblings (100k copied
+  // entries, under the 250,000 budget): a field-less template inspects
+  // to zero fields, fast, with a small heap — the budget bounds the
+  // amplification without rejecting legitimate wide environments.
+  // (Passes on round-10 code too, slower; it pins the budget's
+  // below-threshold behaviour, not the defect.)
+  const decls = Array.from({ length: 200 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const sibs = Array.from(
+    { length: 500 },
+    (_, i) => `<subform name="s${i}" xmlns:q="urn:q"></subform>`,
+  ).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      `<subform name="form" layout="tb" ${decls}>${sibs}</subform></template>`,
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><note/></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, []);
+});
+
+test("A-2 (round 11): a mixed namespace one level down defeats rich text (W2)", async () => {
+  // Sol's construction: <h:xhtml> has one immediate child <h:html>
+  // (XHTML, skeleton name) — that passed the round-10 first-level
+  // rule — but the html's children are company-namespaced
+  // <c:body>/<c:head>. The round-10 code flattened them to
+  // form.note = "FIRSTSECOND"; the company namespace is KNOWN
+  // (declared on the container itself), so this is not covered by
+  // the stated "lying document" limit. Now the whole subtree is
+  // validated before flattening: the parent has no data node, and
+  // the children stay addressable.
+  const datasets =
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml" xmlns:c="urn:company:data">` +
+    `<h:html><c:body>FIRST</c:body><c:head>SECOND</c:head></h:html></h:xhtml></note>`;
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<subform name="html"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform></subform>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.xhtml.html.body", value: "FIRST", type: "text" },
+    { name: "form.note.xhtml.html.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-2 (round 11): a dataGroup marking on a skeleton descendant defeats rich text (W2b)", async () => {
+  // A dataNode="dataGroup" marking on a skeleton DESCENDANT
+  // (<h:body> inside a genuine XHTML skeleton) was not checked
+  // before flattening: the round-10 code reported form.note =
+  // "SECRET". Now the marking defeats the classification; the
+  // unmarked sibling stays addressable and the marked body's text
+  // is not a leaf.
+  const datasets =
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml">` +
+    `<h:html><h:head></h:head><h:body xfa:dataNode="dataGroup">SECRET</h:body></h:html></h:xhtml></note>`;
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const headBytes = await createXfaPdf(
+    wrap(
+      '<field name="head"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.note.xhtml.html.head"/></field>',
+      datasets,
+    ),
+  );
+  const headResult = await inspectPdf(headBytes);
+  assert.deepEqual(headResult.fields, [
+    { name: "form.note.xhtml.html.head", value: "", type: "text" },
+  ]);
+  const bodyBytes = await createXfaPdf(
+    wrap(
+      '<field name="body"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.note.xhtml.html.body"/></field>',
+      datasets,
+    ),
+  );
+  await assert.rejects(inspectPdf(bodyBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-2 (round 11): genuine two-level and first-level-mixed skeletons (W2c, W2d controls)", async () => {
+  // W2c control: a genuine two-level XHTML skeleton stays rich text
+  // "A" — the whole-subtree check must not reject honest XHTML.
+  const genuineBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml">` +
+        `<h:html><h:head></h:head><h:body>A</h:body></h:html></h:xhtml></note>`,
+    ),
+  );
+  const genuine = await inspectPdf(genuineBytes);
+  assert.deepEqual(genuine.fields, [{ name: "form.note", value: "A", type: "unsupported" }]);
+  // W2d control: a mixed namespace at the FIRST level already failed
+  // closed under the round-10 rule — it still does, proving the
+  // bypass fixed above was specifically the second level.
+  const firstLevelBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml" xmlns:c="urn:company:data">` +
+        `<c:html><c:body>FIRST</c:body></c:html></h:xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(firstLevelBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-2 (round 11): contradictory descendants deeper than the skeleton still defeat rich text", async () => {
+  // The check is the WHOLE subtree, not just two levels: a
+  // company-namespaced <c:span> inside a <p> inside a genuine
+  // <h:body>, and a dataGroup marking on a <p> inside a genuine
+  // <h:body>, both defeat classification. An <html> whose children
+  // are not <head>/<body> is not skeleton-shaped either.
+  const shapes = [
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml" xmlns:c="urn:company:data">` +
+      `<h:html><h:head></h:head><h:body><h:p><c:span>SECRET</c:span></h:p></h:body></h:html></h:xhtml></note>`,
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml">` +
+      `<h:html><h:head></h:head><h:body><h:p xfa:dataNode="dataGroup">SECRET</h:p></h:body></h:html></h:xhtml></note>`,
+    `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml">` +
+      `<h:html><h:div>NOT-A-SKELETON</h:div></h:html></h:xhtml></note>`,
+  ];
+  for (const datasets of shapes) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /has no data node/);
+      return true;
+    });
+  }
+});
+
+test("A-3 (round 11): the full malformed-entity matrix fails closed in both lexical contexts", async () => {
+  // Round 10 pinned Z3/Z3b/Z3c in element content only. The scanner
+  // must reject every malformed form in BOTH places a reference can
+  // occur — element content and a quoted attribute value — and the
+  // legal forms must still decode in both. Each malformed spelling
+  // is tried in a <note> value and in a field's name attribute.
+  const malformed = [
+    "&#X41;", // uppercase X
+    "&#;", // empty reference
+    "&#65", // missing semicolon
+    "&AMP;", // wrong-case named entity
+    "& amp;", // whitespace inside the reference
+    "&am&#112;;", // split entity
+    "&a&#109;p;", // split entity, other split point
+    "&foo;", // undeclared named entity
+    "&amp", // unterminated named entity
+  ];
+  for (const spelling of malformed) {
+    const contentBytes = await createXfaPdf(
+      wrap(
+        '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+        `<note>A${spelling}B</note>`,
+      ),
+    );
+    await assert.rejects(inspectPdf(contentBytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /malformed entity reference/, spelling);
+      return true;
+    });
+    const attrBytes = await createXfaPdf(
+      wrap(
+        `<field name="a${spelling}b"><ui><textEdit/></ui><bind match="none"/></field>`,
+        `<note>V</note>`,
+      ),
+    );
+    await assert.rejects(inspectPdf(attrBytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /malformed entity reference/, spelling);
+      return true;
+    });
+  }
+  // Legal controls in both contexts: a numeric reference and a
+  // predefined named entity decode, in content and in an attribute.
+  const controlBytes = await createXfaPdf(
+    wrap(
+      '<field name="a&#65;b"><ui><textEdit/></ui><bind match="none"/></field>' +
+        '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note>A&#65;B&amp;C</note>`,
+    ),
+  );
+  const control = await inspectPdf(controlBytes);
+  assert.deepEqual(control.fields, [
+    { name: "form.aAb", value: "", type: "unsupported" },
+    { name: "form.note", value: "AAB&C", type: "text" },
+  ]);
+});
