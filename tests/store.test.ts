@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createStore } from "../apps/server/src/db.ts";
+import { createPgDatabase, createStore } from "../apps/server/src/db.ts";
 
 // Raw query access for the index assertions below: the Store keeps its
 // database handle private, so reach in through a cast (test-only).
@@ -228,4 +228,152 @@ test("nested transaction calls join the ambient transaction", async (t) => {
   );
   assert.equal(await db.get("owner", "notes", "n3"), null);
   assert.equal(await db.get("owner", "notes", "n4"), null);
+});
+
+// --- B1 fix round 7 (panel re-review #6, chunk B, Nov 19, 2026) --------------
+// Mock-level pg transaction tests for the failed-ROLLBACK discard
+// (B-1, round 7). No live PostgreSQL exists in this environment, so
+// the timeout sequence itself is mock-level: the fake pool's client
+// fails its work query (client-side timeout shape) and fails its
+// ROLLBACK too. What is asserted for real is the discard mechanism —
+// release called exactly once WITH an error (pg-pool destroys a
+// client released with an error instead of returning it to the idle
+// pool, verified against installed pg-pool 3.14.0 _release) — and
+// that the original error is preserved, never masked by the rollback
+// failure.
+
+interface FakePgClient {
+  queries: string[];
+  releases: Array<Error | undefined>;
+  failWorkWith: Error | null;
+  failRollbackWith: Error | null;
+}
+
+function fakePgPool(client: FakePgClient) {
+  const clients: FakePgClient[] = [];
+  return {
+    clients,
+    pool: {
+      query: async () => ({ rows: [] }),
+      connect: async () => {
+        clients.push(client);
+        return {
+          query: async (sql: string) => {
+            client.queries.push(sql);
+            if (sql === "BEGIN") return { rows: [] };
+            if (sql === "COMMIT") return { rows: [] };
+            if (sql === "ROLLBACK") {
+              if (client.failRollbackWith) throw client.failRollbackWith;
+              return { rows: [] };
+            }
+            if (client.failWorkWith) throw client.failWorkWith;
+            return { rows: [] };
+          },
+          release: (error?: Error) => {
+            client.releases.push(error);
+          },
+        };
+      },
+      end: async () => {},
+    },
+  };
+}
+
+test("B-1 (round 7): a failed ROLLBACK discards the pg client instead of returning it to the pool", async () => {
+  const workError = new Error("query timed out");
+  const rollbackError = new Error("ROLLBACK timed out");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: workError,
+    failRollbackWith: rollbackError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  // Capture console.error: the cleanup failure must be reported, not
+  // swallowed (backgroundFailure logs phase + error name only).
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    await assert.rejects(
+      db.transaction(async (query) => {
+        await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+        return "never";
+      }),
+      (error: unknown) => {
+        // The ORIGINAL error is preserved — the rollback failure must
+        // never mask it.
+        assert.equal(error, workError);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(client.queries, [
+    "BEGIN",
+    "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)",
+    "ROLLBACK",
+  ]);
+  // Exactly one release, WITH an error: pg destroys a client released
+  // with an error instead of returning it to the idle pool, so the
+  // connection can never be reused mid-transaction by a later COMMIT.
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], rollbackError);
+  assert.match(captured.join("\n"), /postgres rollback failed/);
+});
+
+test("B-1 (round 7): a successful ROLLBACK releases the pg client normally", async () => {
+  // Control: the discard is specific to a FAILED rollback. Work fails,
+  // ROLLBACK succeeds, the client goes back to the pool with a plain
+  // release and the original error still propagates.
+  const workError = new Error("audit write failed");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: workError,
+    failRollbackWith: null,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  await assert.rejects(
+    db.transaction(async (query) => {
+      await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+      return "never";
+    }),
+    (error: unknown) => {
+      assert.equal(error, workError);
+      return true;
+    },
+  );
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], undefined);
+});
+
+test("B-1 (round 7): a successful pg transaction releases the client exactly once", async () => {
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: null,
+    failRollbackWith: null,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const result = await db.transaction(async (query) => {
+    await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+    return "committed";
+  });
+  assert.equal(result, "committed");
+  assert.deepEqual(client.queries, [
+    "BEGIN",
+    "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)",
+    "COMMIT",
+  ]);
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], undefined);
 });

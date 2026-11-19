@@ -2220,3 +2220,420 @@ test("A-4 (round 6): overlapping scopes merge for unnamed fields too", async () 
     { name: "form.person.code", value: "0", type: "checkbox", onValues: ["1", "2"] },
   ]);
 });
+
+// --- B1 fix round 7 (panel re-review #6, chunked Astra, Nov 19, 2026) --------
+// Each test below is a regression test for an adopted P1 finding; the
+// probe shape it mirrors (panel/probe-rereview6.mts) is noted.
+
+test("A-1 (round 7): overlapping scopes do not leak on-values between resolved fields (probe W1 shape)", async () => {
+  // Two persons; the first unit scopes $data.form.person (both), the
+  // second scopes $data.form.person[0] (person 0 only). The old code
+  // assigned the template unit's onValues array directly to every
+  // resolved field, so merging "2" into person 0 also gave it to
+  // person 1 (sameArrayRef=true). Each resolved field now owns its
+  // merge state: person 0 merges ["1", "2"], person 1 stays ["1"].
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>1</text><text>0</text></items></field></subform>` +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>2</text><text>0</text></items></field></subform>` +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[0].code", value: "0", type: "checkbox", onValues: ["1", "2"] },
+    { name: "form.person[1].code", value: "0", type: "checkbox", onValues: ["1"] },
+  ]);
+  // The two fields must not share one array object: mutating one
+  // resolved field's onValues must not change the other.
+  result.fields[0].onValues?.push("MUTATED");
+  assert.deepEqual(result.fields[1].onValues, ["1"]);
+});
+
+test("A-1 (round 7): the W1b output-byte bound holds on the final serialized fields (probe W1b shape)", async () => {
+  // 100 persons + a 12,000-char on-value on the second unit
+  // (person 0 only). The old code returned 1,208,191 serialized bytes
+  // with no 422: the shared array gave all 100 fields the 12 KiB
+  // value while only person 0 was ever charged for it. With owned
+  // merge state the true total is small — only person 0 carries the
+  // big value — so the inspect SUCCEEDS with a genuinely small
+  // result; the bound is what the final JSON.stringify(result.fields)
+  // size is asserted against. (The "must 422" reading of the probe
+  // note does not follow from the required fix: owning the arrays
+  // makes the output genuinely under the bound instead of inflating
+  // it. The companion test below covers the genuinely-over-budget
+  // case, which does 422.)
+  const big = "X".repeat(12000);
+  const persons = "<person><code>0</code></person>".repeat(100);
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>1</text><text>0</text></items></field></subform>` +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>${big}</text><text>0</text></items></field></subform>` +
+      "</subform></template>",
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>${persons}</form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 100);
+  const totalBytes = JSON.stringify(result.fields).length;
+  assert.ok(totalBytes <= 1024 * 1024, `final serialized fields are ${totalBytes} bytes`);
+  assert.ok(totalBytes > 12000, "the big on-value is present in the output");
+  assert.deepEqual(result.fields[0].onValues, ["1", big]);
+  for (let i = 1; i < 100; i++) assert.deepEqual(result.fields[i].onValues, ["1"], `person ${i}`);
+});
+
+test("A-1 (round 7): a genuinely over-budget output still fails closed", async () => {
+  // The big on-value here sits on the ALL-persons unit, so all 100
+  // fields genuinely carry 12 KiB: ~1.2 MB of serialized fields, past
+  // the 1 MiB bound. The running accounting and the final exact check
+  // must both fail closed on it. (Guard test: the old code 422s this
+  // shape too via the running bound — the discriminator for the fix
+  // is the W1b test above, where the old code returned >1 MiB.)
+  const big = "X".repeat(12000);
+  const persons = "<person><code>0</code></person>".repeat(100);
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>${big}</text><text>0</text></items></field></subform>` +
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/><items><text>2</text><text>0</text></items></field></subform>` +
+      "</subform></template>",
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>${persons}</form></xfa:data></xfa:datasets>`,
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of resolved fields/);
+    return true;
+  });
+});
+
+test("A-2 (round 7): same-identity collapse with conflicting options fails closed (probe W2 shape)", async () => {
+  // Two fields named color, same SOM path, default binding, choiceList
+  // with different items; dataset value Blue (only in the second
+  // list). The old subgroup collapse took the first options with no
+  // conflict check and reported value "Blue" with options
+  // ["Red", "Green"] — the second list silently discarded.
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Red</text><text>Green</text></items></field>` +
+        `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Red</text><text>Blue</text></items></field>`,
+      "<color>Blue</color>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /conflicting options/);
+    return true;
+  });
+});
+
+test("A-2 (round 7): same-identity collapse with conflicting option ORDER fails closed (probe W2b shape)", async () => {
+  // Same shape, but the two lists hold the same options in a
+  // different order (Red/Green vs Green/Red): order is part of the
+  // value domain, so silently taking the first list is still a
+  // conflict, not a merge.
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Red</text><text>Green</text></items></field>` +
+        `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Green</text><text>Red</text></items></field>`,
+      "<color>Red</color>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /conflicting options/);
+    return true;
+  });
+});
+
+test("A-2 (round 7): identical options collapse, and labels keep first-occurrence-wins (controls)", async () => {
+  // Guards against over-rejection from the new subgroup check: two
+  // occurrences that AGREE on options collapse to one field, and two
+  // occurrences with DIFFERENT captions keep the first caption —
+  // the W-9 policy (its seven c1_1 boxes carry per-occurrence
+  // captions and the collapsed field reports the first).
+  const options = await createXfaPdf(
+    wrap(
+      `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Red</text><text>Green</text></items></field>` +
+        `<field name="color"><ui><choiceList/></ui><bind match="default"/><items><text>Red</text><text>Green</text></items></field>`,
+      "<color>Green</color>",
+    ),
+  );
+  assert.deepEqual((await inspectPdf(options)).fields, [
+    { name: "form.color", value: "Green", type: "unsupported", options: ["Red", "Green"] },
+  ]);
+  const labels = await createXfaPdf(
+    wrap(
+      `<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>First caption</text></value></caption></field>` +
+        `<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><text>Second caption</text></value></caption></field>`,
+      "<code>V</code>",
+    ),
+  );
+  assert.deepEqual((await inspectPdf(labels)).fields, [
+    { name: "form.code", value: "V", type: "text", label: "First caption" },
+  ]);
+});
+
+test("A-3 (round 7): a caption descendant's xml:space=preserve survives normalization (probe W3a shape)", async () => {
+  // The <value> carries preserve but the <caption> does not: the old
+  // code flattened to "A\nB" and then normalized the whole label to
+  // "A B" because the caption-level boolean was false.
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="note"><ui><textEdit/></ui><bind match="none"/>` +
+        `<caption><value xml:space="preserve"><text>A\nB</text></value></caption></field>`,
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "A\nB" },
+  ]);
+});
+
+test("A-3 (round 7): an unnamed option field's own xml:space=preserve governs its items (probe W3b shape)", async () => {
+  // The unnamed radio-option field carries preserve, but the old code
+  // passed the GROUP's state to itemTexts(), never the field's own
+  // effective state, so the newline was dropped ("AB").
+  const bytes = await createXfaPdf(
+    wrap(
+      `<exclGroup name="pay"><bind match="none"/>` +
+        `<field xml:space="preserve"><ui><radioButton/></ui><items><text><b>A</b>\n<b>B</b></text></items></field></exclGroup>`,
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.pay", value: "", type: "unsupported", options: ["A\nB"] },
+  ]);
+  // Control: the same option field with xml:space="default" under a
+  // preserving group resets to default ("AB"), proving the field's
+  // own state — not just the group's — is what itemTexts() sees.
+  const control = await createXfaPdf(
+    wrap(
+      `<exclGroup name="pay" xml:space="preserve"><bind match="none"/>` +
+        `<field xml:space="default"><ui><radioButton/></ui><items><text><b>A</b>\n<b>B</b></text></items></field></exclGroup>`,
+      "<ok>V</ok>",
+    ),
+  );
+  assert.deepEqual((await inspectPdf(control)).fields, [
+    { name: "form.pay", value: "", type: "unsupported", options: ["AB"] },
+  ]);
+});
+
+test("A-3 (round 7): a caption mixes preserved and default subtrees (mixed normalization)", async () => {
+  // One caption, two whitespace regimes: the plain <text> normalizes
+  // ("X" plus its same-line space) while the preserved <b> keeps its
+  // newline verbatim. A single boolean at the caption root cannot
+  // express this; per-segment normalization can.
+  const bytes = await createXfaPdf(
+    wrap(
+      `<field name="note"><ui><textEdit/></ui><bind match="none"/>` +
+        `<caption><value><text>X</text> <b xml:space="preserve">A\nB</b></value></caption></field>`,
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "X A\nB" },
+  ]);
+});
+
+test("A-3 (round 7): xml:space=preserve directly on <xfa:datasets> reaches the walk (minor item b)", async () => {
+  // The round-6 "datasets roots" test put preserve on <xfa:data>
+  // only; preserve directly on <xfa:datasets> is threaded in code
+  // (inspectXfa passes the datasets root's effective state into the
+  // walk) but had no assertion. Same rich-text shape as the round-6
+  // test, preserve one level higher.
+  const preserved = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xml:space="preserve"><xfa:data>' +
+      `<form><note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  assert.deepEqual((await inspectPdf(preserved)).fields, [
+    { name: "form.note", value: "A\nB", type: "unsupported" },
+  ]);
+  // Control: a default on <xfa:data> below the preserving datasets
+  // root resets the state back, so the same markup reports "AB".
+  const reset = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xml:space="preserve"><xfa:data xml:space="default">' +
+      `<form><note><xhtml><body><p><b>A</b>\n<b>B</b></p></body></xhtml></note></form>` +
+      "</xfa:data></xfa:datasets>",
+  });
+  assert.deepEqual((await inspectPdf(reset)).fields, [
+    { name: "form.note", value: "AB", type: "unsupported" },
+  ]);
+});
+
+test("A-4 (round 7): duplicate resolution of a ~900 KiB field trips the cumulative work bound (probe W4 shape)", async () => {
+  // 13 singleton ancestors + one ~900 KiB code leaf, 1,024 sibling
+  // subforms each with a distinct [0]-variant dataRef, all resolving
+  // to the same node. The old code re-serialized the ~900 KiB field
+  // on every duplicate (~900 MiB cumulative, 3,297 ms) with no bound
+  // tripping. The cumulative duplicate-work budget (64 MiB, charged
+  // the retained field size per duplicate) now fails closed
+  // deterministically — the trip is by byte counting, not by timing.
+  // The 5 s bound is a gross-slowness guard only.
+  const ancestors = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"];
+  const big = "Y".repeat(900 * 1024);
+  const n = 1024;
+  let subforms = "";
+  for (let i = 0; i < n; i++) {
+    const ref = ancestors.map((name, pos) => ((i >> pos) & 1 ? `${name}[0]` : name)).join(".");
+    subforms +=
+      `<subform name="s"><bind match="dataRef" ref="$data.form.${ref}"/>` +
+      `<field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>`;
+  }
+  const datasetPath =
+    ancestors.map((name) => `<${name}>`).join("") +
+    `<code>${big}</code>` +
+    ancestors
+      .map((name) => `</${name}>`)
+      .reverse()
+      .join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      subforms +
+      "</subform></template>",
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>${datasetPath}</form></xfa:data></xfa:datasets>`,
+  });
+  const started = Date.now();
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /cumulative duplicate-merge work/);
+    return true;
+  });
+  assert.ok(Date.now() - started < 5000, `W4 inspect took ${Date.now() - started}ms`);
+});
+
+test("A-4 (round 7): a small duplicate count over the same ~900 KiB field still resolves", async () => {
+  // Guard against an over-aggressive work bound: 32 duplicates charge
+  // ~29 MiB against the 64 MiB budget, so the inspect succeeds with
+  // the one field and its full value — the bound trips only on
+  // amplification-scale duplication, not on ordinary repeats.
+  const ancestors = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m"];
+  const big = "Y".repeat(900 * 1024);
+  const n = 32;
+  let subforms = "";
+  for (let i = 0; i < n; i++) {
+    const ref = ancestors.map((name, pos) => ((i >> pos) & 1 ? `${name}[0]` : name)).join(".");
+    subforms +=
+      `<subform name="s"><bind match="dataRef" ref="$data.form.${ref}"/>` +
+      `<field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>`;
+  }
+  const datasetPath =
+    ancestors.map((name) => `<${name}>`).join("") +
+    `<code>${big}</code>` +
+    ancestors
+      .map((name) => `</${name}>`)
+      .reverse()
+      .join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      subforms +
+      "</subform></template>",
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>${datasetPath}</form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 1);
+  assert.equal(result.fields[0].value.length, 900 * 1024);
+  assert.equal(result.fields[0].value, big);
+});
+
+test("A-4 (round 7): duplicate merges resolve to MULTIPLE leaves with independent on-values (multi-leaf)", async () => {
+  // Test-adequacy requirement (round 6 adjudication): the round-6
+  // merge tests all resolved to a SINGLE dataset leaf, which hid the
+  // shared-array defect. Here overlapping units resolve to TWO
+  // leaves, and each leaf's field merges its own on-values: person 0
+  // gets ["1", "2"], person 1 gets ["1", "3"] — never each other's.
+  const sub = (ref: string, on: string) =>
+    `<subform name="s"><bind match="dataRef" ref="${ref}"/>` +
+    `<field name="code"><ui><checkButton/></ui><bind match="default"/>` +
+    `<items><text>${on}</text><text>0</text></items></field></subform>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      sub("$data.form.person", "1") +
+      sub("$data.form.person[0]", "2") +
+      sub("$data.form.person[1]", "3") +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[0].code", value: "0", type: "checkbox", onValues: ["1", "2"] },
+    { name: "form.person[1].code", value: "0", type: "checkbox", onValues: ["1", "3"] },
+  ]);
+});
+
+test("A-4 (round 7): duplicate merges accumulate on-values incrementally up to the bound, then fail closed", async () => {
+  // Each duplicate adds one distinct ~100 KiB on-value to the same
+  // field. Nine additions (~920 KiB of merged on-values) succeed with
+  // the exact union — proving the incremental byte accounting does
+  // not over-charge and trip early — while twelve additions push the
+  // merged on-values past 1 MiB and fail closed on the T-4 bound
+  // (deterministic byte counting; the duplicate-work budget, which
+  // would trip only around 35 such duplicates, is not what trips).
+  const bigValue = (i: number) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1);
+  const subforms = (count: number): string => {
+    let out =
+      `<subform name="s"><bind match="dataRef" ref="$data.form.person"/>` +
+      `<field name="code"><ui><checkButton/></ui><bind match="default"/>` +
+      `<items><text>1</text><text>0</text></items></field></subform>`;
+    for (let i = 0; i < count; i++) {
+      out +=
+        `<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/>` +
+        `<field name="code"><ui><checkButton/></ui><bind match="default"/>` +
+        `<items><text>${bigValue(i)}</text><text>0</text></items></field></subform>`;
+    }
+    return out;
+  };
+  const build = (count: number) =>
+    createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        subforms(count) +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><person><code>0</code></person></form></xfa:data></xfa:datasets>',
+    });
+  const ok = await inspectPdf(await build(9));
+  assert.deepEqual(ok.fields, [
+    {
+      name: "form.person.code",
+      value: "0",
+      type: "checkbox",
+      onValues: ["1", ...Array.from({ length: 9 }, (_, i) => bigValue(i))],
+    },
+  ]);
+  await assert.rejects(inspectPdf(await build(12)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of checkbox on-values/);
+    return true;
+  });
+});
