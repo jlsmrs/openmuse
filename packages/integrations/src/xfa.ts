@@ -406,8 +406,14 @@ function collectTextSegments(
  * "A B"): a single boolean at the caption root cannot normalize mixed
  * preserved/default subtrees after flattening erases their
  * boundaries. Preserved segments are replaced by NUL-delimited
- * placeholders (NUL cannot occur in XML 1.0 text, so no real content
- * can collide with one) before normalizing, then restored verbatim.
+ * placeholders before normalizing, then restored verbatim. NUL
+ * cannot collide with real content: parseXfaXml rejects every
+ * literal NUL — and every other illegal XML 1.0 character, and
+ * numeric references naming one — before parsing, so no NUL can
+ * reach this function from a packet (A-2, round 8). The round-7
+ * comment asserted this without enforcement, and literal NUL bytes
+ * demonstrably passed through the parser into values and labels;
+ * the invariant is now enforced at parse time, not assumed.
  * With no preserved segment the result is exactly
  * normalizeSpace(nodeText(node)) as before.
  */
@@ -546,6 +552,82 @@ export function readXfaPackets(doc: PDFDocument): Map<string, Uint8Array> {
 }
 
 /**
+ * XML 1.0 character validity (A-2, round 8): the Char production
+ * admits #x9 | #xA | #xD | [#x20-#xD7FF] | [#xE000-#xFFFD] |
+ * [#x10000-#x10FFFF] — everything else (C0 controls except tab/LF/CR,
+ * surrogates, U+FFFE/U+FFFF, above U+10FFFF) is illegal. The literal
+ * scan walks by code point (codePointAt): a valid surrogate pair
+ * yields its astral value (legal); a lone surrogate yields its own
+ * value and is rejected. Surrogate code points can also arrive via a
+ * numeric character reference, so the reference check covers the full
+ * range.
+ */
+function isIllegalXmlChar(codePoint: number): boolean {
+  return (
+    (codePoint >= 0x00 && codePoint <= 0x08) ||
+    codePoint === 0x0b ||
+    codePoint === 0x0c ||
+    (codePoint >= 0x0e && codePoint <= 0x1f) ||
+    (codePoint >= 0xd800 && codePoint <= 0xdfff) ||
+    codePoint === 0xfffe ||
+    codePoint === 0xffff ||
+    codePoint > 0x10ffff
+  );
+}
+
+/**
+ * Reject illegal XML 1.0 characters in a packet's raw text, before
+ * parsing (A-2, round 8). Literal NUL bytes — and every other illegal
+ * character — survive fast-xml-parser into values and labels, where
+ * they collide with the NUL-delimited placeholders
+ * normalizePreserving() uses: a literal "\u00000\u0000" run in a
+ * caption was restored as placeholder index 0, silently corrupting
+ * the label. The round-7 comment claimed NUL "cannot occur in XML
+ * 1.0 text"; that is true of valid XML 1.0, but this parser does not
+ * enforce it, so the check is enforced here, explicitly, on every
+ * packet: any literal illegal character, and any numeric character
+ * reference (&#0; / &#x0; / ...) naming one, fails closed with a 422
+ * naming the code point — never the surrounding content. The
+ * reference scan skips CDATA sections and comments, where a
+ * reference is literal text, not a character reference (a literal
+ * NUL is illegal there too, so the literal scan does not skip them);
+ * the strip runs only when the text contains a reference at all.
+ * No regex literal carries a control character (the linter forbids
+ * it): the literal scan is a codePointAt loop and the reference
+ * pattern contains no control characters.
+ */
+function assertValidXmlChars(packetName: string, text: string): void {
+  // Walk by code point, not by code unit: a legal astral character
+  // (e.g. 😀, U+1F600) is a surrogate pair, and its halves must not
+  // be mistaken for lone surrogates. codePointAt returns the full
+  // astral value for a valid pair and the lone surrogate value for
+  // an unpaired one — the latter is illegal and is rejected.
+  for (let i = 0; i < text.length; ) {
+    const codePoint = text.codePointAt(i) ?? 0;
+    if (isIllegalXmlChar(codePoint))
+      throw new XfaError(
+        `XFA packet '${shortName(packetName)}' contains character U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
+      );
+    i += codePoint > 0xffff ? 2 : 1;
+  }
+  if (!text.includes("&#")) return;
+  const withoutLiteral = text
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "")
+    .replace(/<!--[\s\S]*?-->/g, "");
+  for (const ref of withoutLiteral.matchAll(/&#[0-9]+;|&#x[0-9a-fA-F]+;/g)) {
+    const digits = ref[0].slice(2, -1);
+    const codePoint =
+      digits.startsWith("x") || digits.startsWith("X")
+        ? Number.parseInt(digits.slice(1), 16)
+        : Number.parseInt(digits, 10);
+    if (Number.isInteger(codePoint) && isIllegalXmlChar(codePoint))
+      throw new XfaError(
+        `XFA packet '${shortName(packetName)}' contains character reference '${shortName(ref[0])}' naming U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
+      );
+  }
+}
+
+/**
  * Parse one XFA packet to its ordered root elements. Well-formedness is
  * validated explicitly before parsing (the parser alone accepts a
  * template missing only its final closing tag), and namespace prefixes
@@ -572,6 +654,10 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
   // fast-xml-parser's parse step alone does not reject every malformed
   // document (a template missing only its final closing tag parses), so
   // validate well-formedness explicitly first, on every packet.
+  // Character validity is checked before that (A-2, round 8): the
+  // validator and parser both let literal NUL bytes through, so an
+  // explicit check on the raw text is the only gate.
+  assertValidXmlChars(packetName, text);
   const validation = XMLValidator.validate(text);
   if (validation !== true)
     throw new XfaError(
@@ -1130,6 +1216,48 @@ function strippedSegments(segments: string[]): string[] {
 }
 
 /**
+ * The element names an XHTML document skeleton may carry directly
+ * under <xhtml> in XFA rich text (A-1, round 8): the <xhtml> wrapper
+ * holds an XHTML document fragment — <html>/<head>/<body> — not
+ * arbitrary data. An ordinary dataset element that happens to be
+ * named `xhtml` holds data children, not an XHTML skeleton, so the
+ * skeleton is what distinguishes rich text from a same-named data
+ * element. The parser does not resolve namespace URIs, so
+ * classification rests on this supported structural shape, not on
+ * the name alone and not on a namespace check the tree cannot make.
+ */
+const XHTML_SKELETON = new Set(["html", "head", "body"]);
+
+/** True when `element` is an <xhtml> holding an XHTML document skeleton. */
+function isXhtmlDocument(element: XElement): boolean {
+  const children = elementChildren(element);
+  return children.length > 0 && children.every((child) => XHTML_SKELETON.has(child.local));
+}
+
+/**
+ * Is `child` a supported rich-text container (A-1, round 8)? Either a
+ * bare <xhtml> holding an XHTML document skeleton, or an <exData>
+ * whose whole content is exactly one such <xhtml> (whitespace-only
+ * direct text besides). Anything else named `exData` or `xhtml` — a
+ * text-only <exData>, an <exData> wrapping non-XHTML content, an
+ * <xhtml> holding data children — is an ordinary dataset element, not
+ * a rich-text container, and must not change its parent's
+ * classification. The contentType attribute is not consulted: the
+ * structural shape (a single <xhtml> child holding an XHTML
+ * skeleton) is what the classifier establishes, and consulting it
+ * would classify the same <exData> differently at the parent level
+ * than at its own level, where the <xhtml> rule already applies.
+ */
+function isRichTextContainer(child: XElement): boolean {
+  if (child.local === "xhtml") return isXhtmlDocument(child);
+  if (child.local !== "exData") return false;
+  const children = elementChildren(child);
+  if (children.length !== 1 || children[0].local !== "xhtml") return false;
+  if (!isXhtmlDocument(children[0])) return false;
+  return child.content.every((item) => typeof item !== "string" || item.trim() === "");
+}
+
+/**
  * Walk <xfa:data> collecting leaf data nodes, in document order.
  * Repeated elements get an index in the path (form.repeat[0].item) so
  * repeating subforms stay distinct; a lone element keeps its plain
@@ -1159,13 +1287,35 @@ function collectDataLeaves(
     out.push({ segments: path, value, markup: false });
     return;
   }
-  // Rich-text values are leaves: their flattened text content, flagged.
-  // Only actual rich-text containers count (an <xhtml> subtree or an
-  // <exData> element) — a bare colon in a key used to trigger this too.
-  // The flattened value keeps the text in document order (no whitespace
-  // normalisation); block boundaries carry no separator.
-  if (children.some((child) => child.local === "xhtml" || child.local === "exData")) {
-    out.push({ segments: path, value: nodeText(node, 0, keep), markup: true });
+  // Rich-text values are leaves (A-1, round 8): a node is a rich-text
+  // leaf ONLY when its whole element content is one supported
+  // rich-text container — a bare <xhtml> holding an XHTML document
+  // skeleton, or an <exData> wrapping exactly one such <xhtml> — with
+  // no other element children and no non-whitespace direct text, and
+  // never when the dataset explicitly marks the node a data group
+  // (xfa:dataNode="dataGroup"). Anything else named `exData` or
+  // `xhtml` is an ordinary dataset element: the walk recurses into it
+  // like any other element, so its children stay addressable
+  // (form.note.exData, form.note.other) and a field bound to the
+  // group itself has no data node and fails closed — instead of the
+  // old behaviour, which flattened the whole parent (siblings and
+  // all) into one fabricated scalar. The flattened value comes from
+  // the container child, not the parent, so a same-line space beside
+  // the container cannot leak into the value. The flattened value
+  // keeps the text in document order (no whitespace normalisation);
+  // block boundaries carry no separator. Resource bounds do not cover
+  // semantic classification (R-7, round 8): this rule IS the
+  // classification, and the bounds only cap the work and output
+  // around whatever it produces — a misclassified leaf fits every
+  // byte bound, so no bound may be claimed to establish it.
+  const dataNode = attr(node, "xfa:dataNode");
+  if (
+    dataNode !== "dataGroup" &&
+    children.length === 1 &&
+    isRichTextContainer(children[0]) &&
+    node.content.every((item) => typeof item !== "string" || item.trim() === "")
+  ) {
+    out.push({ segments: path, value: nodeText(children[0], 0, keep), markup: true });
     return;
   }
   const counts = new Map<string, number>();
@@ -1365,9 +1515,11 @@ function matchesSelectors(
  * (e) metadata compatibility is checked in BOTH merge paths:
  * subgroup collapse applies the same options check as resolved-node
  * merging (contents and order), while labels keep
- * first-occurrence-wins within a subgroup (the W-9's repeat boxes
- * carry per-occurrence captions) and fail closed on conflict only
- * across subgroups;
+ * first-nonempty-caption-wins within a subgroup — a lossy reporting
+ * convention (round 8 wording), not a general XFA semantic
+ * conclusion: differing captions are not proof of per-choice
+ * captions, and a later caption fills an absent first caption —
+ * and fail closed on conflict only across subgroups;
  * (f) xml:space is preserved through normalization: caption labels
  * normalize only their default segments, keeping a preserved
  * descendant's whitespace verbatim, and an unnamed option field's
@@ -1379,7 +1531,15 @@ function matchesSelectors(
  * check runs after decoding (the decode budget is external); and the
  * duplicate-work charge is a conservative over-approximation of the
  * comparison work (1× retained size per merge), with the 64 MiB cap
- * a calibration, not a proven-tight limit.
+ * a calibration, not a proven-tight limit. Semantic classification
+ * is outside what any resource bound can establish (R-7, round 8):
+ * the bounds cap work and output size around whatever the dataset
+ * classification produces, but they cannot prove the classification
+ * itself is right — a misclassified leaf (a data group flattened
+ * into a scalar, A-1 round 8) fits every byte bound. Do not claim
+ * the bounds cover classification; the classifier in
+ * collectDataLeaves is the classification, and it is justified on
+ * its own structural terms.
  */
 interface PathBucket {
   leaves: DataLeaf[];
@@ -1593,8 +1753,12 @@ interface ResolvedFieldEntry {
   onValuesSeen: Set<string>;
   /**
    * Byte length of the field's merged on-values, charged in the T-4
-   * convention (JSON-literal bytes + 2 per value, matching the
-   * subgroup-collapse charge).
+   * convention: utf8Length(value) + 2 per value — NOT escaped
+   * JSON-literal bytes (round 8 correction of this comment: the
+   * charge never included escapes). Escaped content cannot bypass
+   * the output limit anyway: mergeDuplicate() charges the exact
+   * JSON-literal delta to the output bound, and the final
+   * JSON.stringify check verifies the exact serialized size.
    */
   onValuesBytes: number;
 }
@@ -1647,6 +1811,9 @@ function mergeDuplicate(previous: ResolvedFieldEntry, incoming: XfaField): numbe
     existing.options = incoming.options;
     delta += 1 + utf8Length('"options":') + utf8Length(JSON.stringify(incoming.options));
   }
+  // Labels: first-nonempty-caption-wins reporting convention (round 8
+  // wording) — a later label fills an absent first label; two stated
+  // labels must agree, or the merge is a conflict, not a merge.
   if (existing.label !== undefined && incoming.label !== undefined) {
     if (existing.label !== incoming.label) throw conflict("labels");
   } else if (incoming.label !== undefined) {
@@ -1816,19 +1983,21 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
             }
           }
         }
-        // Labels keep first-occurrence-wins (A-2, round 7): repeat
-        // occurrences of one field carry per-occurrence captions —
-        // the W-9's seven c1_1 boxes are captioned
-        // "Individual/sole proprietor", "C corporation", "S
+        // Labels keep first-nonempty-caption-wins (A-2, round 7;
+        // wording round 8): repeat occurrences of one field carry
+        // per-occurrence captions — the W-9's seven c1_1 boxes are
+        // captioned "Individual/sole proprietor", "C corporation", "S
         // corporation", ... — and the collapsed field reports the
-        // first occurrence's caption by established convention, so
-        // differing labels within one subgroup are NOT a conflict
-        // (cross-subgroup label conflicts still fail closed in
-        // mergeDuplicate()). Options are different: they state the
-        // one field's value domain, so two occurrences of the same
-        // identity that disagree on options — contents or order —
-        // fail closed here, exactly as mergeDuplicate() does for
-        // resolved-node merges across subgroups.
+        // first nonempty occurrence's caption. That is a lossy
+        // reporting convention for this API, NOT a general XFA
+        // semantic conclusion: differing captions are not proof of
+        // per-choice captions, and a later caption fills an absent
+        // first caption. (Cross-subgroup label conflicts still fail
+        // closed in mergeDuplicate().) Options are different: they
+        // state the one field's value domain, so two occurrences of
+        // the same identity that disagree on options — contents or
+        // order — fail closed here, exactly as mergeDuplicate() does
+        // for resolved-node merges across subgroups.
         if (!merged.label && field.label) merged.label = field.label;
         if (merged.options !== undefined && field.options !== undefined) {
           if (JSON.stringify(merged.options) !== JSON.stringify(field.options))

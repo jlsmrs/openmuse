@@ -61,7 +61,7 @@ interface Database {
 }
 
 /**
- * Indeterminate COMMIT marker (B-1, round 6): a transaction whose
+ * Indeterminate COMMIT marker (B-1, round 6; non-mutating, round 8): a transaction whose
  * COMMIT step failed may or may not have committed server-side — a
  * lost acknowledgement is indistinguishable from a rollback from the
  * client's seat. The pg transaction marks such failures with this
@@ -71,20 +71,23 @@ interface Database {
  * own: callers must ALSO treat any failure after their work callback
  * completed as indeterminate, because a wrapper (or a later step) can
  * throw after a successful commit — which no backend marker can see.
+ *
+ * Round 8: the mark lives in a WeakSet keyed by the error object,
+ * NOT as a property on the error. Assigning a symbol property throws
+ * on a frozen/non-extensible error, which would replace the COMMIT
+ * error with the assignment failure; a WeakSet add never mutates the
+ * object, so marking works on frozen errors too, and the mark dies
+ * with the error (no retention beyond the error's own lifetime).
  */
-const INDETERMINATE_COMMIT = Symbol("indeterminate-commit");
+const indeterminateCommits = new WeakSet<object>();
 export function markIndeterminateCommit(error: unknown): unknown {
   if (typeof error === "object" && error !== null) {
-    (error as Record<symbol, boolean>)[INDETERMINATE_COMMIT] = true;
+    indeterminateCommits.add(error);
   }
   return error;
 }
 export function isIndeterminateCommit(error: unknown): boolean {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    (error as Record<symbol, unknown>)[INDETERMINATE_COMMIT] === true
-  );
+  return typeof error === "object" && error !== null && indeterminateCommits.has(error);
 }
 
 export class Store {
@@ -337,6 +340,10 @@ export interface PgTransactionPool {
  * masks it. The client is released exactly once on every path: the
  * success path releases after COMMIT, the failure path releases
  * after the ROLLBACK attempt (with or without the discard error).
+ * (B-1, round 8) release() and the cleanup logging are themselves
+ * guarded: a throwing release or a throwing logger is reported, never
+ * propagated, so cleanup can never mask the original error — or, on
+ * the success path, turn a committed transaction into a thrown error.
  */
 export function createPgDatabase(pool: PgTransactionPool): Database {
   return {
@@ -344,11 +351,31 @@ export function createPgDatabase(pool: PgTransactionPool): Database {
     transaction: async (fn) => {
       const client = await pool.connect();
       let released = false;
+      // (B-1, round 8) Cleanup must never mask the operation error:
+      // client.release() itself can throw, and so can the cleanup
+      // logging (backgroundFailure) — either would otherwise replace
+      // the original error with a cleanup failure, or, on the success
+      // path, turn a committed transaction into a thrown error. Every
+      // cleanup step is therefore guarded: a cleanup failure is
+      // reported via backgroundFailure and the transaction's own
+      // outcome stands.
+      const reportCleanupFailure = (phase: string, failure: unknown): void => {
+        try {
+          backgroundFailure(phase, failure);
+        } catch {
+          // Logging must never mask the operation error either; a
+          // logging failure is unreportable by definition.
+        }
+      };
       const release = (error?: Error): void => {
         if (released) return;
         released = true;
-        if (error !== undefined) client.release(error);
-        else client.release();
+        try {
+          if (error !== undefined) client.release(error);
+          else client.release();
+        } catch (releaseFailure) {
+          reportCleanupFailure("postgres release failed", releaseFailure);
+        }
       };
       try {
         await client.query("BEGIN");
@@ -373,7 +400,7 @@ export function createPgDatabase(pool: PgTransactionPool): Database {
           rollbackError = rollbackFailure;
         }
         if (rollbackError !== undefined) {
-          backgroundFailure("postgres rollback failed", rollbackError);
+          reportCleanupFailure("postgres rollback failed", rollbackError);
           release(
             rollbackError instanceof Error
               ? rollbackError
