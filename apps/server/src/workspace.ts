@@ -39,6 +39,15 @@ function sampleMailMatches(words: string[], haystack: string): boolean {
   return words.every((word) => word === "in:inbox" || hay.includes(word));
 }
 
+/**
+ * Google auth failures (expired session, disconnected or changed account) mean
+ * the connection is dead, not the workspace. Any other error still fails the
+ * load, so a real outage is never hidden as an empty mailbox.
+ */
+function isGoogleAuthError(error: unknown): boolean {
+  return error instanceof AppError && (error.status === 401 || error.status === 409);
+}
+
 export class WorkspaceService {
   private seeding = new Map<string, Promise<void>>();
   constructor(
@@ -363,16 +372,23 @@ export class WorkspaceService {
       const connection = await this.connection(owner);
       if (!connection) throw new AppError("Google is disconnected", 409);
       const google = this.google(owner, connection.id);
-      const [mailResult, eventResult] = await Promise.all([
-        wantMail ? google.listMail(query) : Promise.resolve([] as Mail[]),
-        wantEvents
-          ? google.listEvents().then((page) => page.events)
-          : Promise.resolve([] as CalendarEvent[]),
-      ]);
-      mail = mailResult;
-      events = eventResult;
-      if (wantMail) mail = await this.cacheMail(owner, mail, connection.id);
-      for (const event of events) await this.db.put(owner, "events", event);
+      try {
+        const [mailResult, eventResult] = await Promise.all([
+          wantMail ? google.listMail(query) : Promise.resolve([] as Mail[]),
+          wantEvents
+            ? google.listEvents().then((page) => page.events)
+            : Promise.resolve([] as CalendarEvent[]),
+        ]);
+        mail = mailResult;
+        events = eventResult;
+        if (wantMail) mail = await this.cacheMail(owner, mail, connection.id);
+        for (const event of events) await this.db.put(owner, "events", event);
+      } catch (error) {
+        // A dead Google session must not brick the workspace: report Google
+        // as disconnected so the owner can reconnect from Connections.
+        if (!isGoogleAuthError(error)) throw error;
+        return { mail: [], events: [], connected: false };
+      }
     } else if (this.config.mode === "sample" && connected) {
       if (wantMail) {
         mail = await this.db.list<Mail>(owner, "mail");
