@@ -1803,7 +1803,13 @@ function isXhtmlDocument(element: XElement): boolean {
       !grandChildren.every((child) => child.local === "head" || child.local === "body")
     )
       return false;
-    pending.push(...grandChildren);
+    // Append one at a time, never pending.push(...grandChildren):
+    // spreading a wide child array into a call hits the engine's
+    // maximum argument count (RangeError) on a legitimate shape —
+    // a shallow <body> with ~190k empty children is well-formed
+    // and under every packet cap, so it must succeed, not fail
+    // closed on an engine limit (A-1, round 12).
+    for (const child of grandChildren) pending.push(child);
   }
   return true;
 }
