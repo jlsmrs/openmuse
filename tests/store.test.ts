@@ -6,6 +6,7 @@ import {
   isIndeterminateCommit,
   markIndeterminateCommit,
 } from "../apps/server/src/db.ts";
+import { reportBackgroundFailure } from "../apps/server/src/log.ts";
 
 // Raw query access for the index assertions below: the Store keeps its
 // database handle private, so reach in through a cast (test-only).
@@ -258,6 +259,8 @@ interface FakePgClient {
   failCommitWith?: Error | null;
   /** Round 8: throw from release(). */
   failReleaseWith?: Error | null;
+  /** Round 9 (B-2): reject the ROLLBACK with `undefined` itself. */
+  failRollbackWithUndefined?: boolean;
 }
 
 function fakePgPool(client: FakePgClient) {
@@ -280,6 +283,7 @@ function fakePgPool(client: FakePgClient) {
               return { rows: [] };
             }
             if (sql === "ROLLBACK") {
+              if (client.failRollbackWithUndefined) throw undefined;
               if (client.failRollbackWith) throw client.failRollbackWith;
               return { rows: [] };
             }
@@ -616,4 +620,84 @@ test("B-1 (round 8): markIndeterminateCommit marks frozen and non-object errors 
   assert.equal(isIndeterminateCommit(plain), true);
   assert.equal(markIndeterminateCommit("a string error"), "a string error");
   assert.equal(isIndeterminateCommit("a string error"), false);
+});
+
+// --- B1 fix round 9 (panel re-review #8, Nov 19, 2026) ----------------------
+// B-1 shared non-throwing logging wrapper; B-2 undefined rollback rejection.
+
+test("B-1 (round 9): reportBackgroundFailure never throws, even when the logger does", async () => {
+  // The shared wrapper (log.ts) is what both db.ts and files.ts now
+  // call for cleanup logging. With a throwing console, the wrapper
+  // must return normally — the caller keeps its own error and control
+  // flow — and with a working console it still reports the phase.
+  const originalError = console.error;
+  console.error = () => {
+    throw new Error("logger down");
+  };
+  try {
+    reportBackgroundFailure("test phase", new Error("boom"));
+  } finally {
+    console.error = originalError;
+  }
+  const captured: string[] = [];
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    reportBackgroundFailure("test phase", new Error("boom"));
+  } finally {
+    console.error = originalError;
+  }
+  assert.match(captured.join("\n"), /test phase/);
+});
+
+test("B-2 (round 9): a ROLLBACK rejecting with undefined still discards the pg client", async () => {
+  // The old check read `rollbackError !== undefined`, so a query
+  // rejecting with `undefined` took the plain release() path and
+  // returned the client to the pool. The failure is now tracked with
+  // a separate boolean: the client must be released WITH an error
+  // (pg destroys it) and the original work error preserved.
+  const workError = new Error("query timed out");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: workError,
+    failRollbackWith: null,
+    failRollbackWithUndefined: true,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    await assert.rejects(
+      db.transaction(async (query) => {
+        await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+        return "never";
+      }),
+      (error: unknown) => {
+        assert.equal(error, workError);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(client.queries, [
+    "BEGIN",
+    "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)",
+    "ROLLBACK",
+  ]);
+  // Exactly one release, WITH an error — the client is discarded,
+  // not returned to the pool.
+  assert.equal(client.releases.length, 1);
+  assert.ok(client.releases[0] instanceof Error);
+  assert.match(captured.join("\n"), /postgres rollback failed/);
 });

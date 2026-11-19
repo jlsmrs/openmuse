@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createSamplePdf, fillPdf, inspectPdf } from "../packages/integrations/src/pdf.ts";
+import { countXmlScanSteps } from "../packages/integrations/src/xfa.ts";
 import { createXfaPdf, staticDatasetsXml, staticTemplateXml } from "./xfa-fixtures.ts";
 
 const fixture = (name: string): Uint8Array =>
@@ -2954,11 +2955,12 @@ test("A-2 (round 8): other illegal XML 1.0 characters and references fail closed
 
 test("A-2 (round 8): legal characters and references still pass (no over-rejection)", async () => {
   // Guard the other way: tab and newline are legal XML 1.0
-  // characters, &amp; decodes, and numeric references are legal and
-  // pass through (this parser leaves &#65; literal rather than
-  // decoding it — only named entities decode — so the value carries
-  // it verbatim). "&#0;" is literal text — not a character reference
-  // — inside CDATA and comments, so it must not be rejected there.
+  // characters, &amp; decodes, and numeric references DECODE to
+  // their characters (round 9, A-2: &#65; is "A", so the value is
+  // "AAB&C" — the round-8 version of this test pinned the wrong
+  // literal value "A&#65;B&C"). "&#0;" is literal text — not a
+  // character reference — inside CDATA and comments, so it must not
+  // be rejected there.
   const bytes = await createXfaPdf(
     wrap(
       '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>' +
@@ -2979,7 +2981,7 @@ test("A-2 (round 8): legal characters and references still pass (no over-rejecti
   assert.deepEqual(result.fields, [
     { name: "form.note", value: "A\nB", type: "text" },
     { name: "form.tab", value: "A\tB", type: "text" },
-    { name: "form.ref", value: "A&#65;B&C", type: "text" },
+    { name: "form.ref", value: "AAB&C", type: "text" },
     { name: "form.cdata", value: "A&#0;B", type: "text" },
   ]);
   const commentResult = await inspectPdf(commentBytes);
@@ -3239,4 +3241,514 @@ test("Test adequacy (round 8): options introduction near the exact output bounda
       return true;
     },
   );
+});
+
+// --- B1 fix round 9 (panel re-review #8, Nov 19, 2026) ---------------------
+// Regression tests for the adopted chunk-A findings (A-1..A-4), the
+// test-adequacy items, and the probe shapes in panel/probe-rereview8.mts.
+
+test("A-1 (round 9): a dataGroup-marked xhtml child never classifies as rich text (Y1)", async () => {
+  // Astra's counterexample verbatim: the <xhtml> child is explicitly
+  // xfa:dataNode="dataGroup" and company-namespaced. The round-8
+  // classifier read only the PARENT's marking and fabricated
+  // form.note = "FIRSTSECOND". Now the container child's own
+  // declarations defeat the classification: the parent has no data
+  // node, and the children stay addressable.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="urn:company:data" xfa:dataNode="dataGroup"><body>FIRST</body><head>SECOND</head></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      `<note><xhtml xmlns="urn:company:data" xfa:dataNode="dataGroup"><body>FIRST</body><head>SECOND</head></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 9): an empty dataGroup element is not a scalar leaf (Y2)", async () => {
+  // Group classification runs before the empty-leaf branch: an empty
+  // element the dataset marks a data group is a group with no
+  // members, not a scalar leaf with value "".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xfa:dataNode="dataGroup"/>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  // Control (Y2b): an ordinary empty element with no dataGroup
+  // marking is still a scalar leaf with value "".
+  const controlBytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', `<note/>`),
+  );
+  const control = await inspectPdf(controlBytes);
+  assert.deepEqual(control.fields, [{ name: "form.note", value: "", type: "text" }]);
+});
+
+test("A-1 (round 9): XHTML-namespaced legitimate rich text stays rich text", async () => {
+  // What legitimate rich text carries: either no namespace
+  // declaration (the round-8 X4 shape) or the XHTML namespace.
+  // Both stay a rich-text leaf with value "A".
+  for (const datasets of [
+    '<note><exData contentType="text/html"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><p><b>A</b></p></body></xhtml></exData></note>',
+    '<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><p><b>A</b></p></body></xhtml></note>',
+  ]) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    const result = await inspectPdf(bytes);
+    assert.deepEqual(result.fields, [{ name: "form.note", value: "A", type: "unsupported" }]);
+  }
+});
+
+test("A-1 (round 9): a company-namespaced container is ordinary data", async () => {
+  // Same skeleton shape as Y1 but WITHOUT the dataGroup marking: the
+  // non-XHTML namespace alone defeats rich-text classification, and
+  // the children stay addressable. Both positions are covered: the
+  // namespace on the <xhtml> itself, and the namespace on the
+  // <exData> wrapper — the wrapper's declaration governs its whole
+  // content, so recursing past it must not let its bare <xhtml>
+  // child classify the wrapper as a leaf anyway.
+  const datasetsList = [
+    `<note><xhtml xmlns="urn:company:data"><body>FIRST</body><head>SECOND</head></xhtml></note>`,
+    `<note><exData xmlns="urn:company:data"><xhtml><body>FIRST</body><head>SECOND</head></xhtml></exData></note>`,
+  ];
+  for (const datasets of datasetsList) {
+    const bytes = await createXfaPdf(
+      wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /has no data node/);
+      return true;
+    });
+  }
+  const datasets = datasetsList[0];
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+  // Wrapper-declared namespace: the children stay addressable
+  // through the wrapper too.
+  const wrapperChildBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="exData"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform></subform>',
+      datasetsList[1],
+    ),
+  );
+  const wrapperResult = await inspectPdf(wrapperChildBytes);
+  assert.deepEqual(wrapperResult.fields, [
+    { name: "form.note.exData.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.exData.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 9): contentType text/plain wrapping an xhtml skeleton is ordinary data", async () => {
+  // Rule (stated, probed either way — the classifier takes the
+  // plain-text declaration at its word): contentType is supporting
+  // evidence only, but a declared non-HTML content type contradicts
+  // an HTML skeleton, so it defeats rich-text classification. The
+  // children stay addressable; the parent has no data node.
+  const datasets =
+    '<note><exData contentType="text/plain"><xhtml><body>FIRST</body><head>SECOND</head></xhtml></exData></note>';
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const childBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="exData"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform></subform>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(childBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.exData.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.exData.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 9): dataGroup on the container itself defeats rich text (child vs parent)", async () => {
+  // dataGroup on the <exData> wrapper child (not the parent): the
+  // wrapper is a data group, not a rich-text container — so neither
+  // the parent nor the wrapper is a leaf. The wrapper's <xhtml>
+  // child is ordinary data too, and the text stays addressable at
+  // its own deep path.
+  const datasets =
+    '<note><exData xfa:dataNode="dataGroup" contentType="text/html"><xhtml><body><p><b>A</b></p></body></xhtml></exData></note>';
+  const bytes = await createXfaPdf(
+    wrap('<field name="note"><ui><textEdit/></ui><bind match="default"/></field>', datasets),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const wrapperBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      datasets,
+    ),
+  );
+  await assert.rejects(inspectPdf(wrapperBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+  const deepBytes = await createXfaPdf(
+    wrap(
+      '<field name="b"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.note.exData.xhtml.body.p.b"/></field>',
+      datasets,
+    ),
+  );
+  const result = await inspectPdf(deepBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.exData.xhtml.body.p.b", value: "A", type: "text" },
+  ]);
+  // dataGroup on the INNER <xhtml> inside an <exData>: the wrapper
+  // is not a container either, and the inner <xhtml> is not one —
+  // so body/head stay addressable as ordinary data.
+  const innerDatasets =
+    '<note><exData contentType="text/html"><xhtml xfa:dataNode="dataGroup"><body>FIRST</body><head>SECOND</head></xhtml></exData></note>';
+  const innerBytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="exData"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="body"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="head"><ui><textEdit/></ui><bind match="default"/></field></subform></subform></subform>',
+      innerDatasets,
+    ),
+  );
+  const innerResult = await inspectPdf(innerBytes);
+  assert.deepEqual(innerResult.fields, [
+    { name: "form.note.exData.xhtml.body", value: "FIRST", type: "text" },
+    { name: "form.note.exData.xhtml.head", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-2 (round 9): numeric character references decode — hex, leading zeros, escaped spellings, CDATA (Y3)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="hex"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="escaped"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="cdata"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="markup"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<note>A&#65;B&amp;C</note>" +
+        "<hex>A&#x42;B&#00065;C</hex>" +
+        "<escaped>A&#65;B&amp;#65;C</escaped>" +
+        "<cdata><![CDATA[&#65;]]></cdata>" +
+        "<markup>A&#60;B&#38;C</markup>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    // Y3: the XML value is "AAB&C", not the literal spelling.
+    { name: "form.note", value: "AAB&C", type: "text" },
+    // Hex and leading-zero decimal references decode too.
+    { name: "form.hex", value: "ABBAC", type: "text" },
+    // "&amp;#65;" is an escaped literal spelling, not a reference:
+    // it stays literal "&#65;" while the real reference decodes.
+    { name: "form.escaped", value: "AAB&#65;C", type: "text" },
+    // CDATA holds characters, not references: its text stays literal.
+    { name: "form.cdata", value: "&#65;", type: "text" },
+    // Decoded "<" and "&" become the characters, never markup: the
+    // value is "A<B&C", not a broken document.
+    { name: "form.markup", value: "A<B&C", type: "text" },
+  ]);
+});
+
+test("A-2 (round 9): numeric character references decode in attribute values", async () => {
+  // A dataRef whose segment spells "note" via &#111; ("o") resolves
+  // only if the attribute value is decoded before parsing — the raw
+  // spelling is not a valid ref segment. Likewise a field name
+  // spelled with a reference decodes to its name.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.n&#111;te"/></field>' +
+        '<field name="n&#111;te2"><ui><textEdit/></ui><bind match="default"/></field>',
+      "<note>V</note><note2>W</note2>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "V", type: "text" },
+    { name: "form.note2", value: "W", type: "text" },
+  ]);
+});
+
+test("A-3 (round 9): the single-pass scanner is linear on the repeated-opener shape (Y4)", async () => {
+  // Deterministic work counter, never a wall-clock threshold: the
+  // round-8 regex strips scanned the remaining suffix from every
+  // candidate opener (n=2000 → 11 ms, n=8000 → 125 ms, ~11–14x for
+  // 4x input). A single forward scan examines each character at most
+  // twice, so the step count is linear in the input (4x input → ~4x
+  // steps) and bounded by twice the input length. The "&#0;" sits
+  // inside the comment, where it is literal text — the scan must not
+  // throw on this shape.
+  const scanDatasets = (n: number) =>
+    `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><!-- &#0; ${"<![CDATA[".repeat(n)} --><note>V</note></form></xfa:data></xfa:datasets>`;
+  const text2000 = scanDatasets(2000);
+  const text8000 = scanDatasets(8000);
+  const steps2000 = countXmlScanSteps(text2000);
+  const steps8000 = countXmlScanSteps(text8000);
+  assert.ok(
+    steps2000 <= 2 * text2000.length,
+    `steps(2000)=${steps2000} over ${text2000.length} chars`,
+  );
+  assert.ok(
+    steps8000 <= 2 * text8000.length,
+    `steps(8000)=${steps8000} over ${text8000.length} chars`,
+  );
+  assert.ok(
+    steps8000 < 6 * steps2000,
+    `steps must scale linearly: steps(8000)=${steps8000}, steps(2000)=${steps2000}`,
+  );
+  // The same shape still inspects: the comment is literal, the note
+  // is real data.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<!-- &#0; ${"<![CDATA[".repeat(2000)} --><note>V</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "V", type: "text" }]);
+});
+
+test("A-4 (round 9): the scanner is context-correct — comment/CDATA/PI delimiters (Y5/Y6)", async () => {
+  // Y5: a CDATA opener inside the first comment must not match a
+  // terminator inside the second — the real &#0; is rejected.
+  const bypassBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<!-- <![CDATA[ --><note>&#0;</note><!-- ]]> -->`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bypassBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /character reference '&#0;' naming U\+0000/);
+    return true;
+  });
+  // Y6: reference-like text inside a processing instruction is
+  // literal data, not a character reference.
+  const piBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<?probe &#0;?><note>V</note>`,
+    ),
+  );
+  const piResult = await inspectPdf(piBytes);
+  assert.deepEqual(piResult.fields, [{ name: "form.note", value: "V", type: "text" }]);
+  // Delimiters inside each other's literal content: a CDATA section
+  // may hold "<!--", a comment may hold "]]>", a PI may hold "-->".
+  const delimiterBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="cdata"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<!-- ]]> --><note>V</note><cdata><![CDATA[ <!-- ]]></cdata>`,
+    ),
+  );
+  const delimiterResult = await inspectPdf(delimiterBytes);
+  assert.deepEqual(delimiterResult.fields, [
+    { name: "form.note", value: "V", type: "text" },
+    { name: "form.cdata", value: " <!-- ", type: "text" },
+  ]);
+  const piDelimiterBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<?probe -->?><note>V</note>`,
+    ),
+  );
+  const piDelimiterResult = await inspectPdf(piDelimiterBytes);
+  assert.deepEqual(piDelimiterResult.fields, [{ name: "form.note", value: "V", type: "text" }]);
+});
+
+test("A-4 (round 9): overflowing and leading-zero references are rejected (Y7)", async () => {
+  // Y7: a 400-digit reference used to parse to Infinity and skip the
+  // rejection; saturating accumulation rejects it.
+  const overflowBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<note>&#${"9".repeat(400)};</note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(overflowBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /above U\+10FFFF.*not valid in XML 1\.0/);
+    return true;
+  });
+  // Control (Y7b): a merely out-of-range reference names its exact
+  // code point.
+  const outOfRangeBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<note>&#x110000;</note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(outOfRangeBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /naming U\+110000/);
+    return true;
+  });
+  // Leading-zero references are still caught: &#x00; names U+0000.
+  const leadingZeroBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<note>&#x00;</note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(leadingZeroBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /naming U\+0000/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 9): byte accounting rejects values over 1 MiB in bytes but under it in characters", async () => {
+  // The round-8 non-ASCII test only succeeds below the bound — a
+  // character-count implementation could also pass it. This is the
+  // rejection proof: 11 × 51,200 "é" is 563,200 characters (under
+  // 1 MiB) but 1,126,400 UTF-8 bytes (over 1 MiB), so byte
+  // accounting must 422 while character counting would pass it.
+  const value = "é".repeat(51_200 * 11);
+  assert.equal(value.length, 563_200);
+  assert.equal(new TextEncoder().encode(value).length, 1_126_400);
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<note>${value}</note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of resolved fields/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 9): the incremental output guard fires before a later conflicting merge", async () => {
+  // Ten units of one checkbox field, each a DISTINCT scope identity
+  // resolving to the same leaf (the round-8 ancestor-bit
+  // construction): nine ~100 KiB on-values merge to ~921 KiB, under
+  // both bounds — the round-8 test proves that succeeds. The tenth
+  // unit also carries a ~200 KiB caption label, so its merge delta
+  // pushes the serialized field past 1 MiB: the INCREMENTAL outBytes
+  // guard in push() must reject with "bytes of resolved fields". An
+  // eleventh unit carries a CONFLICTING label — if the incremental
+  // guard had not fired, processing would reach it and
+  // mergeDuplicate() would throw "conflicting labels" instead. So
+  // the byte error here proves the incremental guard fired, not
+  // merely the final exact JSON.stringify check, which runs only
+  // after all units and would never be reached once the conflict
+  // throws.
+  const bigValue = (i: number) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1);
+  const bigLabel = "L".repeat(200_000);
+  const otherLabel = "M".repeat(200_000);
+  const refs = accumRefs(11);
+  let subforms = accumCheckboxSubform(refs[0], "1");
+  for (let i = 1; i <= 8; i++) subforms += accumCheckboxSubform(refs[i], bigValue(i - 1));
+  subforms += accumCheckboxSubform(refs[9], bigValue(8), bigLabel);
+  subforms += accumCheckboxSubform(refs[10], "1", otherLabel);
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      subforms +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+      accumDataset +
+      "</form></xfa:data></xfa:datasets>",
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of resolved fields/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 9): control — small labels let the later conflicting merge surface", async () => {
+  // The same construction with small (~1 KiB) labels: the tenth
+  // unit's merge stays under 1 MiB, so no byte guard fires, and the
+  // eleventh unit's conflicting label DOES surface — proving the
+  // conflict is reachable and would have been the error if the
+  // incremental guard in the test above had not fired first.
+  const bigValue = (i: number) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1);
+  const refs = accumRefs(11);
+  let subforms = accumCheckboxSubform(refs[0], "1");
+  for (let i = 1; i <= 8; i++) subforms += accumCheckboxSubform(refs[i], bigValue(i - 1));
+  subforms += accumCheckboxSubform(refs[9], bigValue(8), "L".repeat(1000));
+  subforms += accumCheckboxSubform(refs[10], "1", "M".repeat(1000));
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      subforms +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+      accumDataset +
+      "</form></xfa:data></xfa:datasets>",
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /conflicting labels/);
+    return true;
+  });
 });

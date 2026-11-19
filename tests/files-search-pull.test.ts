@@ -973,3 +973,60 @@ test("an output-limit import fails over HTTP and persists no row and no bytes", 
   );
   assert.deepEqual(await readdir(join(directory, "files")), filesBefore);
 });
+
+// --- B1 fix round 9 (panel re-review #8, Nov 19, 2026) ----------------------
+// B-1: the pull-level cleanup logging is the shared non-throwing
+// wrapper, so a throwing logger cannot replace the transaction error.
+// The logger is not injectable (a module import), but the wrapper
+// bottoms out in console.error, so the pull-level test stubs
+// console.error to throw — the same fault the round-8 db-level test
+// covers for the runner — and drives the indeterminate branch with
+// the existing commit-acknowledgement-lost store proxy. The other
+// call site (byte-removal failure) is covered by the wrapper unit
+// test in tests/store.test.ts only: forcing `rm` to fail at pull
+// level is not injectable.
+test("pull keeps the original error when the cleanup logger throws (B-1, round 9)", async () => {
+  const source = await agent.files.import(
+    "throwing-logger-owner",
+    "fw9.pdf",
+    await fixture("fw9.pdf"),
+    "test",
+  );
+  const wrapped: Store = new Proxy(db, {
+    get(target, property, receiver) {
+      if (property === "transaction") {
+        return async (work: (tx: Store) => Promise<unknown>) => {
+          await target.transaction(work);
+          throw new Error("COMMIT acknowledgement lost (simulated)");
+        };
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const wrappedFiles = new Files(wrapped, config, {
+    sign: (_owner: string, path: string) => path,
+  } as unknown as Auth);
+  const originalError = console.error;
+  console.error = () => {
+    throw new Error("logger down");
+  };
+  try {
+    // Pre-fix this rejected with the logger's error instead: the
+    // indeterminate branch called backgroundFailure directly, and a
+    // throwing logger replaced the transaction error before `throw
+    // error` was reached.
+    await assert.rejects(
+      wrappedFiles.pull("throwing-logger-owner", source.id, "bob"),
+      /COMMIT acknowledgement lost/,
+    );
+  } finally {
+    console.error = originalError;
+  }
+  // The copy is committed under the target owner and its bytes are
+  // still readable — the retained-bytes outcome stands alongside the
+  // original error.
+  const copies = (await agent.files.list("bob")).filter((file) => file.parentId === source.id);
+  assert.equal(copies.length, 1);
+  const bytes = await new Files(db, config, auth).bytes("bob", copies[0].id);
+  assert.deepEqual(Buffer.from(bytes), await fixture("fw9.pdf"));
+});
