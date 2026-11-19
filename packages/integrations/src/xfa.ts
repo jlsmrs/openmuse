@@ -212,12 +212,73 @@ function isRecord(value: unknown): value is XmlRecord {
  * and its mixed content — element children and text, in document
  * order. Keeping text interleaved with elements (instead of merging it
  * into one #text value) is what makes rich-text order recoverable.
+ *
+ * Namespace bindings (A-1, round 10): `ns` is the resolved namespace
+ * URI of the element's own qualified name — the binding for its
+ * prefix, or the in-scope default namespace for an unprefixed name —
+ * or undefined when the element is in no namespace. `nsUnbound` is
+ * true when the name carries a prefix with no binding in scope: its
+ * namespace is UNKNOWN, not "none", and classification fails closed
+ * on it. `bindings` is the full in-scope prefix→URI map ("" is the
+ * default namespace) at this element, inherited down the walk: a
+ * binding declared on an ancestor governs descendants until
+ * redeclared, exactly as XML namespaces work. The map is shared,
+ * never mutated after creation — an element that declares a namespace
+ * gets a fresh copy — so sharing costs nothing per element.
  */
 interface XElement {
   name: string;
   local: string;
   attrs: Record<string, string>;
   content: Array<XElement | string>;
+  ns: string | undefined;
+  nsUnbound: boolean;
+  bindings: ReadonlyMap<string, string>;
+}
+
+/** In-scope bindings at a packet root: only the implicit `xml` prefix. */
+const ROOT_NS_BINDINGS: ReadonlyMap<string, string> = new Map([
+  ["xml", "http://www.w3.org/XML/1998/namespace"],
+]);
+
+/**
+ * The in-scope namespace bindings for an element: its parent's map,
+ * plus any `xmlns` / `xmlns:prefix` declaration the element itself
+ * carries. A declaration of "" undeclares that prefix (or the default
+ * namespace). Returns the parent map unchanged — shared, not copied —
+ * when the element declares nothing.
+ */
+function namespaceBindingsFor(
+  rawAttrs: XmlRecord,
+  parent: ReadonlyMap<string, string>,
+): ReadonlyMap<string, string> {
+  let bindings: Map<string, string> | null = null;
+  for (const [key, value] of Object.entries(rawAttrs)) {
+    if (typeof value !== "string") continue;
+    if (key !== "@_xmlns" && !key.startsWith("@_xmlns:")) continue;
+    if (bindings === null) bindings = new Map(parent);
+    if (key === "@_xmlns") {
+      if (value === "") bindings.delete("");
+      else bindings.set("", value);
+    } else {
+      const prefix = key.slice("@_xmlns:".length);
+      if (value === "") bindings.delete(prefix);
+      else bindings.set(prefix, value);
+    }
+  }
+  return bindings ?? parent;
+}
+
+/** Resolve an element name against its in-scope bindings. */
+function resolveElementNamespace(
+  tagKey: string,
+  bindings: ReadonlyMap<string, string>,
+): { ns: string | undefined; nsUnbound: boolean } {
+  const colon = tagKey.indexOf(":");
+  if (colon < 0) return { ns: bindings.get(""), nsUnbound: false };
+  const prefix = tagKey.slice(0, colon);
+  const ns = bindings.get(prefix);
+  return { ns, nsUnbound: ns === undefined };
 }
 
 function elementChildren(element: XElement): XElement[] {
@@ -259,7 +320,12 @@ function attr(element: XElement, name: string): string | undefined {
  * else that carries no data). Recursion is depth-bounded by
  * `convertEntries`, which throws at MAX_XFA_DEPTH.
  */
-function convertEntry(entry: unknown, packetName: string, depth: number): XElement | string | null {
+function convertEntry(
+  entry: unknown,
+  packetName: string,
+  depth: number,
+  bindings: ReadonlyMap<string, string> = ROOT_NS_BINDINGS,
+): XElement | string | null {
   if (!isRecord(entry)) return null;
   const keys = Object.keys(entry);
   if (keys.includes("#comment")) return null;
@@ -279,11 +345,18 @@ function convertEntry(entry: unknown, packetName: string, depth: number): XEleme
   for (const [key, value] of Object.entries(rawAttrs)) {
     if (typeof value === "string") attrs[key] = value;
   }
+  // Namespace bindings in scope at this element: its own xmlns
+  // declarations on top of its parent's, carried down to its children.
+  const elementBindings = namespaceBindingsFor(rawAttrs, bindings);
+  const { ns, nsUnbound } = resolveElementNamespace(tagKey, elementBindings);
   return {
     name: tagKey,
     local: tagKey.split(":").at(-1) ?? tagKey,
     attrs,
-    content: convertEntries(childEntries, packetName, depth + 1),
+    content: convertEntries(childEntries, packetName, depth + 1, elementBindings),
+    ns,
+    nsUnbound,
+    bindings: elementBindings,
   };
 }
 
@@ -302,12 +375,13 @@ function convertEntries(
   entries: unknown[],
   packetName: string,
   depth: number,
+  bindings: ReadonlyMap<string, string> = ROOT_NS_BINDINGS,
 ): Array<XElement | string> {
   if (depth > MAX_XFA_DEPTH)
     throw new XfaError(`XFA ${shortName(packetName)} packet is nested too deeply`);
   const out: Array<XElement | string> = [];
   for (const entry of entries) {
-    const converted = convertEntry(entry, packetName, depth);
+    const converted = convertEntry(entry, packetName, depth, bindings);
     if (converted !== null) out.push(converted);
   }
   const seen = new Map<string, string>();
@@ -576,24 +650,79 @@ function isIllegalXmlChar(codePoint: number): boolean {
 }
 
 /**
- * The XHTML namespace URI, as a string the tree can state it: the
- * parser does not resolve namespace URIs, but it preserves the
- * `xmlns` attribute string, so the rich-text classifier compares
- * that string against this value (A-1, round 9).
+ * The XHTML namespace URI. The parser itself does not resolve
+ * namespace URIs, but the converter builds the in-scope bindings
+ * from the preserved `xmlns` attributes (A-1, round 10), so the
+ * rich-text classifier compares each element's RESOLVED namespace
+ * URI against this value — not the literal `xmlns` string on one
+ * element.
  */
 const XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+
+/** The XFA data namespace URI, for `dataNode` attributes (A-2, round 10). */
+const XFA_DATA_NAMESPACE = "http://www.xfa.org/schema/xfa-data/1.0/";
+
+/**
+ * The value of the attribute whose EXPANDED name is
+ * `{namespaceUri}localName` on this element (A-2, round 10): the
+ * attribute's prefix is resolved through the element's in-scope
+ * bindings, so any prefix bound to that namespace matches and a
+ * prefix bound elsewhere does not. An unprefixed attribute is in no
+ * namespace, so it never matches a namespaced lookup. Returns
+ * undefined when no such attribute is present.
+ */
+function attrInNamespace(
+  element: XElement,
+  localName: string,
+  namespaceUri: string,
+): string | undefined {
+  for (const [key, value] of Object.entries(element.attrs)) {
+    const raw = key.startsWith("@_") ? key.slice(2) : key;
+    const colon = raw.indexOf(":");
+    if (colon < 0) continue;
+    if (raw.slice(colon + 1) !== localName) continue;
+    if (element.bindings.get(raw.slice(0, colon)) === namespaceUri) return value;
+  }
+  return undefined;
+}
+
+/**
+ * The dataset's `dataNode` marking on this element, by expanded name
+ * (A-2, round 10): `{http://www.xfa.org/schema/xfa-data/1.0/}dataNode`,
+ * whatever prefix the document chose for that namespace. One
+ * documented exception, in the fail-closed direction: a literal
+ * `xfa:dataNode` whose `xfa` prefix is UNDECLARED anywhere in scope
+ * is read as the XFA marking too — the conventional XFA prefix, and
+ * treating it as a group can only fail a field closed, never invent
+ * a value. When `xfa` IS bound, the binding governs: bound to
+ * anything else, the literal spelling is a different attribute and
+ * is not a group marking.
+ */
+function dataNodeValue(element: XElement): string | undefined {
+  const resolved = attrInNamespace(element, "dataNode", XFA_DATA_NAMESPACE);
+  if (resolved !== undefined) return resolved;
+  if (!element.bindings.has("xfa")) return attr(element, "xfa:dataNode");
+  return undefined;
+}
 
 /** The text a single-pass XML scan returns, with its work accounted. */
 interface XmlScanResult {
   /** Input text with legal numeric character references decoded (A-2, round 9). */
   text: string;
   /**
-   * Input characters the scan examined (each input character at most
-   * twice: once in the main loop, once more when a failed reference
-   * attempt re-walks its digits as plain text). Delimiter lookahead
-   * is a bounded (at most 9-character) compare per position, so total
-   * work is O(steps) — the adversarial scanner test asserts a linear
-   * step budget on the repeated-opener shape (A-3, round 9).
+   * A linear-work PROXY for the scan, not literally a count of every
+   * examined character (A-3, round 10 — precision correction): the
+   * main loop charges one step per character it visits, and a
+   * reference's digit/name characters are charged as they are read,
+   * so `steps` stays within twice the input length and scales
+   * linearly (asserted by test) — but delimiter lookahead
+   * (`startsWith` compares of at most 9 characters per position)
+   * and the characters inside a matched delimiter (`<!--`, `<![CDATA[`,
+   * `<?`, `-->`, `]]>`, `?>`) are NOT individually charged, and some
+   * output construction is omitted. Total work is O(steps) because
+   * the uncharged work per position is bounded by a constant, so the
+   * O(n) argument stands — the counter just does not literally count
+   * every character the scan touches.
    */
   steps: number;
 }
@@ -617,7 +746,10 @@ interface XmlScanResult {
  *
  * The scan tracks lexical state — element content, inside a tag
  * (with its attribute-value quote state), comment, CDATA section,
- * or processing instruction — and visits each character once:
+ * or processing instruction — and makes ONE forward pass, visiting
+ * each character in the main loop once (the step counter is a
+ * linear-work proxy for that pass, not a literal per-character
+ * count — see XmlScanResult.steps):
  * - a literal character illegal in XML 1.0 fails closed naming the
  *   code point, in EVERY state (a literal NUL is illegal inside
  *   CDATA and comments too);
@@ -631,6 +763,22 @@ interface XmlScanResult {
  *   parsing to Infinity and skipping the rejection (Y7) — and
  *   leading zeros stay legal (`&#x00;` is still caught, `&#00065;`
  *   still decodes to `A`);
+ * - entity syntax is established on the ORIGINAL text, BEFORE any
+ *   decoding can repair it (A-3, round 10): in element content and
+ *   in attribute values, every `&` must start a complete, valid
+ *   entity reference — a numeric reference (`&#...;`, validated and
+ *   decoded as above, and a malformed one fails closed instead of
+ *   being passed through as plain text) or one of the five
+ *   predefined named entities (`&amp;` `&lt;` `&gt;` `&quot;`
+ *   `&apos;`, terminated by `;`). Anything else — a split entity
+ *   such as `&am&#112;;` or `&a&#109;p;`, an unterminated `&amp`,
+ *   an undeclared `&foo;` — fails closed here. This is the only
+ *   sound order: decoding first turned `&am&#112;;` into the valid
+ *   `&amp;` and reported `"&"` for malformed input (Z3/Z3b/Z3c).
+ *   Only the predefined five can occur: DOCTYPE is refused before
+ *   this scan runs, so no DTD can declare any other entity. Inside
+ *   comments, CDATA, and PIs an `&` is literal text and is not
+ *   validated, as before;
  * - a legal reference DECODES to its character (A-2, round 9):
  *   this parser version decodes named entities but leaves numeric
  *   references literal, so `&#65;` used to be reported as the wrong
@@ -679,6 +827,63 @@ function scanXmlText(packetName: string, text: string): XmlScanResult {
     new XfaError(
       `XFA packet '${shortName(packetName)}' contains a numeric character reference naming a code point above U+10FFFF, which is not valid in XML 1.0`,
     );
+  /** A malformed entity reference: the raw spelling, capped for the message. */
+  const malformedEntityError = (at: number, end: number): XfaError =>
+    new XfaError(
+      `XFA packet '${shortName(packetName)}' contains a malformed entity reference '${shortName(text.slice(at, Math.min(end, at + 32)))}', which is not valid XML`,
+    );
+  /** The only named entities a DTD-less document can use (A-3, round 10). */
+  const PREDEFINED_ENTITIES = new Set(["amp", "lt", "gt", "quot", "apos"]);
+  /**
+   * Validate a named entity reference at `at` (`text[at]` is `&`,
+   * `text[at + 1]` is not `#`). Returns the index just past the
+   * terminating `;` when the reference is one of the five predefined
+   * entities; throws on anything else — an unterminated, split, or
+   * undeclared entity. Name characters are charged to `steps` as
+   * they are read (they are then skipped, never re-walked), so the
+   * step count stays a linear-work proxy. The set-membership check
+   * is the real gate: any non-ASCII or otherwise exotic spelling
+   * can never be a predefined name, so it throws here too.
+   */
+  const tryNamedEntity = (at: number): number => {
+    let j = at + 1;
+    while (j < text.length) {
+      const ch = text[j];
+      const code = ch.charCodeAt(0);
+      const isNameChar =
+        (ch >= "A" && ch <= "Z") ||
+        (ch >= "a" && ch <= "z") ||
+        (ch >= "0" && ch <= "9") ||
+        ch === "." ||
+        ch === "-" ||
+        ch === "_" ||
+        ch === ":" ||
+        code >= 0x80;
+      if (!isNameChar) break;
+      steps++;
+      j++;
+    }
+    const name = text.slice(at + 1, j);
+    if (name.length === 0 || text[j] !== ";" || !PREDEFINED_ENTITIES.has(name))
+      throw malformedEntityError(at, j + 1);
+    return j + 1;
+  };
+  /**
+   * Validate and consume one entity reference at `at` (`text[at]`
+   * is `&`): a numeric reference is validated/decoded by
+   * tryReference, a named one by tryNamedEntity. A malformed
+   * numeric reference (no digits, no `;`) throws instead of being
+   * passed through as plain text for a later validator to see —
+   * passing it through is what let decoding repair it (Z3).
+   */
+  const consumeEntity = (at: number): number => {
+    if (text[at + 1] === "#") {
+      const after = tryReference(at);
+      if (after === null) throw malformedEntityError(at, at + 32);
+      return after;
+    }
+    return tryNamedEntity(at);
+  };
   /** A decoded character, re-emitted so it can never become markup. */
   const emitDecoded = (codePoint: number): string => {
     switch (codePoint) {
@@ -781,9 +986,12 @@ function scanXmlText(packetName: string, text: string): XmlScanResult {
           quote = null;
           i++;
         }
-      } else if (character === "&" && text[i + 1] === "#") {
-        const after = tryReference(i);
-        i = after ?? i + 1;
+      } else if (character === "&") {
+        // Every "&" in content must start a valid entity reference
+        // (A-3, round 10): consumeEntity validates the ORIGINAL
+        // spelling before any decoding, so a split entity can never
+        // be repaired into a valid one.
+        i = consumeEntity(i);
       } else {
         i++;
       }
@@ -791,9 +999,10 @@ function scanXmlText(packetName: string, text: string): XmlScanResult {
       if (quote !== null) {
         if (character === quote) {
           quote = null;
-        } else if (character === "&" && text[i + 1] === "#") {
-          const after = tryReference(i);
-          i = after ?? i + 1;
+        } else if (character === "&") {
+          // Same rule inside a quoted attribute value (Z3c): the
+          // repair is reachable there too.
+          i = consumeEntity(i);
           continue;
         }
         i++;
@@ -832,10 +1041,14 @@ function scanXmlText(packetName: string, text: string): XmlScanResult {
 }
 
 /**
- * Test hook for the scanner's work bound (A-3, round 9): the number
- * of input characters one scan of `text` examines. The adversarial
- * scanner test asserts a linear budget on the repeated-opener shape
- * against this count — never a wall-clock threshold.
+ * Test hook for the scanner's work bound (A-3, round 9; precision,
+ * round 10): the scan's linear-work proxy for `text` — the main-loop
+ * visits plus reference digit/name characters charged as read, NOT
+ * literally every character the scan touches (delimiter lookahead and
+ * the characters inside a matched delimiter are not individually
+ * charged). The adversarial scanner test asserts a linear budget on
+ * the repeated-opener shape against this count — never a wall-clock
+ * threshold.
  */
 export function countXmlScanSteps(text: string): number {
   return scanXmlText("test", text).steps;
@@ -873,7 +1086,11 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
   // and parser both let literal NUL bytes through, so an explicit
   // check on the raw text is the only gate — and the decoded text is
   // what is validated and parsed, so a legal numeric reference
-  // reports its character, not its spelling.
+  // reports its character, not its spelling. Entity syntax is
+  // established by the same scan on the ORIGINAL text, before any
+  // decoding (A-3, round 10): a malformed entity can no longer be
+  // repaired into a valid one by decoding, so what the validator
+  // sees was already well-formed as written.
   text = scanXmlText(packetName, text).text;
   const validation = XMLValidator.validate(text);
   if (validation !== true)
@@ -1439,84 +1656,126 @@ function strippedSegments(segments: string[]): string[] {
  * arbitrary data. An ordinary dataset element that happens to be
  * named `xhtml` holds data children, not an XHTML skeleton, so the
  * skeleton is what distinguishes rich text from a same-named data
- * element. (A-1, round 9) Namespace is the second distinguishing
- * evidence, stated in the terms the tree can state it: the parser
- * does not resolve namespace URIs, but it preserves the `xmlns`
- * attribute string, so the <xhtml> element's own default-namespace
- * declaration — when present — must be the XHTML namespace. A
- * company or other non-XHTML namespace on the container means the
- * element is data in that namespace, not an XHTML document, however
- * skeleton-shaped its children are. Absent `xmlns` stays as before:
+ * element. (A-1, round 10) Namespace is the second distinguishing
+ * evidence, now evaluated on EXPANDED names: each element's resolved
+ * namespace URI (its prefix's binding, or the in-scope default
+ * namespace, inherited down the walk) is compared, not the literal
+ * `xmlns` string on one element. A company or other non-XHTML
+ * namespace on the container — declared on the container itself, on
+ * a prefix, or inherited from a parent's default namespace — means
+ * the element is data in that namespace, not an XHTML document,
+ * however skeleton-shaped its children are. A genuine XHTML
+ * container under a prefix stays rich text even when an unrelated
+ * default namespace is also declared (Z1c): the prefix resolves,
+ * the default does not govern it. Absent namespace stays as before:
  * legitimate rich text in the wild carries either no declaration
- * (the round-8 X4 shape) or the XHTML namespace.
+ * (the round-8 X4 shape) or the XHTML namespace. What this still
+ * cannot distinguish is stated plainly, not hidden: an element in
+ * NO namespace is accepted exactly as before (the legacy shape), so
+ * a namespace-less data element that is skeleton-shaped is still
+ * read as rich text — the no-namespace convention is the accepted
+ * ambiguity — and a namespace URI is only a string: a document that
+ * declares the XHTML URI on company data is indistinguishable from
+ * genuine XHTML by any evidence the tree holds. Where the evidence
+ * genuinely cannot distinguish — an unbound prefix (namespace
+ * unknown, not "none"), or a skeleton child in a different
+ * namespace from its container — the classifier fails closed.
  */
 const XHTML_SKELETON = new Set(["html", "head", "body"]);
 
-/** True when `element` is an <xhtml> holding an XHTML document skeleton. */
+/**
+ * True when `element` is an <xhtml> holding an XHTML document
+ * skeleton, in namespace terms as well as shape: the container's
+ * expanded name must be XHTML or no-namespace (never a company or
+ * other namespace, never an unbound prefix), and every skeleton
+ * child must be in the SAME namespace as the container — a child in
+ * a different namespace, or with an unbound prefix, is data in that
+ * namespace, not part of this document, so the whole container fails
+ * closed instead of flattening a mixture.
+ */
 function isXhtmlDocument(element: XElement): boolean {
-  const xmlns = attr(element, "xmlns");
-  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return false;
+  if (element.local !== "xhtml") return false;
+  if (element.nsUnbound) return false;
+  if (element.ns !== undefined && element.ns !== XHTML_NAMESPACE) return false;
   const children = elementChildren(element);
-  return children.length > 0 && children.every((child) => XHTML_SKELETON.has(child.local));
+  return (
+    children.length > 0 &&
+    children.every(
+      (child) => XHTML_SKELETON.has(child.local) && !child.nsUnbound && child.ns === element.ns,
+    )
+  );
 }
 
 /**
  * Is `child` a supported rich-text container (A-1, round 8; namespace
- * and data-group evidence, round 9)? Either a bare <xhtml> holding an
- * XHTML document skeleton, or an <exData> whose whole content is
- * exactly one such <xhtml> (whitespace-only direct text besides).
- * Anything else named `exData` or `xhtml` — a text-only <exData>, an
- * <exData> wrapping non-XHTML content, an <xhtml> holding data
- * children — is an ordinary dataset element, not a rich-text
- * container, and must not change its parent's classification. The
- * container child's own declarations defeat the classification, not
- * just the parent's (Y1, round 9): a container marked
- * `xfa:dataNode="dataGroup"` is a data group, and a container whose
- * default namespace is not the XHTML namespace is data in that
- * namespace — either way its children stay ordinary data. `contentType`
- * is supporting evidence only: it cannot establish rich text on its
- * own — namespace, data-group marking, and structure do that — but a
- * declared non-HTML content type (`text/plain` wrapping an XHTML
- * skeleton) contradicts an HTML document, so it defeats the
- * classification; absent `contentType` stays as before. These
- * checks guard the PARENT's flattening; the matching node-side guard
- * is `exDataDefeated()`, consulted by collectDataLeaves when the walk
- * stands ON the wrapper — without it, recursing past a defeated
- * wrapper would let its bare <xhtml> child classify the wrapper as
- * a rich-text leaf anyway.
+ * and data-group evidence, rounds 9–10)? Either a bare <xhtml>
+ * holding an XHTML document skeleton, or an <exData> whose whole
+ * content is exactly one such <xhtml> (whitespace-only direct text
+ * besides). Anything else named `exData` or `xhtml` — a text-only
+ * <exData>, an <exData> wrapping non-XHTML content, an <xhtml>
+ * holding data children — is an ordinary dataset element, not a
+ * rich-text container, and must not change its parent's
+ * classification. The container child's own declarations defeat the
+ * classification, not just the parent's (Y1, round 9): a container
+ * marked a data group (by expanded `dataNode` name, any prefix —
+ * A-2, round 10) is a data group, and a container whose RESOLVED
+ * namespace is not the XHTML namespace is data in that namespace —
+ * either way its children stay ordinary data. Namespace is judged
+ * on the inner <xhtml>'s own expanded name, through its in-scope
+ * bindings: a wrapper's default namespace defeats the classification
+ * only insofar as the inner <xhtml> inherits it — a wrapper that
+ * declares an unrelated default namespace around a genuinely
+ * XHTML-prefixed inner <xhtml> does NOT defeat it (the Z1c converse
+ * for wrappers; the round-9 standalone wrapper `xmlns` check, which
+ * rejected that shape, is removed for exactly this reason).
+ * `contentType` is supporting evidence only: it cannot establish
+ * rich text on its own — namespace, data-group marking, and
+ * structure do that — but a declared non-HTML content type
+ * (`text/plain` wrapping an XHTML skeleton) contradicts an HTML
+ * document, so it defeats the classification; absent `contentType`
+ * stays as before. These checks guard the PARENT's flattening; the
+ * matching node-side guard is `exDataDefeated()`, consulted by
+ * collectDataLeaves when the walk stands ON the wrapper — without
+ * it, recursing past a defeated wrapper would let its bare <xhtml>
+ * child classify the wrapper as a rich-text leaf anyway.
  */
 function isRichTextContainer(child: XElement): boolean {
-  if (attr(child, "xfa:dataNode") === "dataGroup") return false;
+  if (dataNodeValue(child) === "dataGroup") return false;
   if (child.local === "xhtml") return isXhtmlDocument(child);
   if (child.local !== "exData") return false;
   const contentType = attr(child, "contentType");
   if (contentType !== undefined && contentType.trim().toLowerCase() !== "text/html") return false;
-  const xmlns = attr(child, "xmlns");
-  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return false;
   const children = elementChildren(child);
   if (children.length !== 1 || children[0].local !== "xhtml") return false;
-  if (attr(children[0], "xfa:dataNode") === "dataGroup") return false;
+  if (dataNodeValue(children[0]) === "dataGroup") return false;
   if (!isXhtmlDocument(children[0])) return false;
   return child.content.every((item) => typeof item !== "string" || item.trim() === "");
 }
 
 /**
  * Does an <exData> element itself carry a declaration that defeats
- * rich-text classification for the leaf IT would be (A-1, round 9)?
- * The wrapper's declared default namespace and content type govern
- * its whole content: a company-namespaced or `text/plain` wrapper
- * holds data, not an HTML document — so when the walk stands on the
- * wrapper, its bare <xhtml> child must not classify the wrapper as
- * a rich-text leaf. (The parent-side counterpart lives in
+ * rich-text classification for the leaf IT would be (A-1, rounds 9–10)?
+ * The wrapper's content type governs its whole content: a `text/plain`
+ * wrapper holds data, not an HTML document — so when the walk stands
+ * on the wrapper, its bare <xhtml> child must not classify the wrapper
+ * as a rich-text leaf. (The parent-side counterpart lives in
  * isRichTextContainer, which stops the PARENT from flattening; this
  * one stops the wrapper itself. A dataGroup marking needs no check
  * here: collectDataLeaves already defeats the node on its own
- * `xfa:dataNode`, and an empty dataGroup returns before this point.)
+ * `dataNode`, and an empty dataGroup returns before this point.)
+ * Namespace is deliberately NOT checked here any more: the round-9
+ * version defeated a wrapper on its own default-namespace
+ * declaration, which is only a proxy for the inner <xhtml>'s
+ * namespace — and a wrong proxy for a prefixed genuine inner
+ * <xhtml> (Z1c converse). The inner element's resolved namespace is
+ * now judged directly, through its inherited bindings, by
+ * isXhtmlDocument() in the flattening condition below; a wrapper
+ * whose default namespace the inner element inherits is defeated
+ * there, and a wrapper around a genuinely XHTML-prefixed inner
+ * element is not.
  */
 function exDataDefeated(element: XElement): boolean {
   if (element.local !== "exData") return false;
-  const xmlns = attr(element, "xmlns");
-  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return true;
   const contentType = attr(element, "contentType");
   return contentType !== undefined && contentType.trim().toLowerCase() !== "text/html";
 }
@@ -1548,8 +1807,10 @@ function collectDataLeaves(
   // group with no members, not a scalar leaf with value "" (Y2) —
   // the round-8 order emitted the scalar first and never reached
   // any dataGroup check. A marked group WITH children still recurses
-  // below, so its children stay addressable.
-  const dataNode = attr(node, "xfa:dataNode");
+  // below, so its children stay addressable. The marking is read by
+  // expanded name (A-2, round 10): any prefix bound to the XFA data
+  // namespace counts, not just the literal `xfa:` spelling.
+  const dataNode = dataNodeValue(node);
   if (dataNode === "dataGroup" && children.length === 0) return;
   if (children.length === 0) {
     // A leaf's value is its direct text, verbatim: dataset whitespace
@@ -1565,18 +1826,21 @@ function collectDataLeaves(
   // skeleton, or an <exData> wrapping exactly one such <xhtml> — with
   // no other element children and no non-whitespace direct text, and
   // never when the dataset explicitly marks the node a data group
-  // (xfa:dataNode="dataGroup"). (A-1, round 9) The container child's
-  // own declarations are consulted too, inside
-  // isRichTextContainer(): a container marked dataGroup, or carrying
-  // a non-XHTML default namespace, is ordinary data, not rich text —
-  // the round-8 check read only the parent's marking, so a
-  // dataGroup-marked, company-namespaced <xhtml> child still
-  // flattened its parent into a fabricated scalar (Y1). The node's
-  // OWN wrapper declarations are consulted as well, via
-  // exDataDefeated() in the condition below: a wrapper that declares
-  // a non-XHTML namespace or a non-HTML contentType governs its whole
-  // content, so recursing past it must not let its bare <xhtml> child
-  // classify the wrapper as a leaf anyway. Anything else
+  // (by expanded `dataNode` name — A-2, round 10). (A-1, round 10)
+  // The container child's own declarations are consulted too, inside
+  // isRichTextContainer(): a container marked dataGroup, or whose
+  // RESOLVED namespace (prefix binding or inherited default, carried
+  // through the walk) is not the XHTML namespace, is ordinary data,
+  // not rich text — the round-9 check read only the literal `xmlns`
+  // on one element, so a prefixed company-namespaced container
+  // (Z1) and an inherited company default namespace (Z1b) still
+  // flattened into a fabricated scalar. The node's OWN wrapper
+  // declarations are consulted as well, via exDataDefeated() in the
+  // condition below: a wrapper that declares a non-HTML contentType
+  // governs its whole content, so recursing past it must not let its
+  // bare <xhtml> child classify the wrapper as a leaf anyway
+  // (namespace is judged on the inner <xhtml> itself now, not by a
+  // wrapper-level `xmlns` proxy — see exDataDefeated). Anything else
   // named `exData` or `xhtml` is an ordinary dataset element: the
   // walk recurses into it like any other element, so its children
   // stay addressable (form.note.exData, form.note.other) and a field
@@ -1591,7 +1855,10 @@ function collectDataLeaves(
   // round 8): this rule IS the classification, and the bounds only
   // cap the work and output around whatever it produces — a
   // misclassified leaf fits every byte bound, so no bound may be
-  // claimed to establish it.
+  // claimed to establish it. Namespace resolution is part of that
+  // classification, not of the bounds: it is justified on expanded
+  // names and in-scope bindings, and it cannot prove a document's
+  // namespace declarations are honest (see isXhtmlDocument).
   if (
     dataNode !== "dataGroup" &&
     !exDataDefeated(node) &&
@@ -1814,30 +2081,46 @@ function matchesSelectors(
  * the packet text — comments, CDATA sections, and processing
  * instructions are recognised in context and skipped as literal
  * text, so no delimiter confusion can hide a reference or invent
- * one, and no suffix is ever rescanned. The scan examines each
- * input character at most twice (counted as steps, asserted
- * linearly by test), so its work is O(n) in the packet size, which
- * is itself capped at 10 MiB per packet. Numeric decoding is
- * bounded the same way: each reference yields at most one
- * character, or a 6-character named entity for the five results
+ * one, and no suffix is ever rescanned. The scan's work is O(n) in
+ * the packet size, which is itself capped at 10 MiB per packet,
+ * with the work accounted as a step count that is a linear-work
+ * PROXY, not literally every examined character (A-3, round 10 —
+ * precision correction: delimiter lookahead and the characters
+ * inside a matched delimiter are not individually charged, so the
+ * counter must not be described as a per-character count; the O(n)
+ * argument stands because the uncharged work per position is
+ * bounded by a constant). Entity syntax is established by the same
+ * scan on the ORIGINAL text, before decoding (A-3, round 10), so a
+ * malformed entity cannot be repaired into a valid one. Numeric
+ * decoding is bounded the same way: each reference yields at most
+ * one character, or a 6-character named entity for the five results
  * that must not become markup (`<`, `>`, `&`, `"`, `'`), so the
  * decoded text is at most a small constant factor of the input.
- * What this still does NOT cover — restated plainly (R-7, round 9):
- * semantic classification is outside what any resource bound can
- * establish (round 8, unchanged): the bounds cap work and output
- * size around whatever the dataset classification produces, but
- * they cannot prove the classification itself is right — a
+ * What this still does NOT cover — restated plainly (R-7, round 10,
+ * fifth pass): semantic classification is outside what any resource
+ * bound can establish (round 8, unchanged): the bounds cap work and
+ * output size around whatever the dataset classification produces,
+ * but they cannot prove the classification itself is right — a
  * misclassified leaf (a data group flattened into a scalar, A-1
  * round 8) fits every byte bound. The classifier in
  * collectDataLeaves is the classification, and it is justified on
- * its own structural, namespace, and data-group terms — namespace
- * evidence is only what the tree can state (the `xmlns` attribute
- * string and qualified names; the parser does not resolve
- * namespace URIs, so an inherited namespace the container does not
- * itself declare is not visible to it), and a decoded `&#13;` (CR)
- * reports as LF because the parser normalizes line endings on
- * input. The per-packet size check still runs after decoding (the
- * decode budget is external), the duplicate-work charge is still a
+ * its own structural, namespace, and data-group terms. Namespace
+ * resolution (A-1, round 10) is semantic classification, outside
+ * what any bound can establish — say so plainly, do not claim the
+ * bounds prove it: the tree now carries in-scope namespace bindings
+ * (default namespace + prefix bindings, inherited down the walk)
+ * and the classifier evaluates EXPANDED names against them, so a
+ * prefixed or inherited company namespace defeats rich-text
+ * classification and a genuinely XHTML-prefixed container stays
+ * rich text — but the evidence is still only namespace URI strings
+ * as declared: a document that declares the XHTML URI on company
+ * data is indistinguishable from genuine XHTML, a namespace-less
+ * skeleton-shaped element is accepted by the legacy no-namespace
+ * convention, and an unbound prefix fails closed as unknown rather
+ * than being read as "none". A decoded `&#13;` (CR) reports as LF
+ * because the parser normalizes line endings on input. The
+ * per-packet size check still runs after decoding (the decode
+ * budget is external), the duplicate-work charge is still a
  * conservative over-approximation, and the bounds say nothing about
  * the parser's own internal work on up to 10 MiB of XML — only
  * that the work THIS module adds around it is bounded as stated.
