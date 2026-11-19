@@ -89,6 +89,27 @@ const MAX_JOINED_BYTES = 1024 * 1024;
  */
 const MAX_INTERNAL_PATH_BYTES = 4 * 1024 * 1024;
 /**
+ * Bound on dataRef segment count (A-1, round 6): a dataRef is folded
+ * one segment at a time through ScopeInterner.child(), and no dataset
+ * leaf path can exceed MAX_XFA_DEPTH segments (the whole-document
+ * depth gate), so a ref with more segments than that can never
+ * resolve — it fails closed at parse time, before any folding, so a
+ * field-less subtree is charged too. 100 segments is far above any
+ * legitimate SOM path (the W-9's longest ref is a handful).
+ */
+const MAX_DATA_REF_SEGMENTS = MAX_XFA_DEPTH;
+/**
+ * Bounds on `[N]` occurrence selectors (A-2, round 6): a selector's
+ * digit run is capped at 7 characters and its value at 1,000,000. No
+ * occurrence index can exceed the number of sibling repeats, itself
+ * capped by MAX_XFA_TAGS (200,000), so a larger value can never match
+ * a real leaf — rejecting it at parse time is fail-closed, and the cap
+ * keeps selector parsing a bounded, once-per-field operation instead
+ * of a per-candidate one.
+ */
+const MAX_SELECTOR_DIGITS = 7;
+const MAX_SELECTOR_INDEX = 1_000_000;
+/**
  * Error messages never interpolate an unbounded name (M1, round 4):
  * a 100 KiB field name with no data node used to produce a 102,462-byte
  * error. Names longer than this are truncated with a marker naming how
@@ -324,6 +345,20 @@ function normalizeSpace(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * The effective xml:space state at an element (A-3, round 6):
+ * an explicit xml:space="preserve" keeps whitespace verbatim for the
+ * subtree, xml:space="default" resets to the skipping behaviour, and
+ * no attribute inherits the parent's state. nodeText() already applies
+ * this within its own traversal; the walks below apply it ACROSS
+ * entry points, so state set above a flattening entry point (a
+ * datasets ancestor, a template <items> or <caption>) is not lost.
+ */
+function effectiveSpace(element: XElement, inherited: boolean): boolean {
+  const space = attr(element, "xml:space");
+  return space === "preserve" ? true : space === "default" ? false : inherited;
+}
+
 /** The AcroForm dict, or undefined when the catalog has no (dict) AcroForm. */
 function acroFormDict(doc: PDFDocument): PDFDict | undefined {
   const object = doc.catalog.lookup(PDFName.of("AcroForm"));
@@ -498,19 +533,46 @@ interface TemplateField {
 
 /**
  * A dataset-side scope as carried down the template walk (U-2, round
- * 5). `segments` is shared by reference — a child scope extends its
- * parent's array by one segment (an array of references, never a
- * re-join of the parent's path string), so a wide tree under one long
- * parent scope does not copy that scope's characters per child. The
- * template path strings that ARE retained (each field's somPath) are
- * still charged in aggregate by countTemplatePath, which trips after
- * a bounded number of long paths; a field-less subtree builds no
- * path string at all, because the walk carries segment arrays and
- * joins them only when a field is actually built.
+ * 5; representation corrected A-1, round 6). A scope is PARENT-LINKED:
+ * a child holds its one segment plus a pointer to its parent, so
+ * `child()` is O(1) and never copies the parent's segments — the
+ * round-5 comment claimed "a child scope extends its parent's array
+ * by one segment" while the code spread the whole array
+ * (`[...parent.segments, segment]`), a full copy per segment, which
+ * made folding a 20,000-segment dataRef quadratic (2,714 ms) with no
+ * bound tripping. The segment array is materialized lazily by
+ * `scopeSegments()` — once per distinct (interned) scope, memoized —
+ * only when a field is actually built, so a field-less subtree pays
+ * nothing per segment beyond the bounded fold. The fold itself is
+ * bounded twice: `parseDataRefSegments` rejects refs over
+ * MAX_DATA_REF_SEGMENTS before folding, and `child()` enforces the
+ * whole-document depth gate, so no ref — field-less or not — can
+ * drive unbounded scope construction. The template path strings that
+ * ARE retained (each field's somPath) are still charged in aggregate
+ * by countTemplatePath.
  */
 interface ScopeContext {
   id: number;
-  segments: string[];
+  parent: ScopeContext | null;
+  segment: string | null;
+  depth: number;
+  /** Memoized materialization of the segment array (see scopeSegments). */
+  segmentsCache?: string[];
+}
+
+/** Materialize a scope's segment array, memoized on the scope itself. */
+function scopeSegments(scope: ScopeContext): string[] {
+  const cached = scope.segmentsCache;
+  if (cached !== undefined) return cached;
+  const reversed: string[] = [];
+  let current: ScopeContext | null = scope;
+  while (current !== null && current.segment !== null) {
+    reversed.push(current.segment);
+    current = current.parent;
+  }
+  const segments = reversed.reverse();
+  scope.segmentsCache = segments;
+  return segments;
 }
 
 /**
@@ -521,20 +583,27 @@ interface ScopeContext {
  * scope nor a long parent is copied or serialized per occurrence.
  * An absolute dataRef scope folds from the root one segment at a
  * time; a bare (relative) dataRef scope folds from the parent scope.
+ * A child is O(1) (A-1, round 6): the scope is parent-linked, so no
+ * segment array is copied per segment, and the depth gate bounds the
+ * fold even for a ref that somehow bypasses the parse-time bound.
  */
 class ScopeInterner {
   private nextId = 1;
   private readonly ids = new Map<string, number>();
-  readonly root: ScopeContext = { id: 0, segments: [] };
+  readonly root: ScopeContext = { id: 0, parent: null, segment: null, depth: 0 };
 
   child(parent: ScopeContext, segment: string): ScopeContext {
+    if (parent.depth + 1 > MAX_XFA_DEPTH)
+      throw new XfaError(
+        `XFA template scope exceeds ${MAX_XFA_DEPTH} segments; refusing to report an unbounded result`,
+      );
     const key = `${parent.id}\u0000${segment}`;
     let id = this.ids.get(key);
     if (id === undefined) {
       id = this.nextId++;
       this.ids.set(key, id);
     }
-    return { id, segments: [...parent.segments, segment] };
+    return { id, parent, segment, depth: parent.depth + 1 };
   }
 }
 
@@ -593,11 +662,15 @@ function fieldTypeFromUi(uiKind: string): XfaFieldType {
 
 /** Choice-list option texts from the field-level `<items><text>…`. Accepts
  * several <items> elements (the parser produces one per element) and
- * merges their texts in order instead of silently dropping to []. */
-function itemTexts(node: XElement): string[] {
+ * merges their texts in order instead of silently dropping to [].
+ * `preserve` is the effective xml:space state at the field (A-3,
+ * round 6); each <items> element's own attribute overrides it, so
+ * state set on an <items> ancestor reaches the <text> children. */
+function itemTexts(node: XElement, preserve = false): string[] {
   const out: string[] = [];
   for (const items of childrenNamed(node, "items")) {
-    for (const text of childrenNamed(items, "text")) out.push(nodeText(text));
+    const keep = effectiveSpace(items, preserve);
+    for (const text of childrenNamed(items, "text")) out.push(nodeText(text, 0, keep));
   }
   return out;
 }
@@ -621,7 +694,9 @@ function buildTemplateField(
   pathSegments: string[],
   scope: ScopeContext,
   pathBytes: { bytes: number },
+  preserve = false,
 ): TemplateField | undefined {
+  const keep = effectiveSpace(node, preserve);
   const parentPath = (): string => segmentPath(pathSegments);
   // The binding is read BEFORE the name check (U-4, round 5): an
   // explicitly bound unnamed field must be inspected or rejected,
@@ -676,20 +751,28 @@ function buildTemplateField(
       `XFA packet is malformed: ${context} has more than one user-interface element`,
     );
   const uiKind = uiChildren[0]?.local ?? "none";
-  const items = itemTexts(node);
+  const items = itemTexts(node, keep);
   let onValues: string[] | undefined;
   // On-values live in <items> only for checkButtons; a choiceList's
   // <items> are its options, not on-values.
   if (uiKind === "checkButton" && items.length > 0) onValues = [items[0]];
   const caption = singletonChild(node, "caption", context);
+  const captionKeep = caption !== undefined ? effectiveSpace(caption, keep) : keep;
   const captionValue =
-    caption !== undefined ? nodeText(singletonChild(caption, "value", context) ?? caption) : "";
-  const label = captionValue !== "" ? normalizeSpace(captionValue) : undefined;
-  const options = uiKind === "choiceList" ? itemTexts(node) : [];
+    caption !== undefined
+      ? nodeText(singletonChild(caption, "value", context) ?? caption, 0, captionKeep)
+      : "";
+  // Caption labels normalize whitespace by default — EXCEPT under
+  // xml:space="preserve", where the document says the whitespace is
+  // significant (A-3, round 6; SPEC §1 step 4): a preserved caption
+  // keeps its newlines verbatim.
+  const label =
+    captionValue !== "" ? (captionKeep ? captionValue : normalizeSpace(captionValue)) : undefined;
+  const options = uiKind === "choiceList" ? itemTexts(node, keep) : [];
   return {
     somPath: fieldPath,
     leafName,
-    scope: scope.segments,
+    scope: scopeSegments(scope),
     scopeId: scope.id,
     ui: fieldTypeFromUi(uiKind),
     bind,
@@ -769,10 +852,16 @@ function collectTemplateFields(
   depth: number,
   out: TemplateField[],
   pathBytes: { bytes: number },
+  preserve = false,
 ): void {
   // Fail closed like the datasets walk: a form whose only fields are too
   // deep is a 422, never a silent field-less report.
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA template packet is nested too deeply");
+  // Effective xml:space at this element (A-3, round 6): state set on
+  // this element or above reaches every field, option list, and
+  // caption below it; each child element's own attribute overrides it
+  // where the walk (or buildTemplateField) applies it.
+  const keep = effectiveSpace(node, preserve);
   for (const child of elementChildren(node)) {
     if (child.local === "subform") {
       const name = attr(child, "name");
@@ -788,9 +877,10 @@ function collectTemplateFields(
         depth + 1,
         out,
         pathBytes,
+        keep,
       );
     } else if (child.local === "field") {
-      const field = buildTemplateField(child, pathSegments, scope, pathBytes);
+      const field = buildTemplateField(child, pathSegments, scope, pathBytes, keep);
       if (field) out.push(field);
     } else if (child.local === "exclGroup") {
       const name = attr(child, "name");
@@ -813,6 +903,9 @@ function collectTemplateFields(
       validateSomName(name, () => `exclGroup '${segmentPath(groupPathSegments)}'`);
       const groupPath = segmentPath(groupPathSegments);
       countTemplatePath(pathBytes, groupPath);
+      // The group's own xml:space (A-3, round 6): state set on the
+      // group element reaches its option fields and its caption.
+      const groupKeep = effectiveSpace(child, keep);
       const options: string[] = [];
       const childBinds: { bind: BindKind; ref: string | undefined }[] = [];
       for (const optionField of childrenNamed(child, "field")) {
@@ -825,11 +918,11 @@ function collectTemplateFields(
             throw new XfaError(
               `XFA template/datasets mismatch: exclGroup '${shortName(groupPath)}' has an unnamed option field with an explicit binding and cannot be reported`,
             );
-          const texts = itemTexts(optionField);
+          const texts = itemTexts(optionField, groupKeep);
           if (texts.length > 0) options.push(texts[0]);
           continue;
         }
-        const built = buildTemplateField(optionField, pathSegments, scope, pathBytes);
+        const built = buildTemplateField(optionField, pathSegments, scope, pathBytes, groupKeep);
         if (built) {
           options.push(built.onValues?.[0] ?? built.leafName);
           childBinds.push({ bind: built.bind, ref: built.ref });
@@ -858,25 +951,33 @@ function collectTemplateFields(
         ref = first.ref;
       }
       const caption = singletonChild(child, "caption", `exclGroup '${shortName(groupPath)}'`);
+      const captionKeep = caption !== undefined ? effectiveSpace(caption, groupKeep) : groupKeep;
       const captionValue =
         caption !== undefined
           ? nodeText(
               singletonChild(caption, "value", `exclGroup '${shortName(groupPath)}'`) ?? caption,
+              0,
+              captionKeep,
             )
           : "";
       out.push({
         somPath: groupPath,
         leafName: name,
-        scope: scope.segments,
+        scope: scopeSegments(scope),
         scopeId: scope.id,
         ui: "unsupported",
         bind,
         ref,
         options: options.length > 0 ? options : undefined,
-        label: captionValue !== "" ? normalizeSpace(captionValue) : undefined,
+        label:
+          captionValue !== ""
+            ? captionKeep
+              ? captionValue
+              : normalizeSpace(captionValue)
+            : undefined,
       });
     } else {
-      collectTemplateFields(child, pathSegments, scope, interner, depth + 1, out, pathBytes);
+      collectTemplateFields(child, pathSegments, scope, interner, depth + 1, out, pathBytes, keep);
     }
   }
 }
@@ -906,8 +1007,7 @@ function stripSegmentIndex(segment: string): string {
   // Fast path (U-2, round 5): most segments carry no "[N]" suffix,
   // so return the original string instead of allocating a copy per
   // segment on every strip. Only a trailing "]" can hold a selector.
-  if (!segment.endsWith("]")) return segment;
-  return segment.replace(/\[\d+\]$/, "");
+  return parseSegment(segment).name;
 }
 
 function leafNameOf(segments: string[]): string {
@@ -918,10 +1018,6 @@ function strippedSegments(segments: string[]): string[] {
   return segments.map(stripSegmentIndex);
 }
 
-function stripIndices(path: string): string {
-  return path.replace(/\[\d+\]/g, "");
-}
-
 /**
  * Walk <xfa:data> collecting leaf data nodes, in document order.
  * Repeated elements get an index in the path (form.repeat[0].item) so
@@ -930,8 +1026,19 @@ function stripIndices(path: string): string {
  * to visit every `a` before every `b`, so a `global` bind could pick a
  * later leaf over an earlier one.
  */
-function collectDataLeaves(node: XElement, path: string[], depth: number, out: DataLeaf[]): void {
+function collectDataLeaves(
+  node: XElement,
+  path: string[],
+  depth: number,
+  out: DataLeaf[],
+  preserve = false,
+): void {
   if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA datasets packet is nested too deeply");
+  // Effective xml:space at this element (A-3, round 6): state set on
+  // this element or above — including ancestors above the walk's
+  // entry point, passed in by inspectXfa — reaches the rich-text
+  // flattening below it.
+  const keep = effectiveSpace(node, preserve);
   const children = elementChildren(node);
   if (children.length === 0) {
     // A leaf's value is its direct text, verbatim: dataset whitespace
@@ -947,7 +1054,7 @@ function collectDataLeaves(node: XElement, path: string[], depth: number, out: D
   // The flattened value keeps the text in document order (no whitespace
   // normalisation); block boundaries carry no separator.
   if (children.some((child) => child.local === "xhtml" || child.local === "exData")) {
-    out.push({ segments: path, value: nodeText(node), markup: true });
+    out.push({ segments: path, value: nodeText(node, 0, keep), markup: true });
     return;
   }
   const counts = new Map<string, number>();
@@ -961,7 +1068,7 @@ function collectDataLeaves(node: XElement, path: string[], depth: number, out: D
     const index = seen.get(child.local) ?? 0;
     seen.set(child.local, index + 1);
     const segment = (counts.get(child.local) ?? 1) > 1 ? `${child.local}[${index}]` : child.local;
-    collectDataLeaves(child, [...path, segment], depth + 1, out);
+    collectDataLeaves(child, [...path, segment], depth + 1, out, keep);
   }
 }
 
@@ -1002,6 +1109,28 @@ function parseDataRefSegments(
     throw new XfaError(
       `XFA template/datasets mismatch: ${ctx()} has an unparseable dataRef '${shortName(ref)}'`,
     );
+  // Construction budget (A-1, round 6): a ref with more segments than
+  // any dataset leaf path can hold can never resolve, so it fails
+  // closed here, before subformScope folds it one segment at a time —
+  // including for a field-less subform, which no field-based charge
+  // would ever reach.
+  if (segments.length > MAX_DATA_REF_SEGMENTS)
+    throw new XfaError(
+      `XFA template/datasets mismatch: ${ctx()} has a dataRef with ${segments.length} segments (limit ${MAX_DATA_REF_SEGMENTS}); refusing to report an unbounded result`,
+    );
+  // Selector budget (A-2, round 6): over-long digit runs and
+  // out-of-range values fail closed at parse time, so lookup never
+  // has to parse them — let alone once per candidate. The digits are
+  // never interpolated into the message (they are unbounded input).
+  for (const segment of segments) {
+    const open = segment.lastIndexOf("[");
+    if (open < 0) continue;
+    const digits = segment.slice(open + 1, -1);
+    if (digits.length > MAX_SELECTOR_DIGITS || Number(digits) > MAX_SELECTOR_INDEX)
+      throw new XfaError(
+        `XFA template/datasets mismatch: ${ctx()} has a dataRef with an out-of-range [N] selector (at most ${MAX_SELECTOR_DIGITS} digits, value at most ${MAX_SELECTOR_INDEX})`,
+      );
+  }
   return { segments, absolute };
 }
 
@@ -1018,10 +1147,32 @@ function effectiveDataRefSegments(field: TemplateField): string[] {
   return absolute ? segments : [...field.scope, ...segments];
 }
 
+/**
+ * Parse one path segment into its bare name plus its `[N]` occurrence
+ * selector, if any (A-2, round 6). Regex-free and allocation-light: a
+ * segment that does not end in "]" has no selector (the fast path —
+ * no scan at all), and a trailing "[N]" puts the "[" within a few
+ * characters of the end, so lastIndexOf never walks a long name. The
+ * digits are bounded in every reachable case — ref selectors are
+ * capped at parse time by parseDataRefSegments, dataset suffixes are
+ * real occurrence counts — so Number() here is exact. The old
+ * segmentIndex() ran a regex over the raw selector string on EVERY
+ * candidate leaf at EVERY position — a 256 KiB selector over 5,000
+ * leaves cost 8,299 ms vs 397 ms for "[0]". Selectors are now parsed
+ * once per lookup (see lookupSelectors), never per candidate.
+ */
+function parseSegment(segment: string): { name: string; index: number | undefined } {
+  if (!segment.endsWith("]")) return { name: segment, index: undefined };
+  const open = segment.lastIndexOf("[");
+  if (open <= 0) return { name: segment, index: undefined };
+  const digits = segment.slice(open + 1, -1);
+  if (!/^\d+$/.test(digits)) return { name: segment, index: undefined };
+  return { name: segment.slice(0, open), index: Number(digits) };
+}
+
 /** The `[N]` selector on a path segment, or undefined when unindexed. */
 function segmentIndex(segment: string): number | undefined {
-  const match = /\[(\d+)\]$/.exec(segment);
-  return match ? Number(match[1]) : undefined;
+  return parseSegment(segment).index;
 }
 
 /**
@@ -1038,12 +1189,17 @@ function leafOccurrence(segment: string): number {
  * that carries a dataRef-bound subform's selectors)? The stripped paths
  * must already be equal (the byPath lookup guarantees that); each
  * `[N]` selector then narrows to that one occurrence, and an
- * unindexed selector accepts every occurrence of the name.
+ * unindexed selector accepts every occurrence of the name. The
+ * selectors arrive pre-parsed (A-2, round 6): parsing them here, per
+ * candidate, was the quadratic path.
  */
-function matchesSelectors(leafSegments: string[], selectors: string[]): boolean {
+function matchesSelectors(
+  leafSegments: string[],
+  selectors: Array<{ name: string; index: number | undefined }>,
+): boolean {
   if (leafSegments.length !== selectors.length) return false;
   return selectors.every((selector, position) => {
-    const wanted = segmentIndex(selector);
+    const wanted = selector.index;
     return wanted === undefined || leafOccurrence(leafSegments[position]) === wanted;
   });
 }
@@ -1052,35 +1208,39 @@ function matchesSelectors(leafSegments: string[], selectors: string[]): boolean 
  * The join index, built once per inspect: leaves by leaf name and by
  * stripped path, in document order. Indexing means a field only ever
  * looks up its own exact path or its own name — unrelated leaves cost
- * nothing. R-7 CORRECTION (round 5): the round-4 correction claimed
- * the retired per-field comparison budget was covered by the
- * aggregate internal path/index byte bound (T-3) and the on-values
- * merge bound (T-4). That was still unsound — neither bound covers
- * construction work per repeated leaf (U-2) or per-field filtering
- * work inside one repeated-path bucket (U-3). The work bound is
- * therefore the COMBINATION of all four, each covering exactly what
- * it names and nothing more:
- * (a) the construction-bytes budget below (U-2): every leaf's
- * stripped-path bytes and name bytes are charged as they are
- * processed, per leaf, before the joined key string is built — so
- * repeated leaves under one long ancestor trip the bound after a
- * bounded number of leaves instead of after the whole index is
- * built; plus scope interning in the template walk, so a long scope
- * is never re-serialized per field occurrence;
- * (b) the aggregate structural-comparison budget (U-3, restored):
- * every candidate leaf examined by findLeaves, counted across ALL
- * findLeaves calls in one inspect, capped at 1,000,000 (the
- * original R-7 number) — the backstop for filtering work that
- * remains after selector-aware narrowing;
+ * nothing. R-7 CORRECTION (round 6): the round-5 correction was
+ * still unsound — scope construction (A-1) and selector parsing
+ * (A-2) are pre-resolution amplification paths that none of the four
+ * bounds charged: a 20,000-segment dataRef folded quadratically
+ * (2,714 ms) and a 256 KiB selector was re-parsed per candidate
+ * (8,299 ms), both without tripping anything. This round closes those
+ * two paths directly, and the correction now states exactly what each
+ * bound covers:
+ * (a) construction work is bounded BEFORE resolution: dataRef segment
+ * counts are capped at MAX_DATA_REF_SEGMENTS (100 — no dataset leaf
+ * path can be longer, so a longer ref can never resolve) at parse
+ * time, scopes are parent-linked (child() is O(1), no array copy),
+ * and the aggregate internal path/index byte bound (4 MiB, charged
+ * per leaf before the joined key string is built) caps index
+ * construction;
+ * (b) lookup work is bounded by parsing each selector ONCE per field
+ * into a canonical form (never per candidate), rejecting over-long
+ * selectors and out-of-range values at parse time, plus the aggregate
+ * structural-comparison budget (1,000,000 candidate examinations
+ * across all findLeaves calls) as the backstop — with selector-aware
+ * narrowing, each examination is O(selector positions) with O(1)
+ * occurrence checks (a segment not ending in "]" has no selector; a
+ * trailing "[N]" puts the bracket within a few characters of the
+ * end);
  * (c) the on-values merge byte bound in joinFields (T-4): merged
- * checkbox on-values for one collapsed group may not exceed the
- * 1 MiB output bound;
+ * checkbox on-values for one collapsed group — and for one merged
+ * duplicate (A-4) — may not exceed the 1 MiB output bound;
  * (d) the output count/byte bounds (S-5): at most 10,000 resolved
  * fields totalling at most 1 MiB of serialized JSON.
- * No single one of these retires the others, and no claim is made
- * beyond them: in particular, the depth gate still runs after
- * dependency parsing, and the byte budgets bound work done inside
- * this module, not the parser's internal work.
+ * No single bound retires the others, and no coverage is claimed
+ * beyond them: the depth gate still runs after dependency parsing,
+ * and the byte budgets bound work done inside this module, not the
+ * parser's internal work on up to 10 MiB of XML.
  */
 interface PathBucket {
   leaves: DataLeaf[];
@@ -1213,11 +1373,18 @@ function buildJoinIndex(leaves: DataLeaf[]): JoinIndex {
  * fails closed instead of growing with fields × bucket size.
  */
 function lookupSelectors(index: JoinIndex, selectors: string[], budget: JoinBudget): DataLeaf[] {
-  const bucket = index.byPath.get(stripIndices(selectors.join(".")));
+  // Parse the selectors ONCE into their canonical form (A-2, round
+  // 6): the old code re-ran segmentIndex() — regex + Number() over
+  // the raw selector string — for every candidate leaf at every
+  // position, so a 256 KiB selector over 5,000 leaves re-parsed
+  // 256 KiB × 5,000 times. The bucket key is built from the parsed
+  // bare names, never by re-joining the raw selector strings.
+  const parsed = selectors.map(parseSegment);
+  const bucket = index.byPath.get(parsed.map((selector) => selector.name).join("."));
   if (!bucket) return [];
   let candidates: DataLeaf[] | undefined;
-  for (let position = 0; position < selectors.length; position++) {
-    const wanted = segmentIndex(selectors[position]);
+  for (let position = 0; position < parsed.length; position++) {
+    const wanted = parsed[position].index;
     if (wanted === undefined) continue;
     const narrowed = bucket.byOccurrence.get(position)?.get(wanted) ?? [];
     if (candidates === undefined || narrowed.length < candidates.length) candidates = narrowed;
@@ -1227,7 +1394,7 @@ function lookupSelectors(index: JoinIndex, selectors: string[], budget: JoinBudg
   for (const leaf of pool) {
     budget.comparisons += 1;
     checkComparisons(budget);
-    if (matchesSelectors(leaf.segments, selectors)) out.push(leaf);
+    if (matchesSelectors(leaf.segments, parsed)) out.push(leaf);
   }
   return out;
 }
@@ -1258,6 +1425,53 @@ function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string)
 }
 
 /**
+ * Merge a second occurrence of one resolved data node onto the field
+ * already reported for it (A-4, round 6). Same node, so the value must
+ * agree; the type, options, and label describe that one node, so they
+ * must agree too when both sides state them — disagreement is a
+ * genuine conflict between two template occurrences, not a merge, and
+ * fails closed. Checkbox on-values union (dedup, first-seen order),
+ * byte-bounded like the group merge in joinFields.
+ */
+function mergeDuplicate(existing: XfaField, incoming: XfaField, somPath: string): void {
+  const conflict = (detail: string): XfaError =>
+    new XfaError(
+      `XFA template/datasets mismatch: field '${shortName(somPath)}' has conflicting ${detail} for data node '${shortName(existing.name)}'`,
+    );
+  if (existing.type !== incoming.type) throw conflict("types");
+  if (existing.value !== incoming.value) throw conflict("values");
+  if (existing.options !== undefined && incoming.options !== undefined) {
+    if (JSON.stringify(existing.options) !== JSON.stringify(incoming.options))
+      throw conflict("options");
+  } else if (incoming.options !== undefined) {
+    existing.options = incoming.options;
+  }
+  if (existing.label !== undefined && incoming.label !== undefined) {
+    if (existing.label !== incoming.label) throw conflict("labels");
+  } else if (incoming.label !== undefined) {
+    existing.label = incoming.label;
+  }
+  if (incoming.onValues !== undefined) {
+    if (existing.onValues === undefined) {
+      existing.onValues = [...incoming.onValues];
+    } else {
+      const seen = new Set(existing.onValues);
+      let bytes = existing.onValues.reduce((total, value) => total + utf8Length(value) + 2, 0);
+      for (const value of incoming.onValues) {
+        if (seen.has(value)) continue;
+        seen.add(value);
+        existing.onValues.push(value);
+        bytes += utf8Length(value) + 2;
+        if (bytes > MAX_JOINED_BYTES)
+          throw new XfaError(
+            `XFA join produced more than ${MAX_JOINED_BYTES} bytes of checkbox on-values for field '${shortName(somPath)}'; refusing to report an unbounded result`,
+          );
+      }
+    }
+  }
+}
+
+/**
  * Join template fields to data nodes. Occurrence identity is retained
  * through resolution (S-4): template occurrences are grouped by
  * somPath, and occurrences that disagree on bind/ref/ui fail closed
@@ -1276,7 +1490,11 @@ function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string)
  * node and no `bind none` fails closed — a template/datasets name
  * mismatch must never silently report a wrong value. Two distinct
  * template paths resolving to the same data node fail closed too
- * (public-name collision). The resolved output is capped twice: at
+ * (public-name collision). Two units of ONE template path that
+ * resolve to the same data node (overlapping scopes, A-4, round 6)
+ * merge into one field when their metadata agrees, and fail closed
+ * when it conflicts — the resolved node, not the scope id, is the
+ * identity. The resolved output is capped twice: at
  * MAX_JOINED_FIELDS fields, and at MAX_JOINED_BYTES of serialized
  * resolved fields (S-5) — so no input can produce unbounded output
  * in count or in bytes.
@@ -1407,14 +1625,35 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   // at 1, not 0. Starting at 0 undercounted the full array by exactly
   // 1 byte.
   let outBytes = 1;
-  const resolvedByName = new Map<string, string>();
+  const resolvedByName = new Map<string, { field: XfaField; somPath: string; bytes: number }>();
   const push = (field: XfaField, somPath: string): void => {
     const previous = resolvedByName.get(field.name);
-    if (previous !== undefined && previous !== somPath)
-      throw new XfaError(
-        `XFA template/datasets mismatch: fields '${shortName(previous)}' and '${shortName(somPath)}' resolve to the same data node '${shortName(field.name)}'`,
-      );
-    resolvedByName.set(field.name, somPath);
+    if (previous !== undefined) {
+      if (previous.somPath !== somPath)
+        throw new XfaError(
+          `XFA template/datasets mismatch: fields '${shortName(previous.somPath)}' and '${shortName(somPath)}' resolve to the same data node '${shortName(field.name)}'`,
+        );
+      // Same template path, same resolved data node (A-4, round 6):
+      // overlapping scopes split one somPath group into units that
+      // resolve to the same leaf. They are occurrences of ONE field,
+      // so merge compatible metadata onto it (on-values union) and
+      // reject incompatible metadata instead of reporting the same
+      // public name twice. Scope ids alone cannot establish that two
+      // units' resolved node sets are disjoint — the resolved node
+      // is the identity, checked here. The merged field keeps its
+      // place in the output; only its serialized size is re-charged.
+      mergeDuplicate(previous.field, field, somPath);
+      const mergedBytes = utf8.encode(JSON.stringify(previous.field)).length + 1;
+      outBytes += mergedBytes - previous.bytes;
+      previous.bytes = mergedBytes;
+      if (outBytes > MAX_JOINED_BYTES)
+        throw new XfaError(
+          `XFA join produced more than ${MAX_JOINED_BYTES} bytes of resolved fields; refusing to report an unbounded result`,
+        );
+      return;
+    }
+    const bytes = utf8.encode(JSON.stringify(field)).length + 1;
+    resolvedByName.set(field.name, { field, somPath, bytes });
     out.push(field);
     if (out.length > MAX_JOINED_FIELDS)
       throw new XfaError(
@@ -1424,7 +1663,7 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
     // resolved field so far (name, value, label, options, on-values).
     // Enforced here, during the join — before persistence or HTTP
     // serialization can ever see the result.
-    outBytes += utf8.encode(JSON.stringify(field)).length + 1;
+    outBytes += bytes;
     if (outBytes > MAX_JOINED_BYTES)
       throw new XfaError(
         `XFA join produced more than ${MAX_JOINED_BYTES} bytes of resolved fields; refusing to report an unbounded result`,
@@ -1487,6 +1726,8 @@ export function inspectXfa(doc: PDFDocument): {
     bytes: 0,
   });
   const leaves: DataLeaf[] = [];
-  collectDataLeaves(dataRoot, [], 0, leaves);
+  // xml:space state at the datasets roots (A-3, round 6): the walk
+  // starts at <data>, but the state may be set on <datasets> above it.
+  collectDataLeaves(dataRoot, [], 0, leaves, effectiveSpace(datasetsRoot, false));
   return { fields: joinFields(templateFields, leaves), formKind: xfaFormKind(doc) ?? "xfa-static" };
 }

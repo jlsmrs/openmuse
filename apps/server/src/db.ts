@@ -50,9 +50,41 @@ interface Database {
    * transaction's queries interleave, and a plain query issued
    * mid-transaction joins the open transaction. A nested call just
    * joins the ambient transaction.
+   *
+   * A failure in the COMMIT step is marked indeterminate (B-1, round
+   * 6): the COMMIT may have completed server-side before the
+   * connection broke, so the outcome is unknown, not a rollback —
+   * see markIndeterminateCommit / isIndeterminateCommit.
    */
   transaction: <T>(fn: (query: Database["query"]) => Promise<T>) => Promise<T>;
   close: () => Promise<void>;
+}
+
+/**
+ * Indeterminate COMMIT marker (B-1, round 6): a transaction whose
+ * COMMIT step failed may or may not have committed server-side — a
+ * lost acknowledgement is indistinguishable from a rollback from the
+ * client's seat. The pg transaction marks such failures with this
+ * symbol so callers that do destructive cleanup on failure
+ * (Files.pull deleting the bytes file) can tell "outcome unknown"
+ * from "rolled back". The marker is advisory, not sufficient on its
+ * own: callers must ALSO treat any failure after their work callback
+ * completed as indeterminate, because a wrapper (or a later step) can
+ * throw after a successful commit — which no backend marker can see.
+ */
+const INDETERMINATE_COMMIT = Symbol("indeterminate-commit");
+export function markIndeterminateCommit(error: unknown): unknown {
+  if (typeof error === "object" && error !== null) {
+    (error as Record<symbol, boolean>)[INDETERMINATE_COMMIT] = true;
+  }
+  return error;
+}
+export function isIndeterminateCommit(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as Record<symbol, unknown>)[INDETERMINATE_COMMIT] === true
+  );
 }
 
 export class Store {
@@ -286,7 +318,16 @@ export async function createStore(
         try {
           await client.query("BEGIN");
           const result = await fn((sql, params) => client.query(sql, params));
-          await client.query("COMMIT");
+          try {
+            await client.query("COMMIT");
+          } catch (commitError) {
+            // The COMMIT may have completed server-side before the
+            // connection broke: the outcome is indeterminate, not a
+            // rollback. Mark it — the ROLLBACK attempt below is
+            // connection hygiene only and cannot prove a rollback
+            // happened, so the mark survives it.
+            throw markIndeterminateCommit(commitError);
+          }
           return result;
         } catch (error) {
           await client.query("ROLLBACK").catch(() => undefined);

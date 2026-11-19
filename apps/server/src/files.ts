@@ -5,7 +5,7 @@ import type { Artifact, FormKind } from "../../../packages/domain/src/index.ts";
 import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integrations/src/pdf.ts";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
-import type { Store } from "./db.ts";
+import { isIndeterminateCommit, type Store } from "./db.ts";
 import { isExtractableDocumentMime } from "./engine/document-text.ts";
 import { isConvertibleImageMime, isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
@@ -501,8 +501,15 @@ export class Files {
    * written in the same database transaction as the copy, so the two
    * commit or roll back together: a failed audit write can never leave
    * a visible, unaudited copy. The bytes file is written before the
-   * transaction and removed again if the transaction fails (a removal
-   * failure is logged loudly, never swallowed).
+   * transaction and removed again if the transaction fails before its
+   * work completes (a removal failure is logged loudly, never
+   * swallowed). Once the work has completed, the outcome is
+   * unknown-or-committed — a lost COMMIT acknowledgement, a
+   * commit-phase failure, or a wrapper throwing after commit — and the
+   * bytes are RETAINED, never deleted (B-1, round 6): only a failure
+   * inside the work callback establishes a rollback. Retained bytes
+   * from a genuinely rolled-back commit are orphaned files under
+   * dataDir/files, left for operator reconciliation.
    */
   async pull(owner: string, id: string, toOwner: string): Promise<Artifact> {
     if (typeof toOwner !== "string" || toOwner.trim() === "" || toOwner !== toOwner.trim())
@@ -543,18 +550,32 @@ export class Files {
       to: toOwner,
       when,
     };
+    // The bytes file is removed ONLY when non-commit is established:
+    // the work callback threw before COMMIT was attempted, so the
+    // transaction rolled the copy and the audit entry back together
+    // (B-1, round 6). Once the work completed, the outcome is
+    // unknown-or-committed — a lost COMMIT acknowledgement, a
+    // commit-phase failure (marked indeterminate by the pg
+    // transaction), or a wrapper that threw after commit — and
+    // deleting the bytes could destroy a committed copy's data, so
+    // they are retained and the failure is logged loudly for
+    // reconciliation instead. A removal failure is logged loudly,
+    // never swallowed.
+    let workCompleted = false;
     try {
       await this.db.transaction(async (tx) => {
         await tx.put(toOwner, "files", artifact);
         await tx.put("system", FILE_PULL_AUDIT_COLLECTION, audit);
+        workCompleted = true;
       });
     } catch (error) {
-      // The transaction rolled the copy and the audit entry back
-      // together; the bytes file is not part of it, so remove it — and
-      // log loudly if even the removal fails, never swallow it.
-      await rm(path, { force: true }).catch((removeError: unknown) =>
-        backgroundFailure("file pull cleanup", removeError),
-      );
+      if (!workCompleted && !isIndeterminateCommit(error)) {
+        await rm(path, { force: true }).catch((removeError: unknown) =>
+          backgroundFailure("file pull cleanup", removeError),
+        );
+      } else {
+        backgroundFailure("file pull indeterminate commit — bytes retained", error);
+      }
       throw error;
     }
     return this.signed(toOwner, artifact);
