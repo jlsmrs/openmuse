@@ -428,8 +428,13 @@ function convertEntry(
  * compares RESOLVED namespace identity, not just the written
  * spelling: two siblings with the same local name are repeats of one
  * field only when they share the same expanded name — the same
- * written qualified name AND the same resolved namespace URI. A
- * prefix rebound between siblings (`<p:code xmlns:p="urn:first">` +
+ * resolved namespace URI and the same local name (an expanded name
+ * is URI + local name; the written prefix is not part of it). The
+ * written-qualified-name check below it is the SEPARATE, additional
+ * R-4 requirement: same-URI different-prefix siblings (`<a:code>` /
+ * `<b:code>` both bound to `urn:example`) still fail closed on the
+ * written name, over and above expanded-name equality. A prefix
+ * rebound between siblings (`<p:code xmlns:p="urn:first">` +
  * `<p:code xmlns:p="urn:second">`) used to pass as repeats and report
  * as form.code[0]/[1] — two DIFFERENT expanded names,
  * indistinguishable from genuine same-namespace repeats — so a
@@ -469,6 +474,21 @@ function convertEntries(
 }
 
 /**
+ * XML whitespace (A-2, round 14): only space, tab, CR, and LF count as
+ * whitespace in XML. JavaScript's trim() treats U+00A0 (NBSP),
+ * U+2003 (em space), U+2028, and other Unicode spaces as whitespace
+ * too, so a trim()-based guard accepts `&#160;` at a skeleton
+ * position as formatting while nodeText() retains it in the value.
+ * Every skeleton-text guard below uses this predicate, never trim().
+ */
+function isXmlWhitespace(text: string): boolean {
+  for (const char of text) {
+    if (char !== " " && char !== "\t" && char !== "\n" && char !== "\r") return false;
+  }
+  return true;
+}
+
+/**
  * Concatenate the text under a node in document order. A whitespace-only
  * text node between elements is kept when it holds no line break: a
  * same-line space (`<b>A</b> <b>B</b>` → `"A B"`) is deliberate content,
@@ -493,6 +513,22 @@ function nodeText(node: XElement | string, depth = 0, preserve = false): string 
   let out = "";
   for (const item of node.content) {
     if (typeof item === "string") {
+      // (A-4, round 14) Formatting whitespace directly under a
+      // skeleton element (xhtml/html/head) never enters the flattened
+      // value: it is the author's indentation between skeleton
+      // elements, not body content — a same-line space there must
+      // behave like the newline indentation the existing rule already
+      // skips, or the value depends on formatting style (" Inside "
+      // vs "Inside" for identical content). This applies even under
+      // xml:space="preserve": preserve governs actual body content
+      // (text inside <body>, kept verbatim below), not the skeleton
+      // framing around it. Direct text under <body> itself is content
+      // and is untouched by this rule.
+      if (
+        (node.local === "xhtml" || node.local === "html" || node.local === "head") &&
+        isXmlWhitespace(item)
+      )
+        continue;
       if (!keep && item.trim() === "" && children.length > 0 && /[\n\r]/.test(item)) continue;
       out += item;
     } else {
@@ -1712,6 +1748,18 @@ interface DataLeaf {
    * joining the array with "." for the public SOM path is unambiguous.
    */
   segments: string[];
+  /**
+   * The resolved namespace URI of each segment, parallel to
+   * `segments` (A-3, round 14): `undefined` for an element in no
+   * namespace. The stripped-path join index keys leaves by local
+   * names only, so without this the join cannot tell two
+   * different-namespace same-local-name leaves under repeated
+   * parents apart — they would report as repeats of one field.
+   * Kept parallel (not folded into the segment strings) so the
+   * public SOM path, the stripped-path index, and every message
+   * that prints a segment stay exactly as before.
+   */
+  namespaces: Array<string | undefined>;
   value: string;
   /** True when the value carried markup (xhtml rich text). */
   markup: boolean;
@@ -1822,59 +1870,96 @@ function isXhtmlDocument(element: XElement): boolean {
     )
   )
     return false;
-  // (Round 13, cross-check C2) Non-whitespace text directly under
-  // the container is contradictory content, not formatting: the
-  // skeleton check above looks only at element children, but
-  // nodeText() includes direct text, so `<h:xhtml>LOOSE<h:html>
-  // <h:body>Inside</h:body></h:html></h:xhtml>` used to flatten to
-  // "LOOSEInside". Fail closed with a 422 — whole-container defeat,
-  // same granularity as the existing skeleton rule. Whitespace-only
-  // direct text is formatting and stays accepted.
-  if (element.content.some((item) => typeof item === "string" && item.trim() !== ""))
-    throw new XfaError(
-      "XFA packet has non-whitespace text directly under an XHTML skeleton element 'xhtml'; refusing to flatten it into a field value",
-    );
+  // (Round 14, A-1) RECORD-THEN-DECIDE: skeleton-level direct text
+  // is recorded during the whole-subtree walk, never thrown on sight.
+  // The round-13 code threw here, before the walk could discover an
+  // unrelated classification-defeating contradiction (a namespace
+  // mismatch, a dataGroup marking, a non-head/body child of <html>)
+  // that should defeat classification instead — the container then
+  // recurses as ordinary data and the addressed leaf still resolves
+  // (S1: LOOSE text + a <div> under <html> resolves "VALUE"). The
+  // throw fires only after the walk finishes AND the container
+  // otherwise qualifies; a defeat anywhere in the subtree means the
+  // recorded text is never thrown on. The same record-then-decide
+  // also makes the outcome independent of LIFO pop order: two sibling
+  // <html> elements, one with text and one with a dataGroup-marked
+  // body, decide the same either way, because the walk always runs
+  // to completion before anything is decided.
+  // (Round 14, A-2) The predicate is XML whitespace (space/tab/CR/LF
+  // only), never JS trim(): trim() treats U+00A0 as whitespace, so
+  // `&#160;` at a skeleton position used to pass the guard while
+  // nodeText() retained it in the value.
+  // (Round 14, A-5) The same recording covers direct text under
+  // <head> in a skeleton position (a child of <html> or <xhtml>):
+  // <head> is a skeleton element, so its direct text is outside
+  // <body> just as <html>-level text is. Direct text under <body>
+  // stays content and is never recorded.
+  let skeletonTextAt: string | undefined;
+  if (element.content.some((item) => typeof item === "string" && !isXmlWhitespace(item)))
+    skeletonTextAt = "xhtml";
+  let defeated = false;
   // Whole-subtree validation: every descendant shares the
   // container's namespace, carries no unbound prefix and no
   // dataGroup marking, and an <html> element's children are
   // <head>/<body> only. Iterative — the tree is already
   // depth-bounded by conversion, but no walk here assumes that.
-  const pending: XElement[] = [...children];
+  // Each pending entry carries its parent's local name, so the <head>
+  // text rule can tell a skeleton-position <head> (under <html> or
+  // <xhtml>) from a <head> nested inside body content, whose text is
+  // body content, not skeleton text.
+  const pending: Array<{ element: XElement; parentLocal: string }> = children.map((child) => ({
+    element: child,
+    parentLocal: "xhtml",
+  }));
   while (pending.length > 0) {
-    const descendant = pending.pop() as XElement;
-    if (descendant.nsUnbound || descendant.ns !== element.ns) return false;
-    if (dataNodeValue(descendant) === "dataGroup") return false;
+    const { element: descendant, parentLocal } = pending.pop() as {
+      element: XElement;
+      parentLocal: string;
+    };
+    if (descendant.nsUnbound || descendant.ns !== element.ns) defeated = true;
+    if (dataNodeValue(descendant) === "dataGroup") defeated = true;
     const grandChildren = elementChildren(descendant);
     if (
       descendant.local === "html" &&
       !grandChildren.every((child) => child.local === "head" || child.local === "body")
     )
-      return false;
-    // (Round 13, C2) The same rule at the document-level <html>
-    // position — and at every <html> in the subtree, at any depth:
-    // `<h:html>OUTSIDE<h:body>Inside</h:body></h:html>` used to
-    // flatten to "OUTSIDEInside". Fail closed with a 422, same as
-    // the container level; whitespace-only direct text stays
-    // accepted. (The check runs only once the <html>-child rule
-    // above has passed: an <html> whose children are not
-    // <head>/<body> is not a skeleton position at all, so it
-    // defeats classification and recurses as ordinary data instead
-    // of throwing here.)
+      defeated = true;
+    // Record, never throw mid-walk: the <html>-level text check runs
+    // at EVERY <html> in the subtree, at any depth, and the <head>
+    // check at every skeleton-position <head> — but only the final
+    // decision below may throw, once qualification is settled.
+    if (skeletonTextAt === undefined && descendant.local === "html") {
+      if (descendant.content.some((item) => typeof item === "string" && !isXmlWhitespace(item)))
+        skeletonTextAt = "html";
+    }
     if (
-      descendant.local === "html" &&
-      descendant.content.some((item) => typeof item === "string" && item.trim() !== "")
-    )
-      throw new XfaError(
-        "XFA packet has non-whitespace text directly under an XHTML skeleton element 'html'; refusing to flatten it into a field value",
-      );
+      skeletonTextAt === undefined &&
+      descendant.local === "head" &&
+      (parentLocal === "html" || parentLocal === "xhtml")
+    ) {
+      if (descendant.content.some((item) => typeof item === "string" && !isXmlWhitespace(item)))
+        skeletonTextAt = "head";
+    }
     // Append one at a time, never pending.push(...grandChildren):
     // spreading a wide child array into a call hits the engine's
     // maximum argument count (RangeError) on a legitimate shape —
     // a shallow <body> with ~190k empty children is well-formed
     // and under every packet cap, so it must succeed, not fail
     // closed on an engine limit (A-1, round 12).
-    for (const child of grandChildren) pending.push(child);
+    for (const child of grandChildren)
+      pending.push({ element: child, parentLocal: descendant.local });
   }
+  // Decide only after the whole subtree has been walked: a defeat
+  // anywhere means ordinary data (return false, no throw), and the
+  // recorded skeleton text is thrown on only when the container
+  // otherwise qualifies — whole-container defeat, same granularity
+  // as the existing skeleton rule. Whitespace-only direct text is
+  // formatting and stays accepted.
+  if (defeated) return false;
+  if (skeletonTextAt !== undefined)
+    throw new XfaError(
+      `XFA packet has non-whitespace text directly under an XHTML skeleton element '${skeletonTextAt}'; refusing to flatten it into a field value`,
+    );
   return true;
 }
 
@@ -1920,8 +2005,16 @@ function isRichTextContainer(child: XElement): boolean {
   const children = elementChildren(child);
   if (children.length !== 1 || children[0].local !== "xhtml") return false;
   if (dataNodeValue(children[0]) === "dataGroup") return false;
+  // (Round 14, A-1) The wrapper's own direct-text condition is
+  // checked BEFORE calling isXhtmlDocument(): a wrapper that already
+  // carries non-whitespace direct text is not a rich-text container,
+  // so the inner skeleton text must not throw here — the walk
+  // recurses into the wrapper as ordinary data instead (T3a). The
+  // predicate is XML whitespace (A-2, round 14), never trim().
+  if (!child.content.every((item) => typeof item !== "string" || isXmlWhitespace(item)))
+    return false;
   if (!isXhtmlDocument(children[0])) return false;
-  return child.content.every((item) => typeof item !== "string" || item.trim() === "");
+  return true;
 }
 
 /**
@@ -1963,6 +2056,7 @@ function exDataDefeated(element: XElement): boolean {
 function collectDataLeaves(
   node: XElement,
   path: string[],
+  nsPath: Array<string | undefined>,
   depth: number,
   out: DataLeaf[],
   preserve = false,
@@ -1989,7 +2083,7 @@ function collectDataLeaves(
     // is significant (the parser is configured with trimValues: false,
     // and no trimming happens here either).
     const value = node.content.filter((item): item is string => typeof item === "string").join("");
-    out.push({ segments: path, value, markup: false });
+    out.push({ segments: path, namespaces: nsPath, value, markup: false });
     return;
   }
   // Rich-text values are leaves (A-1, round 8): a node is a rich-text
@@ -2031,14 +2125,28 @@ function collectDataLeaves(
   // classification, not of the bounds: it is justified on expanded
   // names and in-scope bindings, and it cannot prove a document's
   // namespace declarations are honest (see isXhtmlDocument).
+  // (Round 14, A-1) The parent's own direct-text condition is
+  // checked BEFORE isRichTextContainer() is called: a parent that
+  // already carries non-whitespace direct text is not a rich-text
+  // leaf, so an inner skeleton text must not throw here — the walk
+  // recurses into the parent as ordinary data instead (T3b). The
+  // predicate is XML whitespace (A-2, round 14), never trim(): a
+  // parent whose only direct text is NBSP is likewise not a clean
+  // rich-text leaf, and recurses instead of flattening the NBSP
+  // into the value.
   if (
     dataNode !== "dataGroup" &&
     !exDataDefeated(node) &&
     children.length === 1 &&
-    isRichTextContainer(children[0]) &&
-    node.content.every((item) => typeof item !== "string" || item.trim() === "")
+    node.content.every((item) => typeof item !== "string" || isXmlWhitespace(item)) &&
+    isRichTextContainer(children[0])
   ) {
-    out.push({ segments: path, value: nodeText(children[0], 0, keep), markup: true });
+    out.push({
+      segments: path,
+      namespaces: nsPath,
+      value: nodeText(children[0], 0, keep),
+      markup: true,
+    });
     return;
   }
   const counts = new Map<string, number>();
@@ -2052,7 +2160,7 @@ function collectDataLeaves(
     const index = seen.get(child.local) ?? 0;
     seen.set(child.local, index + 1);
     const segment = (counts.get(child.local) ?? 1) > 1 ? `${child.local}[${index}]` : child.local;
-    collectDataLeaves(child, [...path, segment], depth + 1, out, keep);
+    collectDataLeaves(child, [...path, segment], [...nsPath, child.ns], depth + 1, out, keep);
   }
 }
 
@@ -2497,9 +2605,51 @@ function lookupSelectors(index: JoinIndex, selectors: string[], budget: JoinBudg
   return out;
 }
 
+/**
+ * (A-3, round 14) Repeat instances of one stripped path must share
+ * one expanded name at every segment position, or they are not
+ * repeats of one field — fail closed instead of reporting them as
+ * `form.person[0].code` / `[1].code`. The convertEntries sibling
+ * gate (C1, round 13) cannot cover this: the colliding leaves sit
+ * under DIFFERENT parents, so they are never siblings in one
+ * conversion list, and the stripped-path bucket in buildJoinIndex
+ * merges them by local name alone. The comparison therefore belongs
+ * HERE, at resolution time in findLeaves, where the leaves are
+ * assembled as repeat instances of one field — the only point that
+ * sees the whole candidate set together with the field that claims
+ * it. It runs for `default` and for unindexed/selector `dataRef`
+ * lookups, both of which assemble repeat instances; `global` returns
+ * a single leaf by definition, so there is nothing to compare.
+ * Boundary, stated plainly: a `[N]` selector that narrows to ONE
+ * occurrence resolves that occurrence alone — selector-addressed
+ * leaves are not assembled as repeats, so a single selected leaf in
+ * a foreign namespace is reported, not failed closed. Two leaves
+ * that share a namespace at every position (including both in no
+ * namespace) are genuine repeats and pass unchanged.
+ */
+function assertExpandedNamesAgree(field: TemplateField, matches: DataLeaf[]): void {
+  if (matches.length < 2) return;
+  const first = matches[0];
+  for (const match of matches.slice(1)) {
+    const length = Math.max(first.namespaces.length, match.namespaces.length);
+    for (let position = 0; position < length; position++) {
+      const firstNs = first.namespaces[position];
+      const matchNs = match.namespaces[position];
+      if (firstNs !== matchNs) {
+        const local = stripSegmentIndex(first.segments[position] ?? "");
+        throw new XfaError(
+          `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes in different namespaces for segment '${shortName(local)}'; refusing to report them as repeats of one field`,
+        );
+      }
+    }
+  }
+}
+
 function findLeaves(field: TemplateField, index: JoinIndex, budget: JoinBudget): DataLeaf[] {
   if (field.bind === "dataRef") {
-    return lookupSelectors(index, effectiveDataRefSegments(field), budget);
+    const matches = lookupSelectors(index, effectiveDataRefSegments(field), budget);
+    assertExpandedNamesAgree(field, matches);
+    return matches;
   }
   if (field.bind === "global") {
     const first = (index.byName.get(field.leafName) ?? [])[0];
@@ -2507,7 +2657,9 @@ function findLeaves(field: TemplateField, index: JoinIndex, budget: JoinBudget):
   }
   // default: exact scope-path match (selectors in the scope honoured).
   const selectors = [...field.scope, field.leafName];
-  return lookupSelectors(index, selectors, budget);
+  const matches = lookupSelectors(index, selectors, budget);
+  assertExpandedNamesAgree(field, matches);
+  return matches;
 }
 
 function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string): XfaField {
@@ -2970,6 +3122,6 @@ export function inspectXfa(doc: PDFDocument): {
   const leaves: DataLeaf[] = [];
   // xml:space state at the datasets roots (A-3, round 6): the walk
   // starts at <data>, but the state may be set on <datasets> above it.
-  collectDataLeaves(dataRoot, [], 0, leaves, effectiveSpace(datasetsRoot, false));
+  collectDataLeaves(dataRoot, [], [], 0, leaves, effectiveSpace(datasetsRoot, false));
   return { fields: joinFields(templateFields, leaves), formKind: xfaFormKind(doc) ?? "xfa-static" };
 }
