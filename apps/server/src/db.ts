@@ -2,7 +2,7 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
-import { backgroundFailure } from "./log.ts";
+import { reportBackgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
 
@@ -304,7 +304,7 @@ export class Store {
 /** Idle clients can be disconnected by a database restart; without a listener pg's `error` event crashes the process. */
 export function createPool(connectionString: string) {
   const pool = new pg.Pool({ connectionString, max: 5 });
-  pool.on("error", (error) => backgroundFailure("postgres pool", error));
+  pool.on("error", (error) => reportBackgroundFailure("postgres pool", error));
   return pool;
 }
 
@@ -335,15 +335,22 @@ export interface PgTransactionPool {
  * still executing server-side), and a later COMMIT on a reused
  * connection could commit it. So a rollback failure discards the
  * client through pg's error release path (release(error) destroys
- * it), reports the cleanup failure via backgroundFailure, and still
- * rethrows the ORIGINAL operation error — the rollback failure never
- * masks it. The client is released exactly once on every path: the
- * success path releases after COMMIT, the failure path releases
- * after the ROLLBACK attempt (with or without the discard error).
+ * it), reports the cleanup failure via the shared non-throwing
+ * reportBackgroundFailure, and still rethrows the ORIGINAL operation
+ * error — the rollback failure never masks it. The client is released
+ * exactly once on every path: the success path releases after COMMIT,
+ * the failure path releases after the ROLLBACK attempt (with or
+ * without the discard error). A ROLLBACK that rejects with
+ * `undefined` still counts as a failure (B-2, round 9): the failure
+ * is tracked with a separate boolean, never by comparing the caught
+ * value against `undefined`.
  * (B-1, round 8) release() and the cleanup logging are themselves
  * guarded: a throwing release or a throwing logger is reported, never
  * propagated, so cleanup can never mask the original error — or, on
  * the success path, turn a committed transaction into a thrown error.
+ * (B-1, round 9) The guard is now the shared reportBackgroundFailure
+ * in log.ts, used by the pull-level caller too — one implementation
+ * for both call sites, not a local copy here.
  */
 export function createPgDatabase(pool: PgTransactionPool): Database {
   return {
@@ -351,22 +358,16 @@ export function createPgDatabase(pool: PgTransactionPool): Database {
     transaction: async (fn) => {
       const client = await pool.connect();
       let released = false;
-      // (B-1, round 8) Cleanup must never mask the operation error:
+      // (B-1, round 9) Cleanup must never mask the operation error:
       // client.release() itself can throw, and so can the cleanup
       // logging (backgroundFailure) — either would otherwise replace
       // the original error with a cleanup failure, or, on the success
       // path, turn a committed transaction into a thrown error. Every
-      // cleanup step is therefore guarded: a cleanup failure is
-      // reported via backgroundFailure and the transaction's own
-      // outcome stands.
-      const reportCleanupFailure = (phase: string, failure: unknown): void => {
-        try {
-          backgroundFailure(phase, failure);
-        } catch {
-          // Logging must never mask the operation error either; a
-          // logging failure is unreportable by definition.
-        }
-      };
+      // cleanup failure is therefore reported through the shared
+      // non-throwing wrapper reportBackgroundFailure (log.ts), which
+      // the pull-level caller in files.ts uses too — the local
+      // reportCleanupFailure from round 8 is replaced by it, so the
+      // guarantee is one implementation, not two.
       const release = (error?: Error): void => {
         if (released) return;
         released = true;
@@ -374,7 +375,7 @@ export function createPgDatabase(pool: PgTransactionPool): Database {
           if (error !== undefined) client.release(error);
           else client.release();
         } catch (releaseFailure) {
-          reportCleanupFailure("postgres release failed", releaseFailure);
+          reportBackgroundFailure("postgres release failed", releaseFailure);
         }
       };
       try {
@@ -393,14 +394,22 @@ export function createPgDatabase(pool: PgTransactionPool): Database {
         release();
         return result;
       } catch (error) {
+        // (B-2, round 9) Rollback failure is tracked with a separate
+        // boolean: a query rejecting with `undefined` must still count
+        // as a rollback failure — the old `rollbackError !== undefined`
+        // check read it as success and returned the client to the pool
+        // instead of discarding it. `rollbackError` itself is still
+        // kept for the report and for the discard error's cause.
+        let rollbackFailed = false;
         let rollbackError: unknown;
         try {
           await client.query("ROLLBACK");
         } catch (rollbackFailure) {
+          rollbackFailed = true;
           rollbackError = rollbackFailure;
         }
-        if (rollbackError !== undefined) {
-          reportCleanupFailure("postgres rollback failed", rollbackError);
+        if (rollbackFailed) {
+          reportBackgroundFailure("postgres rollback failed", rollbackError);
           release(
             rollbackError instanceof Error
               ? rollbackError

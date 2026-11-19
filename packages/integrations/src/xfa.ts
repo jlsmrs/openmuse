@@ -576,55 +576,269 @@ function isIllegalXmlChar(codePoint: number): boolean {
 }
 
 /**
- * Reject illegal XML 1.0 characters in a packet's raw text, before
- * parsing (A-2, round 8). Literal NUL bytes — and every other illegal
- * character — survive fast-xml-parser into values and labels, where
- * they collide with the NUL-delimited placeholders
- * normalizePreserving() uses: a literal "\u00000\u0000" run in a
- * caption was restored as placeholder index 0, silently corrupting
- * the label. The round-7 comment claimed NUL "cannot occur in XML
- * 1.0 text"; that is true of valid XML 1.0, but this parser does not
- * enforce it, so the check is enforced here, explicitly, on every
- * packet: any literal illegal character, and any numeric character
- * reference (&#0; / &#x0; / ...) naming one, fails closed with a 422
- * naming the code point — never the surrounding content. The
- * reference scan skips CDATA sections and comments, where a
- * reference is literal text, not a character reference (a literal
- * NUL is illegal there too, so the literal scan does not skip them);
- * the strip runs only when the text contains a reference at all.
- * No regex literal carries a control character (the linter forbids
- * it): the literal scan is a codePointAt loop and the reference
- * pattern contains no control characters.
+ * The XHTML namespace URI, as a string the tree can state it: the
+ * parser does not resolve namespace URIs, but it preserves the
+ * `xmlns` attribute string, so the rich-text classifier compares
+ * that string against this value (A-1, round 9).
  */
-function assertValidXmlChars(packetName: string, text: string): void {
-  // Walk by code point, not by code unit: a legal astral character
-  // (e.g. 😀, U+1F600) is a surrogate pair, and its halves must not
-  // be mistaken for lone surrogates. codePointAt returns the full
-  // astral value for a valid pair and the lone surrogate value for
-  // an unpaired one — the latter is illegal and is rejected.
-  for (let i = 0; i < text.length; ) {
+const XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
+
+/** The text a single-pass XML scan returns, with its work accounted. */
+interface XmlScanResult {
+  /** Input text with legal numeric character references decoded (A-2, round 9). */
+  text: string;
+  /**
+   * Input characters the scan examined (each input character at most
+   * twice: once in the main loop, once more when a failed reference
+   * attempt re-walks its digits as plain text). Delimiter lookahead
+   * is a bounded (at most 9-character) compare per position, so total
+   * work is O(steps) — the adversarial scanner test asserts a linear
+   * step budget on the repeated-opener shape (A-3, round 9).
+   */
+  steps: number;
+}
+
+/**
+ * Validate and decode one XFA packet's raw text in a SINGLE forward
+ * pass (A-2/A-3/A-4, round 9). This replaces the round-8
+ * `assertValidXmlChars`, whose two regex strips
+ * (`/<![CDATA[[\s\S]*?]]>/` and `/<!--[\s\S]*?-->/`) rescanned the
+ * remaining suffix from every candidate opener — quadratic work on a
+ * comment holding repeated `<![CDATA[` openers with no terminator
+ * (Y4: n=2000 → 11 ms, n=8000 → 125 ms, under the 200,000-`<` gate)
+ * — and whose reference scan was neither context-correct nor
+ * complete: it matched a CDATA opener inside one comment to a
+ * terminator inside another, deleting a real `&#0;` from the scanned
+ * text (Y5 bypass); it rejected reference-like text inside a
+ * processing instruction, which is literal data (Y6 over-rejection);
+ * and it skipped overflowing references, because
+ * `Number.parseInt` yields `Infinity` and `Number.isInteger` is
+ * false (Y7 missed rejection).
+ *
+ * The scan tracks lexical state — element content, inside a tag
+ * (with its attribute-value quote state), comment, CDATA section,
+ * or processing instruction — and visits each character once:
+ * - a literal character illegal in XML 1.0 fails closed naming the
+ *   code point, in EVERY state (a literal NUL is illegal inside
+ *   CDATA and comments too);
+ * - a numeric character reference is recognised ONLY in element
+ *   content and in attribute values, where a reference is real.
+ *   Inside comments, CDATA, and PIs the same spelling is literal
+ *   text: it is neither validated nor decoded. The reference digits
+ *   accumulate with saturation — exact while they fit in a safe
+ *   integer, so a merely out-of-range reference still names its
+ *   code point, and a digit run past that saturates instead of
+ *   parsing to Infinity and skipping the rejection (Y7) — and
+ *   leading zeros stay legal (`&#x00;` is still caught, `&#00065;`
+ *   still decodes to `A`);
+ * - a legal reference DECODES to its character (A-2, round 9):
+ *   this parser version decodes named entities but leaves numeric
+ *   references literal, so `&#65;` used to be reported as the wrong
+ *   value `"&#65;"`. Decoding happens here, on the raw text before
+ *   parsing, because after parsing the distinction is unrecoverable:
+ *   `&#65;` and `&amp;#65;` both arrive as the parsed text `"&#65;"`,
+ *   while only the first is a reference — the second must stay
+ *   literal `"&#65;"`, and CDATA text must stay literal too (the
+ *   existing `form.cdata = "A&#0;B"` expectation survives: CDATA is
+ *   skipped by this scan, so its text reaches the parser untouched).
+ *   A decoded `<`, `>`, `&`, or quote is re-emitted as its named
+ *   entity (`&#60;` → `&lt;`), so a decoded character can never
+ *   become markup or break attribute quoting; every other decoded
+ *   character is emitted raw. Two corners are inherent to decoding
+ *   before this parser and are accepted, not hidden: a decoded CR
+ *   (`&#13;`) reaches the parser as a raw CR, which its line-ending
+ *   normalization turns into LF (verified: the parser preserves a
+ *   raw tab/LF in attribute values but normalizes CR to LF
+ *   everywhere), so `&#13;` reports as LF, not CR; and decoded output
+ *   is bounded by the input — each reference (at least 4 input
+ *   characters) yields at most one character, or a 6-character
+ *   entity for the five escaped results — so decoding cannot grow
+ *   the text beyond a small constant factor of its size.
+ * Illegal/overflowing references already fail here, BEFORE parsing,
+ * so no decoded NUL can occur and the NUL-placeholder invariant in
+ * caption normalization survives decoding.
+ */
+function scanXmlText(packetName: string, text: string): XmlScanResult {
+  const out: string[] = [];
+  let segmentStart = 0;
+  let steps = 0;
+  let i = 0;
+  type LexicalState = "content" | "tag" | "comment" | "cdata" | "pi";
+  let state: LexicalState = "content";
+  let quote: string | null = null;
+
+  const illegalCharError = (codePoint: number): XfaError =>
+    new XfaError(
+      `XFA packet '${shortName(packetName)}' contains character U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
+    );
+  const illegalRefError = (ref: string, codePoint: number): XfaError =>
+    new XfaError(
+      `XFA packet '${shortName(packetName)}' contains character reference '${shortName(ref)}' naming U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
+    );
+  const overflowRefError = (): XfaError =>
+    new XfaError(
+      `XFA packet '${shortName(packetName)}' contains a numeric character reference naming a code point above U+10FFFF, which is not valid in XML 1.0`,
+    );
+  /** A decoded character, re-emitted so it can never become markup. */
+  const emitDecoded = (codePoint: number): string => {
+    switch (codePoint) {
+      case 0x3c:
+        return "&lt;";
+      case 0x3e:
+        return "&gt;";
+      case 0x26:
+        return "&amp;";
+      case 0x22:
+        return "&quot;";
+      case 0x27:
+        return "&apos;";
+      default:
+        return String.fromCodePoint(codePoint);
+    }
+  };
+  /**
+   * Try to read a numeric character reference at `i` (`text[i]` is
+   * `&`, `text[i + 1]` is `#`). Returns the index just past the
+   * reference when one is present — having validated and decoded it
+   * into the output — or null when the text here is not a complete
+   * reference, in which case nothing is consumed and the caller
+   * re-walks the characters as plain text (at most one extra visit
+   * per character). Throws on an illegal or overflowing reference.
+   */
+  const tryReference = (at: number): number | null => {
+    let j = at + 2;
+    let hex = false;
+    if (text[j] === "x") {
+      hex = true;
+      j++;
+    }
+    const base = hex ? 16 : 10;
+    const digitValue = (character: string): number => {
+      if (character >= "0" && character <= "9") return character.charCodeAt(0) - 0x30;
+      if (hex && character >= "a" && character <= "f") return character.charCodeAt(0) - 0x61 + 10;
+      if (hex && character >= "A" && character <= "F") return character.charCodeAt(0) - 0x41 + 10;
+      return -1;
+    };
+    let value = 0;
+    let digits = 0;
+    let overflow = false;
+    while (j < text.length) {
+      const digit = digitValue(text[j]);
+      if (digit < 0) break;
+      steps++;
+      if (!overflow) {
+        value = value * base + digit;
+        // Saturating accumulation: the value stays exact while it
+        // fits in a safe integer — so a merely out-of-range reference
+        // (&#x110000;) still names its exact code point — and a digit
+        // run past that saturates instead of parsing to Infinity and
+        // skipping the rejection (Y7). Digits keep being consumed so
+        // the scan stays a single forward pass.
+        if (value > Number.MAX_SAFE_INTEGER) {
+          overflow = true;
+          value = Number.POSITIVE_INFINITY;
+        }
+      }
+      j++;
+      digits++;
+    }
+    if (digits === 0 || text[j] !== ";") return null;
+    if (overflow) throw overflowRefError();
+    const ref = text.slice(at, j + 1);
+    if (isIllegalXmlChar(value)) throw illegalRefError(ref, value);
+    out.push(text.slice(segmentStart, at));
+    out.push(emitDecoded(value));
+    segmentStart = j + 1;
+    return j + 1;
+  };
+
+  while (i < text.length) {
     const codePoint = text.codePointAt(i) ?? 0;
-    if (isIllegalXmlChar(codePoint))
-      throw new XfaError(
-        `XFA packet '${shortName(packetName)}' contains character U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
-      );
-    i += codePoint > 0xffff ? 2 : 1;
+    if (isIllegalXmlChar(codePoint)) throw illegalCharError(codePoint);
+    const astral = codePoint > 0xffff;
+    // An astral character is never structural: validate it as one
+    // code point, count both code units as examined, move past both.
+    if (astral) {
+      steps += 2;
+      i += 2;
+      continue;
+    }
+    steps++;
+    const character = text[i];
+    if (state === "content") {
+      if (character === "<") {
+        if (text.startsWith("<!--", i)) {
+          state = "comment";
+          i += 4;
+        } else if (text.startsWith("<![CDATA[", i)) {
+          state = "cdata";
+          i += 9;
+        } else if (text.startsWith("<?", i)) {
+          state = "pi";
+          i += 2;
+        } else {
+          state = "tag";
+          quote = null;
+          i++;
+        }
+      } else if (character === "&" && text[i + 1] === "#") {
+        const after = tryReference(i);
+        i = after ?? i + 1;
+      } else {
+        i++;
+      }
+    } else if (state === "tag") {
+      if (quote !== null) {
+        if (character === quote) {
+          quote = null;
+        } else if (character === "&" && text[i + 1] === "#") {
+          const after = tryReference(i);
+          i = after ?? i + 1;
+          continue;
+        }
+        i++;
+      } else if (character === '"' || character === "'") {
+        quote = character;
+        i++;
+      } else if (character === ">") {
+        state = "content";
+        i++;
+      } else {
+        i++;
+      }
+    } else if (state === "comment") {
+      if (text.startsWith("-->", i)) {
+        state = "content";
+        i += 3;
+      } else {
+        i++;
+      }
+    } else if (state === "cdata") {
+      if (text.startsWith("]]>", i)) {
+        state = "content";
+        i += 3;
+      } else {
+        i++;
+      }
+    } else if (text.startsWith("?>", i)) {
+      state = "content";
+      i += 2;
+    } else {
+      i++;
+    }
   }
-  if (!text.includes("&#")) return;
-  const withoutLiteral = text
-    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, "")
-    .replace(/<!--[\s\S]*?-->/g, "");
-  for (const ref of withoutLiteral.matchAll(/&#[0-9]+;|&#x[0-9a-fA-F]+;/g)) {
-    const digits = ref[0].slice(2, -1);
-    const codePoint =
-      digits.startsWith("x") || digits.startsWith("X")
-        ? Number.parseInt(digits.slice(1), 16)
-        : Number.parseInt(digits, 10);
-    if (Number.isInteger(codePoint) && isIllegalXmlChar(codePoint))
-      throw new XfaError(
-        `XFA packet '${shortName(packetName)}' contains character reference '${shortName(ref[0])}' naming U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}, which is not valid in XML 1.0`,
-      );
-  }
+  out.push(text.slice(segmentStart));
+  return { text: out.join(""), steps };
+}
+
+/**
+ * Test hook for the scanner's work bound (A-3, round 9): the number
+ * of input characters one scan of `text` examines. The adversarial
+ * scanner test asserts a linear budget on the repeated-opener shape
+ * against this count — never a wall-clock threshold.
+ */
+export function countXmlScanSteps(text: string): number {
+  return scanXmlText("test", text).steps;
 }
 
 /**
@@ -654,10 +868,13 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
   // fast-xml-parser's parse step alone does not reject every malformed
   // document (a template missing only its final closing tag parses), so
   // validate well-formedness explicitly first, on every packet.
-  // Character validity is checked before that (A-2, round 8): the
-  // validator and parser both let literal NUL bytes through, so an
-  // explicit check on the raw text is the only gate.
-  assertValidXmlChars(packetName, text);
+  // Character validity is checked before that (A-2, round 8; single
+  // forward scan + numeric-reference decoding, round 9): the validator
+  // and parser both let literal NUL bytes through, so an explicit
+  // check on the raw text is the only gate — and the decoded text is
+  // what is validated and parsed, so a legal numeric reference
+  // reports its character, not its spelling.
+  text = scanXmlText(packetName, text).text;
   const validation = XMLValidator.validate(text);
   if (validation !== true)
     throw new XfaError(
@@ -1222,39 +1439,86 @@ function strippedSegments(segments: string[]): string[] {
  * arbitrary data. An ordinary dataset element that happens to be
  * named `xhtml` holds data children, not an XHTML skeleton, so the
  * skeleton is what distinguishes rich text from a same-named data
- * element. The parser does not resolve namespace URIs, so
- * classification rests on this supported structural shape, not on
- * the name alone and not on a namespace check the tree cannot make.
+ * element. (A-1, round 9) Namespace is the second distinguishing
+ * evidence, stated in the terms the tree can state it: the parser
+ * does not resolve namespace URIs, but it preserves the `xmlns`
+ * attribute string, so the <xhtml> element's own default-namespace
+ * declaration — when present — must be the XHTML namespace. A
+ * company or other non-XHTML namespace on the container means the
+ * element is data in that namespace, not an XHTML document, however
+ * skeleton-shaped its children are. Absent `xmlns` stays as before:
+ * legitimate rich text in the wild carries either no declaration
+ * (the round-8 X4 shape) or the XHTML namespace.
  */
 const XHTML_SKELETON = new Set(["html", "head", "body"]);
 
 /** True when `element` is an <xhtml> holding an XHTML document skeleton. */
 function isXhtmlDocument(element: XElement): boolean {
+  const xmlns = attr(element, "xmlns");
+  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return false;
   const children = elementChildren(element);
   return children.length > 0 && children.every((child) => XHTML_SKELETON.has(child.local));
 }
 
 /**
- * Is `child` a supported rich-text container (A-1, round 8)? Either a
- * bare <xhtml> holding an XHTML document skeleton, or an <exData>
- * whose whole content is exactly one such <xhtml> (whitespace-only
- * direct text besides). Anything else named `exData` or `xhtml` — a
- * text-only <exData>, an <exData> wrapping non-XHTML content, an
- * <xhtml> holding data children — is an ordinary dataset element, not
- * a rich-text container, and must not change its parent's
- * classification. The contentType attribute is not consulted: the
- * structural shape (a single <xhtml> child holding an XHTML
- * skeleton) is what the classifier establishes, and consulting it
- * would classify the same <exData> differently at the parent level
- * than at its own level, where the <xhtml> rule already applies.
+ * Is `child` a supported rich-text container (A-1, round 8; namespace
+ * and data-group evidence, round 9)? Either a bare <xhtml> holding an
+ * XHTML document skeleton, or an <exData> whose whole content is
+ * exactly one such <xhtml> (whitespace-only direct text besides).
+ * Anything else named `exData` or `xhtml` — a text-only <exData>, an
+ * <exData> wrapping non-XHTML content, an <xhtml> holding data
+ * children — is an ordinary dataset element, not a rich-text
+ * container, and must not change its parent's classification. The
+ * container child's own declarations defeat the classification, not
+ * just the parent's (Y1, round 9): a container marked
+ * `xfa:dataNode="dataGroup"` is a data group, and a container whose
+ * default namespace is not the XHTML namespace is data in that
+ * namespace — either way its children stay ordinary data. `contentType`
+ * is supporting evidence only: it cannot establish rich text on its
+ * own — namespace, data-group marking, and structure do that — but a
+ * declared non-HTML content type (`text/plain` wrapping an XHTML
+ * skeleton) contradicts an HTML document, so it defeats the
+ * classification; absent `contentType` stays as before. These
+ * checks guard the PARENT's flattening; the matching node-side guard
+ * is `exDataDefeated()`, consulted by collectDataLeaves when the walk
+ * stands ON the wrapper — without it, recursing past a defeated
+ * wrapper would let its bare <xhtml> child classify the wrapper as
+ * a rich-text leaf anyway.
  */
 function isRichTextContainer(child: XElement): boolean {
+  if (attr(child, "xfa:dataNode") === "dataGroup") return false;
   if (child.local === "xhtml") return isXhtmlDocument(child);
   if (child.local !== "exData") return false;
+  const contentType = attr(child, "contentType");
+  if (contentType !== undefined && contentType.trim().toLowerCase() !== "text/html") return false;
+  const xmlns = attr(child, "xmlns");
+  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return false;
   const children = elementChildren(child);
   if (children.length !== 1 || children[0].local !== "xhtml") return false;
+  if (attr(children[0], "xfa:dataNode") === "dataGroup") return false;
   if (!isXhtmlDocument(children[0])) return false;
   return child.content.every((item) => typeof item !== "string" || item.trim() === "");
+}
+
+/**
+ * Does an <exData> element itself carry a declaration that defeats
+ * rich-text classification for the leaf IT would be (A-1, round 9)?
+ * The wrapper's declared default namespace and content type govern
+ * its whole content: a company-namespaced or `text/plain` wrapper
+ * holds data, not an HTML document — so when the walk stands on the
+ * wrapper, its bare <xhtml> child must not classify the wrapper as
+ * a rich-text leaf. (The parent-side counterpart lives in
+ * isRichTextContainer, which stops the PARENT from flattening; this
+ * one stops the wrapper itself. A dataGroup marking needs no check
+ * here: collectDataLeaves already defeats the node on its own
+ * `xfa:dataNode`, and an empty dataGroup returns before this point.)
+ */
+function exDataDefeated(element: XElement): boolean {
+  if (element.local !== "exData") return false;
+  const xmlns = attr(element, "xmlns");
+  if (xmlns !== undefined && xmlns !== XHTML_NAMESPACE) return true;
+  const contentType = attr(element, "contentType");
+  return contentType !== undefined && contentType.trim().toLowerCase() !== "text/html";
 }
 
 /**
@@ -1279,6 +1543,14 @@ function collectDataLeaves(
   // flattening below it.
   const keep = effectiveSpace(node, preserve);
   const children = elementChildren(node);
+  // Group classification runs BEFORE the empty-leaf branch (A-1,
+  // round 9): an empty element the dataset marks a data group is a
+  // group with no members, not a scalar leaf with value "" (Y2) —
+  // the round-8 order emitted the scalar first and never reached
+  // any dataGroup check. A marked group WITH children still recurses
+  // below, so its children stay addressable.
+  const dataNode = attr(node, "xfa:dataNode");
+  if (dataNode === "dataGroup" && children.length === 0) return;
   if (children.length === 0) {
     // A leaf's value is its direct text, verbatim: dataset whitespace
     // is significant (the parser is configured with trimValues: false,
@@ -1293,24 +1565,36 @@ function collectDataLeaves(
   // skeleton, or an <exData> wrapping exactly one such <xhtml> — with
   // no other element children and no non-whitespace direct text, and
   // never when the dataset explicitly marks the node a data group
-  // (xfa:dataNode="dataGroup"). Anything else named `exData` or
-  // `xhtml` is an ordinary dataset element: the walk recurses into it
-  // like any other element, so its children stay addressable
-  // (form.note.exData, form.note.other) and a field bound to the
-  // group itself has no data node and fails closed — instead of the
-  // old behaviour, which flattened the whole parent (siblings and
-  // all) into one fabricated scalar. The flattened value comes from
-  // the container child, not the parent, so a same-line space beside
-  // the container cannot leak into the value. The flattened value
-  // keeps the text in document order (no whitespace normalisation);
-  // block boundaries carry no separator. Resource bounds do not cover
-  // semantic classification (R-7, round 8): this rule IS the
-  // classification, and the bounds only cap the work and output
-  // around whatever it produces — a misclassified leaf fits every
-  // byte bound, so no bound may be claimed to establish it.
-  const dataNode = attr(node, "xfa:dataNode");
+  // (xfa:dataNode="dataGroup"). (A-1, round 9) The container child's
+  // own declarations are consulted too, inside
+  // isRichTextContainer(): a container marked dataGroup, or carrying
+  // a non-XHTML default namespace, is ordinary data, not rich text —
+  // the round-8 check read only the parent's marking, so a
+  // dataGroup-marked, company-namespaced <xhtml> child still
+  // flattened its parent into a fabricated scalar (Y1). The node's
+  // OWN wrapper declarations are consulted as well, via
+  // exDataDefeated() in the condition below: a wrapper that declares
+  // a non-XHTML namespace or a non-HTML contentType governs its whole
+  // content, so recursing past it must not let its bare <xhtml> child
+  // classify the wrapper as a leaf anyway. Anything else
+  // named `exData` or `xhtml` is an ordinary dataset element: the
+  // walk recurses into it like any other element, so its children
+  // stay addressable (form.note.exData, form.note.other) and a field
+  // bound to the group itself has no data node and fails closed —
+  // instead of the old behaviour, which flattened the whole parent
+  // (siblings and all) into one fabricated scalar. The flattened
+  // value comes from the container child, not the parent, so a
+  // same-line space beside the container cannot leak into the value.
+  // The flattened value keeps the text in document order (no
+  // whitespace normalisation); block boundaries carry no separator.
+  // Resource bounds do not cover semantic classification (R-7,
+  // round 8): this rule IS the classification, and the bounds only
+  // cap the work and output around whatever it produces — a
+  // misclassified leaf fits every byte bound, so no bound may be
+  // claimed to establish it.
   if (
     dataNode !== "dataGroup" &&
+    !exDataDefeated(node) &&
     children.length === 1 &&
     isRichTextContainer(children[0]) &&
     node.content.every((item) => typeof item !== "string" || item.trim() === "")
@@ -1524,22 +1808,41 @@ function matchesSelectors(
  * normalize only their default segments, keeping a preserved
  * descendant's whitespace verbatim, and an unnamed option field's
  * own effective state governs its items.
- * No single bound retires the others, and no coverage is claimed
- * beyond them: the depth gate still runs after dependency parsing;
- * the byte budgets bound work done inside this module, not the
- * parser's internal work on up to 10 MiB of XML; the per-packet size
- * check runs after decoding (the decode budget is external); and the
- * duplicate-work charge is a conservative over-approximation of the
- * comparison work (1× retained size per merge), with the 64 MiB cap
- * a calibration, not a proven-tight limit. Semantic classification
- * is outside what any resource bound can establish (R-7, round 8):
- * the bounds cap work and output size around whatever the dataset
- * classification produces, but they cannot prove the classification
- * itself is right — a misclassified leaf (a data group flattened
- * into a scalar, A-1 round 8) fits every byte bound. Do not claim
- * the bounds cover classification; the classifier in
+ * (g) pre-parse work is bounded by construction, not by wall-clock
+ * guesswork (A-3/A-4, round 9): character validity and numeric
+ * character-reference decoding run as ONE forward lexical scan over
+ * the packet text — comments, CDATA sections, and processing
+ * instructions are recognised in context and skipped as literal
+ * text, so no delimiter confusion can hide a reference or invent
+ * one, and no suffix is ever rescanned. The scan examines each
+ * input character at most twice (counted as steps, asserted
+ * linearly by test), so its work is O(n) in the packet size, which
+ * is itself capped at 10 MiB per packet. Numeric decoding is
+ * bounded the same way: each reference yields at most one
+ * character, or a 6-character named entity for the five results
+ * that must not become markup (`<`, `>`, `&`, `"`, `'`), so the
+ * decoded text is at most a small constant factor of the input.
+ * What this still does NOT cover — restated plainly (R-7, round 9):
+ * semantic classification is outside what any resource bound can
+ * establish (round 8, unchanged): the bounds cap work and output
+ * size around whatever the dataset classification produces, but
+ * they cannot prove the classification itself is right — a
+ * misclassified leaf (a data group flattened into a scalar, A-1
+ * round 8) fits every byte bound. The classifier in
  * collectDataLeaves is the classification, and it is justified on
- * its own structural terms.
+ * its own structural, namespace, and data-group terms — namespace
+ * evidence is only what the tree can state (the `xmlns` attribute
+ * string and qualified names; the parser does not resolve
+ * namespace URIs, so an inherited namespace the container does not
+ * itself declare is not visible to it), and a decoded `&#13;` (CR)
+ * reports as LF because the parser normalizes line endings on
+ * input. The per-packet size check still runs after decoding (the
+ * decode budget is external), the duplicate-work charge is still a
+ * conservative over-approximation, and the bounds say nothing about
+ * the parser's own internal work on up to 10 MiB of XML — only
+ * that the work THIS module adds around it is bounded as stated.
+ * No single bound retires the others, and no coverage is claimed
+ * beyond them: the depth gate still runs after dependency parsing.
  */
 interface PathBucket {
   leaves: DataLeaf[];

@@ -9,7 +9,7 @@ import { isIndeterminateCommit, type Store } from "./db.ts";
 import { isExtractableDocumentMime } from "./engine/document-text.ts";
 import { isConvertibleImageMime, isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
-import { backgroundFailure } from "./log.ts";
+import { reportBackgroundFailure } from "./log.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -571,10 +571,13 @@ export class Files {
     } catch (error) {
       if (!workCompleted && !isIndeterminateCommit(error)) {
         await rm(path, { force: true }).catch((removeError: unknown) =>
-          backgroundFailure("file pull cleanup", removeError),
+          reportBackgroundFailure("file pull cleanup", removeError),
         );
       } else {
-        backgroundFailure("file pull indeterminate commit — bytes retained", error);
+        // (B-1, round 9) The log call is the shared non-throwing
+        // wrapper: a throwing logger must never replace the original
+        // transaction error the `throw error` below rethrows.
+        reportBackgroundFailure("file pull indeterminate commit — bytes retained", error);
       }
       throw error;
     }
