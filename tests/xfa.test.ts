@@ -4254,11 +4254,14 @@ test("A-2 (round 11): contradictory descendants deeper than the skeleton still d
 });
 
 test("A-3 (round 11): the full malformed-entity matrix fails closed in both lexical contexts", async () => {
-  // Round 10 pinned Z3/Z3b/Z3c in element content only. The scanner
-  // must reject every malformed form in BOTH places a reference can
-  // occur — element content and a quoted attribute value — and the
-  // legal forms must still decode in both. Each malformed spelling
-  // is tried in a <note> value and in a field's name attribute.
+  // Round 10 pinned Z3/Z3b in element content and Z3c in a quoted
+  // attribute value (the attrBytes case in that test — a field's
+  // name attribute carrying a split entity). Round 11 extends that
+  // to the full matrix in both contexts: the scanner must reject
+  // every malformed form in BOTH places a reference can occur —
+  // element content and a quoted attribute value — and the legal
+  // forms must still decode in both. Each malformed spelling is
+  // tried in a <note> value and in a field's name attribute.
   const malformed = [
     "&#X41;", // uppercase X
     "&#;", // empty reference
@@ -4359,10 +4362,14 @@ test("Test adequacy (round 12): named entities decode in attribute values", asyn
   // Round 11's entity matrix had a numeric-entity attribute control
   // (a&#65;b → aAb) and numeric/named entities in content, but no
   // named-entity ATTRIBUTE control. A named entity in a field's
-  // name attribute decodes exactly like a numeric one: &amp; → &,
-  // &apos; → ', &quot; → ". (A decoded & or quote is re-emitted as
-  // its named entity before parsing, so it can never become markup
-  // or break attribute quoting.)
+  // name attribute is validated by scanXmlText() and left with its
+  // spelling intact for the parser to decode — it does NOT go
+  // through the decode/re-emit path: only a NUMERIC reference is
+  // decoded by the scanner, and a decoded & or quote from that path
+  // is re-emitted as its named entity before parsing, so it can
+  // never become markup or break attribute quoting. (Round 13
+  // correction of this comment's parenthetical, which used to imply
+  // the re-emit applied to named entities too.)
   const bytes = await createXfaPdf(
     wrap(
       '<field name="a&amp;b"><ui><textEdit/></ui><bind match="none"/></field>' +

@@ -424,7 +424,18 @@ function convertEntry(
  * names normalize to the same local name (e.g. `<a:code>` and
  * `<b:code>`) — fails closed instead of silently overwriting, because
  * the discarded node would be invisible to repeat handling and to the
- * public-name collision check.
+ * public-name collision check. (Round 13, cross-check C1) The gate
+ * compares RESOLVED namespace identity, not just the written
+ * spelling: two siblings with the same local name are repeats of one
+ * field only when they share the same expanded name — the same
+ * written qualified name AND the same resolved namespace URI. A
+ * prefix rebound between siblings (`<p:code xmlns:p="urn:first">` +
+ * `<p:code xmlns:p="urn:second">`) used to pass as repeats and report
+ * as form.code[0]/[1] — two DIFFERENT expanded names,
+ * indistinguishable from genuine same-namespace repeats — so a
+ * different resolved namespace fails closed here too. `ns` is
+ * undefined for an element in no namespace; two such siblings are
+ * genuine repeats.
  */
 function convertEntries(
   entries: unknown[],
@@ -440,15 +451,19 @@ function convertEntries(
     const converted = convertEntry(entry, packetName, depth, bindings, budget);
     if (converted !== null) out.push(converted);
   }
-  const seen = new Map<string, string>();
+  const seen = new Map<string, { name: string; ns: string | undefined }>();
   for (const item of out) {
     if (typeof item === "string") continue;
     const previous = seen.get(item.local);
-    if (previous !== undefined && previous !== item.name)
+    if (previous !== undefined && previous.name !== item.name)
       throw new XfaError(
-        `XFA ${shortName(packetName)} packet has a namespace collision on element '${shortName(item.local)}': '${shortName(previous)}' and '${shortName(item.name)}' normalize to the same name`,
+        `XFA ${shortName(packetName)} packet has a namespace collision on element '${shortName(item.local)}': '${shortName(previous.name)}' and '${shortName(item.name)}' normalize to the same name`,
       );
-    seen.set(item.local, item.name);
+    if (previous !== undefined && previous.ns !== item.ns)
+      throw new XfaError(
+        `XFA ${shortName(packetName)} packet has a namespace collision on element '${shortName(item.local)}': '${shortName(item.name)}' is bound to ${previous.ns === undefined ? "no namespace" : `'${shortName(previous.ns)}'`} and to ${item.ns === undefined ? "no namespace" : `'${shortName(item.ns)}'`} — the same spelling in different namespaces is not two occurrences of one field`,
+      );
+    seen.set(item.local, { name: item.name, ns: item.ns });
   }
   return out;
 }
@@ -1132,8 +1147,21 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
     throw new XfaError(
       `XFA packet '${shortName(packetName)}' contains a DOCTYPE declaration, which is not allowed`,
     );
-  if ((text.match(/</g) ?? []).length > MAX_XFA_TAGS)
-    throw new XfaError(`XFA packet '${shortName(packetName)}' has too many XML nodes`);
+  // Count `<` with an early exit instead of materializing the full
+  // match array (round 13): text.match(/</g) built a ~10M-element
+  // array (~80 MB) for a 10 MiB packet of `<` before the cap check
+  // could reject it — bounded by the packet cap, but not by
+  // construction. The indexOf loop below adds O(n) time and O(1)
+  // space and stops at 200,001, so the gate itself never allocates
+  // in proportion to the input.
+  let tagCount = 0;
+  let at = text.indexOf("<");
+  while (at !== -1) {
+    tagCount++;
+    if (tagCount > MAX_XFA_TAGS)
+      throw new XfaError(`XFA packet '${shortName(packetName)}' has too many XML nodes`);
+    at = text.indexOf("<", at + 1);
+  }
   // fast-xml-parser's parse step alone does not reject every malformed
   // document (a template missing only its final closing tag parses), so
   // validate well-formedness explicitly first, on every packet.
@@ -1768,11 +1796,18 @@ const XHTML_SKELETON = new Set(["html", "head", "body"]);
  * into the subtree as ordinary data, so the children stay
  * addressable. The <html> level is skeleton-shaped too: its element
  * children must be <head>/<body> only. Below head/body the content
- * is arbitrary XHTML markup (<p>, <b>, <span>, …), so only the
- * namespace and group-marking checks apply there — no element-name
- * restriction. The container's own dataGroup marking defeats it as
- * well (the callers check it too; this is the same rule applied at
- * the element itself).
+ * is arbitrary XHTML markup (<p>, <b>, <span>, …) — with ONE
+ * exception: the <html>-child rule applies at EVERY depth,
+ * including below <body>, so a nested <html> anywhere in the
+ * subtree must still have <head>/<body> children only; apart from
+ * that rule, only the namespace and group-marking checks apply
+ * below head/body — no other element-name restriction. (Round 13
+ * correction of this comment: it used to say markup below
+ * <head>/<body> was unrestricted apart from namespace/group
+ * markings, which understated the <html>-child rule.) The
+ * container's own dataGroup marking defeats it as well (the callers
+ * check it too; this is the same rule applied at the element
+ * itself).
  */
 function isXhtmlDocument(element: XElement): boolean {
   if (element.local !== "xhtml") return false;
@@ -1787,6 +1822,18 @@ function isXhtmlDocument(element: XElement): boolean {
     )
   )
     return false;
+  // (Round 13, cross-check C2) Non-whitespace text directly under
+  // the container is contradictory content, not formatting: the
+  // skeleton check above looks only at element children, but
+  // nodeText() includes direct text, so `<h:xhtml>LOOSE<h:html>
+  // <h:body>Inside</h:body></h:html></h:xhtml>` used to flatten to
+  // "LOOSEInside". Fail closed with a 422 — whole-container defeat,
+  // same granularity as the existing skeleton rule. Whitespace-only
+  // direct text is formatting and stays accepted.
+  if (element.content.some((item) => typeof item === "string" && item.trim() !== ""))
+    throw new XfaError(
+      "XFA packet has non-whitespace text directly under an XHTML skeleton element 'xhtml'; refusing to flatten it into a field value",
+    );
   // Whole-subtree validation: every descendant shares the
   // container's namespace, carries no unbound prefix and no
   // dataGroup marking, and an <html> element's children are
@@ -1803,6 +1850,23 @@ function isXhtmlDocument(element: XElement): boolean {
       !grandChildren.every((child) => child.local === "head" || child.local === "body")
     )
       return false;
+    // (Round 13, C2) The same rule at the document-level <html>
+    // position — and at every <html> in the subtree, at any depth:
+    // `<h:html>OUTSIDE<h:body>Inside</h:body></h:html>` used to
+    // flatten to "OUTSIDEInside". Fail closed with a 422, same as
+    // the container level; whitespace-only direct text stays
+    // accepted. (The check runs only once the <html>-child rule
+    // above has passed: an <html> whose children are not
+    // <head>/<body> is not a skeleton position at all, so it
+    // defeats classification and recurses as ordinary data instead
+    // of throwing here.)
+    if (
+      descendant.local === "html" &&
+      descendant.content.some((item) => typeof item === "string" && item.trim() !== "")
+    )
+      throw new XfaError(
+        "XFA packet has non-whitespace text directly under an XHTML skeleton element 'html'; refusing to flatten it into a field value",
+      );
     // Append one at a time, never pending.push(...grandChildren):
     // spreading a wide child array into a call hits the engine's
     // maximum argument count (RangeError) on a legitimate shape —
@@ -2204,6 +2268,17 @@ function matchesSelectors(
  * one character, or a 6-character named entity for the five results
  * that must not become markup (`<`, `>`, `&`, `"`, `'`), so the
  * decoded text is at most a small constant factor of the input.
+ * The `<`-count gate is part of that pre-parse work too, and it is
+ * bounded the same way (round 13): it counts with an indexOf loop
+ * that stops at 200,001, so the gate itself adds O(n) time and O(1)
+ * space. The earlier text.match(/</g) form did NOT meet this claim
+ * — it materialized the full match array (~10M elements, ~80 MB,
+ * for a 10 MiB packet of `<`) before the cap check — bounded by the
+ * packet cap, but not by construction. What the bounds cover, here
+ * as everywhere in this correction, is the work THIS module adds;
+ * they do not cover the dependency parser's internal work on up to
+ * 10 MiB of XML, and they say nothing about semantic correctness
+ * (see below) — no coverage is claimed beyond the listed bounds.
  * (h) namespace-map copying is bounded by a cumulative entries
  * budget, NOT by depth (A-1, round 11 — sixth pass, RETRACTING the
  * round-10 claim): the round-10 prompt head (§0b) said a fresh map
