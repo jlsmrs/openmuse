@@ -2637,3 +2637,606 @@ test("A-4 (round 7): duplicate merges accumulate on-values incrementally up to t
     return true;
   });
 });
+
+// --- B1 fix round 8 (panel re-review #7, Nov 19, 2026) ----------------------
+// Regression tests for the adopted P1s (A-1 dataset classification, A-2
+// NUL / illegal XML 1.0 characters) and the round-7 test-adequacy gap
+// (distinct-scope resolved-node accumulation). Probe shapes are noted
+// per test (panel/probe-rereview7.mts). The B-1 cleanup-hardening mock
+// tests live in tests/store.test.ts.
+
+test("A-1 (round 8): X1 data group with an exData child fails closed, no fabricated leaf", async () => {
+  // Astra's construction: <note> is explicitly a data group with two
+  // ordinary data children. The old code flattened both into one leaf
+  // form.note = "FIRSTSECOND". Now the group has no scalar value, so
+  // a field bound to it has no data node and fails closed.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      '<note xfa:dataNode="dataGroup"><exData>FIRST</exData><other>SECOND</other></note>',
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-1 (round 8): X2 children named exData stay independently addressable", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<field name="exData"><ui><textEdit/></ui><bind match="default"/></field>' +
+        '<field name="other"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<note><exData>FIRST</exData><other>SECOND</other></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.exData", value: "FIRST", type: "text" },
+    { name: "form.note.other", value: "SECOND", type: "text" },
+  ]);
+});
+
+test("A-1 (round 8): X3 xhtml mixed with an ordinary sibling fails closed, no concatenation", async () => {
+  // The old code reported form.note = "ASECOND": the sibling was
+  // concatenated into the rich-text value. Now the mixture is not a
+  // rich-text leaf, so a field bound to the parent has no data node.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      "<note><xhtml><body><p><b>A</b></p></body></xhtml><other>SECOND</other></note>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-1 (round 8): X3 mixed shape keeps each child addressable", async () => {
+  // The same mixture, addressed child by child: the ordinary sibling
+  // resolves on its own, and the rich text is reachable through its
+  // own path — nothing is concatenated into anything else. (The
+  // rich-text leaf sits at ...p.b, under the <b> inside the <p>.)
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<field name="other"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<field name="b"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.note.xhtml.body.p.b"/></field>',
+      "<note><xhtml><body><p><b>A</b></p></body></xhtml><other>SECOND</other></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.other", value: "SECOND", type: "text" },
+    { name: "form.note.xhtml.body.p.b", value: "A", type: "text" },
+  ]);
+});
+
+test("A-1 (round 8): X4 legitimate single exData wrapping xhtml stays a rich-text leaf", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      '<note><exData contentType="text/html"><xhtml><body><p><b>A</b></p></body></xhtml></exData></note>',
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A", type: "unsupported" }]);
+});
+
+test("A-1 (round 8): a lone text-only exData child is ordinary data, not rich text", async () => {
+  // A single <exData> with text content (no <xhtml> inside) is not a
+  // supported rich-text container: it stays an addressable data
+  // element, and its parent is not a leaf.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      "<note><exData>FIRST</exData></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note.exData", value: "FIRST", type: "text" }]);
+  const parentBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      "<note><exData>FIRST</exData></note>",
+    ),
+  );
+  await assert.rejects(inspectPdf(parentBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-1 (round 8): a lone xhtml child holding data children is ordinary data", async () => {
+  // <xhtml> whose children are data elements, not an XHTML document
+  // skeleton (<html>/<head>/<body>), is an ordinary dataset element:
+  // its children stay addressable.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<subform name="xhtml"><bind match="default"/>' +
+        '<field name="item"><ui><textEdit/></ui><bind match="default"/></field></subform></subform>',
+      "<note><xhtml><item>1</item></xhtml></note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note.xhtml.item", value: "1", type: "text" }]);
+});
+
+test("A-1 (round 8): direct text beside a rich-text container is not flattened into the value", async () => {
+  // The parent's own direct text must not leak into the rich-text
+  // value: with real text beside the container the parent is not a
+  // rich-text leaf at all.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      "<note>LEAK<xhtml><body><p>A</p></body></xhtml></note>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-1 (round 8): an explicit dataGroup is never a rich-text leaf", async () => {
+  // Even a single supported rich-text child does not make an
+  // explicitly declared data group a leaf: the dataset's own
+  // declaration wins, and the child stays addressable.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><bind match="default"/>' +
+        '<field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      '<note xfa:dataNode="dataGroup"><exData contentType="text/html"><xhtml><body><p><b>A</b></p></body></xhtml></exData></note>',
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note.exData", value: "A", type: "unsupported" }]);
+  const parentBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      '<note xfa:dataNode="dataGroup"><exData contentType="text/html"><xhtml><body><p><b>A</b></p></body></xhtml></exData></note>',
+    ),
+  );
+  await assert.rejects(inspectPdf(parentBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /has no data node/);
+    return true;
+  });
+});
+
+test("A-2 (round 8): a literal NUL in a dataset value fails closed", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<note>A\u0000B</note>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /U\+0000.*not valid in XML 1\.0/);
+    return true;
+  });
+});
+
+test("A-2 (round 8): a literal NUL in a template caption fails closed (X5a shape)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="none"/>' +
+        '<caption><value><text>X</text></value><value xml:space="preserve"><text>A\u0000B</text></value></caption></field>',
+      "<ok>V</ok>",
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /U\+0000.*not valid in XML 1\.0/);
+    return true;
+  });
+});
+
+test("A-2 (round 8): numeric references to NUL fail closed in datasets and template", async () => {
+  // &#0; / &#x0; arrive as literal strings from this parser, not as
+  // NUL — but a conformant parser decodes them to NUL and rejects
+  // the document, so the packet must not be accepted either way.
+  for (const ref of ["&#0;", "&#x0;"]) {
+    const datasetBytes = await createXfaPdf(
+      wrap(
+        '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+        `<note>A${ref}B</note>`,
+      ),
+    );
+    await assert.rejects(inspectPdf(datasetBytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(
+        error.message,
+        new RegExp(
+          `character reference '${ref.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}' naming U\\+0000`,
+        ),
+      );
+      return true;
+    });
+    const templateBytes = await createXfaPdf(
+      wrap(
+        '<field name="note"><ui><textEdit/></ui><bind match="none"/>' +
+          `<caption><value><text>A${ref}B</text></value></caption></field>`,
+        "<ok>V</ok>",
+      ),
+    );
+    await assert.rejects(inspectPdf(templateBytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /naming U\+0000/);
+      return true;
+    });
+  }
+});
+
+test("A-2 (round 8): the X5c collision shape fails closed, the X5d control keeps its true label", async () => {
+  // X5c: a default caption segment containing a literal "\u00000\u0000"
+  // run plus a real preserved segment "KEEP\nME" — pre-fix the real
+  // NULs were treated as placeholder index 0 and the label came out
+  // "PKEEP\nMEQKEEP\nME". Post-fix the packet 422s on the NUL.
+  const collisionBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="none"/>' +
+        '<caption><value><text>P\u00000\u0000Q</text><text xml:space="preserve">KEEP\nME</text></value></caption></field>',
+      "<ok>V</ok>",
+    ),
+  );
+  await assert.rejects(inspectPdf(collisionBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /U\+0000.*not valid in XML 1\.0/);
+    return true;
+  });
+  // X5d control: the same caption without NULs reports its true label.
+  const controlBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="none"/>' +
+        '<caption><value><text>P Q</text><text xml:space="preserve">KEEP\nME</text></value></caption></field>',
+      "<ok>V</ok>",
+    ),
+  );
+  const result = await inspectPdf(controlBytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "", type: "unsupported", label: "P QKEEP\nME" },
+  ]);
+});
+
+test("A-2 (round 8): other illegal XML 1.0 characters and references fail closed", async () => {
+  // Literal C0 controls (other than tab/LF/CR), U+FFFE, and numeric
+  // references naming a surrogate, U+FFFE, or a code point above
+  // U+10FFFF are all illegal in XML 1.0.
+  for (const bad of ["\u0001", "\u000b", "\u000c", "\u001f", "\uFFFE"]) {
+    const bytes = await createXfaPdf(
+      wrap(
+        '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+        `<note>A${bad}B</note>`,
+      ),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /not valid in XML 1\.0/);
+      return true;
+    });
+  }
+  for (const ref of ["&#xD800;", "&#xFFFE;", "&#x110000;", "&#11;", "&#12;"]) {
+    const bytes = await createXfaPdf(
+      wrap(
+        '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+        `<note>A${ref}B</note>`,
+      ),
+    );
+    await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /not valid in XML 1\.0/);
+      return true;
+    });
+  }
+});
+
+test("A-2 (round 8): legal characters and references still pass (no over-rejection)", async () => {
+  // Guard the other way: tab and newline are legal XML 1.0
+  // characters, &amp; decodes, and numeric references are legal and
+  // pass through (this parser leaves &#65; literal rather than
+  // decoding it — only named entities decode — so the value carries
+  // it verbatim). "&#0;" is literal text — not a character reference
+  // — inside CDATA and comments, so it must not be rejected there.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="tab"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="ref"><ui><textEdit/></ui><bind match="global"/></field>' +
+        '<field name="cdata"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<note>A\nB</note><tab>A\tB</tab><ref>A&#65;B&amp;C</ref><cdata><![CDATA[A&#0;B]]></cdata>",
+    ),
+  );
+  // A comment carrying "&#0;" must not trip the reference scan either.
+  const commentBytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="global"/></field>',
+      "<!-- &#0; --><note>V</note>",
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note", value: "A\nB", type: "text" },
+    { name: "form.tab", value: "A\tB", type: "text" },
+    { name: "form.ref", value: "A&#65;B&C", type: "text" },
+    { name: "form.cdata", value: "A&#0;B", type: "text" },
+  ]);
+  const commentResult = await inspectPdf(commentBytes);
+  assert.deepEqual(commentResult.fields, [{ name: "form.note", value: "V", type: "text" }]);
+});
+
+// --- Test adequacy (round 8): distinct-scope resolved-node merges -----
+// The round-7 incremental-accumulation test (tests/xfa.test.ts:2593)
+// used ONE scope identity ($data.form.person[0]) for every addition,
+// so all additions collapsed into ONE subgroup before resolution — it
+// exercised one resolved-node merge, not the claimed sequence. These
+// tests use the ancestor-bit construction from the W4 test: each
+// subform carries a DISTINCT dataRef scope identity, and every scope
+// resolves to the SAME dataset leaf, so each addition is a genuine
+// resolved-node merge in push()/mergeDuplicate().
+
+const ACCUM_ANCESTORS = ["a", "b", "c", "d"];
+const accumDataset = "<a><b><c><d><code>0</code></d></c></b></a>";
+
+/** Distinct dataRef scope identities over the ancestors (bit patterns). */
+function accumRefs(count: number): string[] {
+  const refs: string[] = [];
+  for (let i = 0; i < count; i++) {
+    refs.push(ACCUM_ANCESTORS.map((name, pos) => ((i >> pos) & 1 ? `${name}[0]` : name)).join("."));
+  }
+  return refs;
+}
+
+const accumCheckboxSubform = (ref: string, on: string, caption?: string) =>
+  `<subform name="s"><bind match="dataRef" ref="$data.form.${ref}"/>` +
+  `<field name="code"><ui><checkButton/></ui><bind match="default"/>` +
+  `<items><text>${on}</text><text>0</text></items>` +
+  (caption !== undefined ? `<caption><value><text>${caption}</text></value></caption>` : "") +
+  `</field></subform>`;
+
+test("Test adequacy (round 8): DISTINCT scopes accumulate on-values through resolved-node merges", async () => {
+  // Nine DISTINCT scope identities, each contributing a different
+  // ~100 KiB on-value to the same leaf: nine genuine resolved-node
+  // merges succeed with the exact union (~920 KiB, under T-4).
+  // Twelve additions push the merged on-values past 1 MiB and fail
+  // closed on the T-4 bound — the duplicate-work budget (~7 MiB
+  // charged at that point) is not what trips.
+  const bigValue = (i: number) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1);
+  const build = (count: number) => {
+    const refs = accumRefs(count + 1);
+    let subforms = accumCheckboxSubform(refs[0], "1");
+    for (let i = 1; i <= count; i++) subforms += accumCheckboxSubform(refs[i], bigValue(i - 1));
+    return createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        subforms +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+        accumDataset +
+        "</form></xfa:data></xfa:datasets>",
+    });
+  };
+  const ok = await inspectPdf(await build(9));
+  assert.deepEqual(ok.fields, [
+    {
+      name: "form.a.b.c.d.code",
+      value: "0",
+      type: "checkbox",
+      onValues: ["1", ...Array.from({ length: 9 }, (_, i) => bigValue(i))],
+    },
+  ]);
+  await assert.rejects(inspectPdf(await build(12)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of checkbox on-values/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 8): escaping on-values are charged exactly near the output boundary", async () => {
+  // Each value is ~100 KiB of double-quote characters: the T-4 charge
+  // (utf8Length + 2) counts ~102 KiB per value, but the true JSON
+  // literal is ~205 KiB per value (every quote escapes). Four values
+  // succeed (true size ~820 KiB, under 1 MiB); nine values must still
+  // fail closed — on the EXACT output bound ("bytes of resolved
+  // fields"), not on T-4, which never trips here.
+  const escValue = (i: number) => String.fromCharCode(65 + i) + '"'.repeat(102400 - 1);
+  const build = (count: number) => {
+    const refs = accumRefs(count + 1);
+    let subforms = accumCheckboxSubform(refs[0], "1");
+    for (let i = 1; i <= count; i++) subforms += accumCheckboxSubform(refs[i], escValue(i - 1));
+    return createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        subforms +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+        accumDataset +
+        "</form></xfa:data></xfa:datasets>",
+    });
+  };
+  const ok = await inspectPdf(await build(4));
+  assert.deepEqual(ok.fields, [
+    {
+      name: "form.a.b.c.d.code",
+      value: "0",
+      type: "checkbox",
+      onValues: ["1", ...Array.from({ length: 4 }, (_, i) => escValue(i))],
+    },
+  ]);
+  await assert.rejects(inspectPdf(await build(9)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of resolved fields/);
+    assert.doesNotMatch(error.message, /bytes of checkbox on-values/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 8): non-ASCII on-values accumulate by UTF-8 bytes, not characters", async () => {
+  // Eight values of 51,200 "é" (2 bytes each = 102,400 bytes) plus one
+  // value of 25,600 "😀" (4 bytes each = 102,400 bytes): nine DISTINCT
+  // scope identities, each contributing exactly 102,400 charged
+  // bytes — the same arithmetic as the ASCII case, proving the byte
+  // accounting measures bytes, so a character count would have
+  // under-charged by 2×–4×.
+  const values = [
+    ...Array.from({ length: 8 }, (_, i) => String.fromCharCode(0xe9 + i) + "é".repeat(51200 - 1)),
+    "😀".repeat(25600),
+  ];
+  const refs = accumRefs(values.length + 1);
+  let subforms = accumCheckboxSubform(refs[0], "1");
+  values.forEach((value, i) => {
+    subforms += accumCheckboxSubform(refs[i + 1], value);
+  });
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+      subforms +
+      "</subform></template>",
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+      accumDataset +
+      "</form></xfa:data></xfa:datasets>",
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    {
+      name: "form.a.b.c.d.code",
+      value: "0",
+      type: "checkbox",
+      onValues: ["1", ...values],
+    },
+  ]);
+});
+
+test("Test adequacy (round 8): label introduction near the exact output boundary", async () => {
+  // Ten DISTINCT scopes contribute ~100 KiB on-values each to the
+  // same leaf (~1,024 KiB total, ~24 KiB under the 1 MiB output
+  // bound); an eleventh DISTINCT scope contributes no new on-value
+  // ("1", already seen) but INTRODUCES a label. The label length is
+  // calibrated in-test from the exact serialized field, so the
+  // under-case lands exactly 50 bytes below the bound and the
+  // over-case exactly 50 bytes above it.
+  const bigValue = (i: number) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1);
+  const onValues = ["1", ...Array.from({ length: 10 }, (_, i) => bigValue(i))];
+  const fieldName = "form.a.b.c.d.code";
+  const noLabel = { name: fieldName, value: "0", type: "checkbox", onValues };
+  const baseLen = JSON.stringify(noLabel).length;
+  // Field JSON with a label of length L: baseLen + 1 + 8 + (L + 2);
+  // the serialized array adds 2 more. MAX = 1,048,576.
+  const labelLenUnder = 1024 * 1024 - 50 - 13 - baseLen;
+  const labelLenOver = 1024 * 1024 + 50 - 13 - baseLen;
+  assert.ok(labelLenUnder > 0, `label calibration went negative: ${labelLenUnder}`);
+  const build = (labelLen: number) => {
+    const refs = accumRefs(12);
+    let subforms = accumCheckboxSubform(refs[0], "1");
+    for (let i = 1; i <= 10; i++) subforms += accumCheckboxSubform(refs[i], bigValue(i - 1));
+    subforms += accumCheckboxSubform(refs[11], "1", "L".repeat(labelLen));
+    return createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        subforms +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+        accumDataset +
+        "</form></xfa:data></xfa:datasets>",
+    });
+  };
+  const under = await inspectPdf(await build(labelLenUnder));
+  assert.deepEqual(under.fields, [{ ...noLabel, label: "L".repeat(labelLenUnder) }]);
+  assert.equal(JSON.stringify(under.fields).length, 1024 * 1024 - 50);
+  await assert.rejects(inspectPdf(await build(labelLenOver)), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /bytes of resolved fields/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 8): options introduction near the exact output boundary", async () => {
+  // A choiceList field whose first DISTINCT scope carries no <items>
+  // (no options) and whose second DISTINCT scope introduces an
+  // options array. The options size is calibrated in-test from the
+  // exact serialized field, so the under-case lands exactly 50 bytes
+  // below the 1 MiB output bound and the over-case exactly 50 bytes
+  // above it — proving the introduction delta is charged exactly.
+  const fieldName = "form.a.b.c.d.code";
+  const noOptions = { name: fieldName, value: "0", type: "unsupported" };
+  const baseLen = JSON.stringify(noOptions).length;
+  // Field JSON with options: baseLen + 1 + 10 + JSON(options); the
+  // serialized array adds 2 more. MAX = 1,048,576.
+  const optionsJsonTarget = (total: number) => total - 13 - baseLen;
+  const buildOptions = (jsonLen: number): string[] => {
+    // Nine fixed ~100 KiB options plus one calibrated option that
+    // brings the options JSON to exactly jsonLen.
+    const fixed = Array.from(
+      { length: 9 },
+      (_, i) => String.fromCharCode(65 + i) + "X".repeat(102400 - 1),
+    );
+    const fixedJsonLen = JSON.stringify(fixed).length;
+    // Options JSON: "[" + items joined by "," + "]"; appending one
+    // more item of length L costs 1 (comma) + (L + 2) (quoted).
+    const lastLen = jsonLen - fixedJsonLen - 3;
+    assert.ok(lastLen > 0, `options calibration went negative: ${lastLen}`);
+    return [...fixed, "J".repeat(lastLen)];
+  };
+  const build = (jsonLen: number) => {
+    const refs = accumRefs(2);
+    const choiceSubform = (ref: string, items?: string[]) =>
+      `<subform name="s"><bind match="dataRef" ref="$data.form.${ref}"/>` +
+      `<field name="code"><ui><choiceList/></ui><bind match="default"/>` +
+      (items !== undefined
+        ? `<items>${items.map((text) => `<text>${text}</text>`).join("")}</items>`
+        : "") +
+      `</field></subform>`;
+    const subforms = choiceSubform(refs[0]) + choiceSubform(refs[1], buildOptions(jsonLen));
+    return createXfaPdf({
+      templateXml:
+        '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb">' +
+        subforms +
+        "</subform></template>",
+      datasetsXml:
+        '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>' +
+        accumDataset +
+        "</form></xfa:data></xfa:datasets>",
+    });
+  };
+  const underOptions = buildOptions(optionsJsonTarget(1024 * 1024 - 50));
+  const under = await inspectPdf(await build(optionsJsonTarget(1024 * 1024 - 50)));
+  assert.deepEqual(under.fields, [{ ...noOptions, options: underOptions }]);
+  assert.equal(JSON.stringify(under.fields).length, 1024 * 1024 - 50);
+  await assert.rejects(
+    inspectPdf(await build(optionsJsonTarget(1024 * 1024 + 50))),
+    (error: unknown) => {
+      assert.ok(error instanceof Error);
+      assert.equal((error as { status?: number }).status, 422);
+      assert.match(error.message, /bytes of resolved fields/);
+      return true;
+    },
+  );
+});

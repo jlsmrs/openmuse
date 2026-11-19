@@ -1,6 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createPgDatabase, createStore } from "../apps/server/src/db.ts";
+import {
+  createPgDatabase,
+  createStore,
+  isIndeterminateCommit,
+  markIndeterminateCommit,
+} from "../apps/server/src/db.ts";
 
 // Raw query access for the index assertions below: the Store keeps its
 // database handle private, so reach in through a cast (test-only).
@@ -247,6 +252,12 @@ interface FakePgClient {
   releases: Array<Error | undefined>;
   failWorkWith: Error | null;
   failRollbackWith: Error | null;
+  /** Round 8: fail the BEGIN step. */
+  failBeginWith?: Error | null;
+  /** Round 8: fail the COMMIT step. */
+  failCommitWith?: Error | null;
+  /** Round 8: throw from release(). */
+  failReleaseWith?: Error | null;
 }
 
 function fakePgPool(client: FakePgClient) {
@@ -260,8 +271,14 @@ function fakePgPool(client: FakePgClient) {
         return {
           query: async (sql: string) => {
             client.queries.push(sql);
-            if (sql === "BEGIN") return { rows: [] };
-            if (sql === "COMMIT") return { rows: [] };
+            if (sql === "BEGIN") {
+              if (client.failBeginWith) throw client.failBeginWith;
+              return { rows: [] };
+            }
+            if (sql === "COMMIT") {
+              if (client.failCommitWith) throw client.failCommitWith;
+              return { rows: [] };
+            }
             if (sql === "ROLLBACK") {
               if (client.failRollbackWith) throw client.failRollbackWith;
               return { rows: [] };
@@ -271,6 +288,7 @@ function fakePgPool(client: FakePgClient) {
           },
           release: (error?: Error) => {
             client.releases.push(error);
+            if (client.failReleaseWith) throw client.failReleaseWith;
           },
         };
       },
@@ -376,4 +394,226 @@ test("B-1 (round 7): a successful pg transaction releases the client exactly onc
   ]);
   assert.equal(client.releases.length, 1);
   assert.equal(client.releases[0], undefined);
+});
+
+// --- B1 fix round 8 (panel re-review #7, Nov 19, 2026) ----------------------
+// B-1 cleanup hardening, mock-level (no live PostgreSQL in this env):
+// release() and the cleanup logging are guarded, so neither can mask
+// the original operation error; the indeterminate-COMMIT mark is
+// non-mutating (WeakSet), so it works on frozen errors too.
+
+test("B-1 (round 8): a BEGIN failure keeps the original error even when release throws", async () => {
+  const beginError = new Error("BEGIN failed: connection reset");
+  const releaseError = new Error("release failed");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: null,
+    failRollbackWith: null,
+    failBeginWith: beginError,
+    failReleaseWith: releaseError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    await assert.rejects(
+      db.transaction(async () => "never"),
+      (error: unknown) => {
+        // The ORIGINAL error is preserved — the throwing release must
+        // never replace it.
+        assert.equal(error, beginError);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(client.queries, ["BEGIN", "ROLLBACK"]);
+  // Exactly one release attempt, and the release failure was reported,
+  // not propagated.
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], undefined);
+  assert.match(captured.join("\n"), /postgres release failed/);
+});
+
+test("B-1 (round 8): a COMMIT failure keeps its indeterminate mark even when release throws", async () => {
+  const commitError = new Error("COMMIT failed: connection lost");
+  const releaseError = new Error("release failed");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: null,
+    failRollbackWith: null,
+    failCommitWith: commitError,
+    failReleaseWith: releaseError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    await assert.rejects(
+      db.transaction(async (query) => {
+        await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+        return "never";
+      }),
+      (error: unknown) => {
+        assert.equal(error, commitError);
+        // The mark survives the ROLLBACK attempt AND the throwing
+        // release: callers can still tell the outcome is unknown,
+        // not rolled back.
+        assert.equal(isIndeterminateCommit(error), true);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(client.queries, [
+    "BEGIN",
+    "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)",
+    "COMMIT",
+    "ROLLBACK",
+  ]);
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], undefined);
+  assert.match(captured.join("\n"), /postgres release failed/);
+});
+
+test("B-1 (round 8): a frozen COMMIT error still gets its indeterminate mark", async () => {
+  // The round-7 marker assigned a symbol property on the error object,
+  // which throws on a frozen/non-extensible error and would replace
+  // the COMMIT error with the assignment failure. The round-8 marker
+  // is a WeakSet add, which never mutates the object.
+  const commitError = Object.freeze(new Error("COMMIT failed: connection lost"));
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: null,
+    failRollbackWith: null,
+    failCommitWith: commitError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  await assert.rejects(
+    db.transaction(async (query) => {
+      await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+      return "never";
+    }),
+    (error: unknown) => {
+      assert.equal(error, commitError);
+      assert.equal(isIndeterminateCommit(error), true);
+      return true;
+    },
+  );
+  assert.equal(client.releases.length, 1);
+});
+
+test("B-1 (round 8): a throwing cleanup logger cannot mask the original error", async () => {
+  // backgroundFailure is only console.error, but if the logger itself
+  // throws (a broken console, a throwing transport), the rollback
+  // reporting must not replace the work error — and the release must
+  // still run.
+  const workError = new Error("query timed out");
+  const rollbackError = new Error("ROLLBACK timed out");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: workError,
+    failRollbackWith: rollbackError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const originalError = console.error;
+  console.error = () => {
+    throw new Error("logger down");
+  };
+  try {
+    await assert.rejects(
+      db.transaction(async (query) => {
+        await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+        return "never";
+      }),
+      (error: unknown) => {
+        assert.equal(error, workError);
+        return true;
+      },
+    );
+  } finally {
+    console.error = originalError;
+  }
+  // The release still ran (with the discard error), despite the
+  // logger throwing before it.
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], rollbackError);
+});
+
+test("B-1 (round 8): a release failure after a successful COMMIT does not fail the transaction", async () => {
+  // The COMMIT succeeded; a throwing release must not turn a
+  // committed transaction into a thrown error. The failure is
+  // reported, and the committed result stands.
+  const releaseError = new Error("release failed");
+  const client: FakePgClient = {
+    queries: [],
+    releases: [],
+    failWorkWith: null,
+    failRollbackWith: null,
+    failReleaseWith: releaseError,
+  };
+  const { pool } = fakePgPool(client);
+  const db = createPgDatabase(pool);
+  const captured: string[] = [];
+  const originalError = console.error;
+  console.error = (...args: unknown[]) => {
+    captured.push(
+      args.map((arg) => (typeof arg === "string" ? arg : JSON.stringify(arg))).join(" "),
+    );
+  };
+  try {
+    const result = await db.transaction(async (query) => {
+      await query("INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)");
+      return "committed";
+    });
+    assert.equal(result, "committed");
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(client.queries, [
+    "BEGIN",
+    "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb)",
+    "COMMIT",
+  ]);
+  assert.equal(client.releases.length, 1);
+  assert.equal(client.releases[0], undefined);
+  assert.match(captured.join("\n"), /postgres release failed/);
+});
+
+test("B-1 (round 8): markIndeterminateCommit marks frozen and non-object errors without throwing", async () => {
+  // Direct mechanism test (see db.ts): the WeakSet mark never mutates
+  // the error, so frozen/non-extensible errors mark cleanly, and
+  // non-objects pass through unmarked (as before).
+  const frozen = Object.freeze(new Error("frozen"));
+  assert.equal(markIndeterminateCommit(frozen), frozen);
+  assert.equal(isIndeterminateCommit(frozen), true);
+  const sealed = Object.preventExtensions(new Error("sealed"));
+  assert.equal(markIndeterminateCommit(sealed), sealed);
+  assert.equal(isIndeterminateCommit(sealed), true);
+  const plain = new Error("plain");
+  assert.equal(isIndeterminateCommit(plain), false);
+  assert.equal(markIndeterminateCommit(plain), plain);
+  assert.equal(isIndeterminateCommit(plain), true);
+  assert.equal(markIndeterminateCommit("a string error"), "a string error");
+  assert.equal(isIndeterminateCommit("a string error"), false);
 });
