@@ -4311,3 +4311,218 @@ test("A-3 (round 11): the full malformed-entity matrix fails closed in both lexi
     { name: "form.note", value: "AAB&C", type: "text" },
   ]);
 });
+
+// --- B1 fix round 12 (re-review #11, Sol alone, Nov 19, 2026) ---------------
+// Regression tests for the adopted P1 (A-1 wide-XHTML spread) plus the
+// round-11 test-adequacy items: the named-entity attribute control, the
+// datasets-side namespace amplification, exact namespace-budget
+// boundaries, root declarations, and both packets independently
+// approaching their budgets.
+
+test("A-1 (round 12): wide XHTML content succeeds instead of throwing (X1)", async () => {
+  // Sol's construction, verbatim from panel/probe-rereview11.mts:
+  // <h:body> with 190,000 empty <h:p/> children inside a genuine
+  // XHTML skeleton — well-formed, ~1.3 MB (under the 10 MiB packet
+  // cap), ~190,005 `<` (under the 200,000 gate), shallow, one
+  // namespace declaration, passing every classifier check. On
+  // round-11 code isXhtmlDocument() spread the whole child array
+  // into pending.push(...), hitting the engine's maximum argument
+  // count (RangeError) and failing closed with a 422 that
+  // misattributed the cause. Now the children are appended one at
+  // a time and the inspection succeeds with an empty rich-text value.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:body>${"<h:p/>".repeat(190_000)}</h:body></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "", type: "unsupported" }]);
+});
+
+test("A-1 (round 12): wide XHTML content at 120k paragraphs succeeds (X1b control)", async () => {
+  // Mid-size control for the X1 regression: the same shape at
+  // 120,000 empty paragraphs also succeeds with an empty rich-text
+  // value. (It passed on round-11 code too — it pins the
+  // below-threshold behaviour, not the defect.)
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:body>${"<h:p/>".repeat(120_000)}</h:body></h:xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "", type: "unsupported" }]);
+});
+
+test("Test adequacy (round 12): named entities decode in attribute values", async () => {
+  // Round 11's entity matrix had a numeric-entity attribute control
+  // (a&#65;b → aAb) and numeric/named entities in content, but no
+  // named-entity ATTRIBUTE control. A named entity in a field's
+  // name attribute decodes exactly like a numeric one: &amp; → &,
+  // &apos; → ', &quot; → ". (A decoded & or quote is re-emitted as
+  // its named entity before parsing, so it can never become markup
+  // or break attribute quoting.)
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="a&amp;b"><ui><textEdit/></ui><bind match="none"/></field>' +
+        '<field name="c&apos;d"><ui><textEdit/></ui><bind match="none"/></field>' +
+        '<field name="e&quot;f"><ui><textEdit/></ui><bind match="none"/></field>',
+      `<note>V</note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.a&b", value: "", type: "unsupported" },
+    { name: "form.c'd", value: "", type: "unsupported" },
+    { name: 'form.e"f', value: "", type: "unsupported" },
+  ]);
+});
+
+test("Test adequacy (round 12): datasets-side namespace amplification fails closed", async () => {
+  // W1 (round 11) proved the amplification on the template side.
+  // The same shape on the datasets side must fail closed too: the
+  // budget is per packet, and conversion runs before field
+  // collection on either packet. A <form> declaring 1,000 prefixes
+  // with 2,000 sibling elements each declaring xmlns:q copies
+  // ~2M map entries on unbudgeted code; the cumulative budget fails
+  // closed with a 422 before the over-budget copy is made.
+  const decls = Array.from({ length: 1000 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const sibs = Array.from({ length: 2000 }, (_, i) => `<s${i} xmlns:q="urn:q"/>`).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      '<subform name="form" layout="tb"></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form ${decls}>${sibs}</form></xfa:data></xfa:datasets>`,
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /too many namespace bindings/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 12): datasets-side namespace environment under the budget still inspects", async () => {
+  // Same shape at 200 prefixes x 500 declaring siblings (101,704
+  // copied entries, under the 250,000 budget): a field-less
+  // template inspects to zero fields — the budget bounds the
+  // amplification without rejecting a legitimate wide environment
+  // on the datasets side either.
+  const decls = Array.from({ length: 200 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const sibs = Array.from({ length: 500 }, (_, i) => `<s${i} xmlns:q="urn:q"/>`).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      '<subform name="form" layout="tb"></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form ${decls}>${sibs}</form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, []);
+});
+
+test("Test adequacy (round 12): namespace budget boundary is exact at 250,000 entries", async () => {
+  // Charge arithmetic, per namespaceBindingsFor(): the <template>
+  // root declaring its default xmlns charges 1 (ROOT size) + 1 = 2;
+  // the <form> subform declaring 496 prefixes charges 2 + 496 =
+  // 498; each declaring sibling charges 498 + 1 = 499. With 500
+  // siblings the total is exactly 2 + 498 + 500 x 499 = 250,000 —
+  // the check is `used + charge > 250,000`, so exactly at budget
+  // still inspects. One more sibling (250,499 total) fails closed.
+  const decls = Array.from({ length: 496 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const atBudget = Array.from(
+    { length: 500 },
+    (_, i) => `<subform name="s${i}" xmlns:q="urn:q"></subform>`,
+  ).join("");
+  const overBudget = Array.from(
+    { length: 501 },
+    (_, i) => `<subform name="s${i}" xmlns:q="urn:q"></subform>`,
+  ).join("");
+  const datasetsXml =
+    '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><note/></form></xfa:data></xfa:datasets>';
+  const atBytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      `<subform name="form" layout="tb" ${decls}>${atBudget}</subform></template>`,
+    datasetsXml,
+  });
+  const atResult = await inspectPdf(atBytes);
+  assert.deepEqual(atResult.fields, []);
+  const overBytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      `<subform name="form" layout="tb" ${decls}>${overBudget}</subform></template>`,
+    datasetsXml,
+  });
+  await assert.rejects(inspectPdf(overBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /too many namespace bindings/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 12): root declarations count toward the namespace budget", async () => {
+  // The packet ROOT's own declarations are charged too (conversion
+  // begins with ROOT_NS_BINDINGS, size 1, then passes through the
+  // same function): a <template> root declaring its default xmlns
+  // plus 249,998 prefixes charges 1 + (1 + 249,998) = 250,000 —
+  // exactly at budget, so it inspects. One more prefix (250,001)
+  // fails closed, even with no declaring descendants at all.
+  const atBudget = Array.from({ length: 249_998 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const overBudget = Array.from({ length: 249_999 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const datasetsXml =
+    '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><note/></form></xfa:data></xfa:datasets>';
+  const atBytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" ' +
+      `${atBudget}><subform name="form" layout="tb"></subform></template>`,
+    datasetsXml,
+  });
+  const atResult = await inspectPdf(atBytes);
+  assert.deepEqual(atResult.fields, []);
+  const overBytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" ' +
+      `${overBudget}><subform name="form" layout="tb"></subform></template>`,
+    datasetsXml,
+  });
+  await assert.rejects(inspectPdf(overBytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /too many namespace bindings/);
+    return true;
+  });
+});
+
+test("Test adequacy (round 12): both packets independently approach their namespace budgets", async () => {
+  // The 250,000-entry budget is PER PACKET, not shared: a template
+  // at 240,481 copied entries AND datasets at 240,481 (480,962
+  // combined — over the budget if it were shared) still inspect,
+  // and a real field still resolves. Per packet: root charge 2,
+  // <form> declaring 477 prefixes charges 2 + 477 = 479, each of
+  // 500 declaring siblings charges 479 + 1 = 480; total
+  // 2 + 479 + 500 x 480 = 240,481.
+  const decls = Array.from({ length: 477 }, (_, i) => `xmlns:p${i}="urn:p${i}"`).join(" ");
+  const templateSibs = Array.from(
+    { length: 500 },
+    (_, i) => `<subform name="s${i}" xmlns:q="urn:q"></subform>`,
+  ).join("");
+  const datasetsSibs = Array.from({ length: 500 }, (_, i) => `<s${i} xmlns:q="urn:q"/>`).join("");
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/">' +
+      `<subform name="form" layout="tb" ${decls}>` +
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>' +
+      `${templateSibs}</subform></template>`,
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data>' +
+      `<form ${decls}>${datasetsSibs}<note>OK</note></form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "OK", type: "text" }]);
+});
