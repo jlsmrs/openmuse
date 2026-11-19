@@ -75,6 +75,22 @@ const MAX_JOINED_FIELDS = 10000;
  */
 const MAX_JOINED_BYTES = 1024 * 1024;
 /**
+ * Cumulative bound on duplicate-merge work (A-4, round 7): merging a
+ * duplicate touches the accumulated field (value/options/label
+ * comparisons), so duplicates × retained field size is the
+ * amplification shape — 8,192 duplicates of one ~900 KiB field
+ * re-serialized ~7,200 MiB with no bound tripping. Each duplicate
+ * merge is charged the merged field's retained serialized size (the
+ * work a naive re-serialization would have paid, and an upper bound
+ * on the comparison work the merge can do against that field), and
+ * the total across one inspect may not exceed this. 64 MiB leaves
+ * ample room for legitimate repeats (the W-9's 7 duplicates of tiny
+ * fields charge a few hundred bytes) while capping the amplification
+ * at a small multiple of the input. Calibration is open: a legitimate
+ * form with many duplicates of a near-1 MiB field could trip it.
+ */
+const MAX_CUMULATIVE_DUPLICATE_BYTES = 64 * 1024 * 1024;
+/**
  * Aggregate bound on internal path/index bytes (T-3, round 4): the
  * 1 MiB output bound does not bound the work done BEFORE any field is
  * emitted — `buildJoinIndex` materializes one dotted path string per
@@ -346,6 +362,92 @@ function normalizeSpace(text: string): string {
 }
 
 /**
+ * Collect a node's flattened text as (text, keep) segments, one per
+ * text node, where `keep` is the effective xml:space state at that
+ * text node (A-3, round 7). Mirrors nodeText()'s traversal exactly —
+ * same descendant-override rule, same skip of newline-bearing
+ * whitespace-only text between elements under default handling — but
+ * keeps the preserve/default boundary per segment instead of merging
+ * everything into one string, so normalizePreserving() can normalize
+ * only the default segments.
+ */
+function collectTextSegments(
+  node: XElement | string,
+  preserve: boolean,
+  out: Array<{ text: string; keep: boolean }>,
+  depth = 0,
+): void {
+  if (typeof node === "string") {
+    out.push({ text: node, keep: preserve });
+    return;
+  }
+  if (depth > MAX_XFA_DEPTH) throw new XfaError("XFA packet is nested too deeply");
+  const keep = effectiveSpace(node, preserve);
+  const children = elementChildren(node);
+  for (const item of node.content) {
+    if (typeof item === "string") {
+      if (!keep && item.trim() === "" && children.length > 0 && /[\n\r]/.test(item)) continue;
+      out.push({ text: item, keep });
+    } else {
+      collectTextSegments(item, keep, out, depth + 1);
+    }
+  }
+}
+
+/**
+ * Flatten a caption's text with whitespace semantics preserved per
+ * subtree (A-3, round 7): text under an xml:space="preserve"
+ * descendant keeps its whitespace verbatim, while text under default
+ * handling normalizes (whitespace runs collapse to one space, ends
+ * trimmed) — even when the <caption> itself carries no preserve. The
+ * old code flattened with nodeText() and then ran normalizeSpace()
+ * over the whole result when the caption root was not preserving,
+ * which destroyed a preserved descendant's newlines ("A\nB" →
+ * "A B"): a single boolean at the caption root cannot normalize mixed
+ * preserved/default subtrees after flattening erases their
+ * boundaries. Preserved segments are replaced by NUL-delimited
+ * placeholders (NUL cannot occur in XML 1.0 text, so no real content
+ * can collide with one) before normalizing, then restored verbatim.
+ * With no preserved segment the result is exactly
+ * normalizeSpace(nodeText(node)) as before.
+ */
+function normalizePreserving(node: XElement, preserve: boolean): string {
+  const segments: Array<{ text: string; keep: boolean }> = [];
+  collectTextSegments(node, preserve, segments);
+  const preserved: string[] = [];
+  let assembled = "";
+  for (const segment of segments) {
+    if (segment.keep) {
+      preserved.push(segment.text);
+      assembled += `\u0000${preserved.length - 1}\u0000`;
+    } else {
+      assembled += segment.text;
+    }
+  }
+  const normalized = normalizeSpace(assembled);
+  // Restore preserved segments by scanning for NUL-delimited indices
+  // (no regex: \u0000 is a control character, which the linter
+  // forbids in regex literals). Placeholders survive normalizeSpace
+  // intact — NUL and digits are not whitespace — so each pair delimits
+  // exactly one index.
+  let restored = "";
+  let cursor = 0;
+  for (;;) {
+    const open = normalized.indexOf("\u0000", cursor);
+    if (open < 0) break;
+    const close = normalized.indexOf("\u0000", open + 1);
+    if (close < 0) break;
+    restored += normalized.slice(cursor, open);
+    const index = Number(normalized.slice(open + 1, close));
+    if (Number.isInteger(index) && index >= 0 && index < preserved.length)
+      restored += preserved[index];
+    cursor = close + 1;
+  }
+  restored += normalized.slice(cursor);
+  return restored;
+}
+
+/**
  * The effective xml:space state at an element (A-3, round 6):
  * an explicit xml:space="preserve" keeps whitespace verbatim for the
  * subtree, xml:space="default" resets to the skipping behaviour, and
@@ -541,10 +643,16 @@ interface TemplateField {
  * (`[...parent.segments, segment]`), a full copy per segment, which
  * made folding a 20,000-segment dataRef quadratic (2,714 ms) with no
  * bound tripping. The segment array is materialized lazily by
- * `scopeSegments()` — once per distinct (interned) scope, memoized —
- * only when a field is actually built, so a field-less subtree pays
- * nothing per segment beyond the bounded fold. The fold itself is
- * bounded twice: `parseDataRefSegments` rejects refs over
+ * `scopeSegments()`, memoized per context object — CORRECTION
+ * (round 7): the round-6 comment claimed "once per distinct
+ * (interned) scope", which is overstated. `child()` returns a fresh
+ * context object per call, so two objects carrying the same interned
+ * id materialize their segment arrays separately; the memoization is
+ * per object, not per interned identity. The work is still bounded:
+ * a materialization walks at most MAX_XFA_DEPTH parent links, and it
+ * happens only when a field is actually built, so a field-less
+ * subtree pays nothing per segment beyond the bounded fold. The fold
+ * itself is bounded twice: `parseDataRefSegments` rejects refs over
  * MAX_DATA_REF_SEGMENTS before folding, and `child()` enforces the
  * whole-document depth gate, so no ref — field-less or not — can
  * drive unbounded scope construction. The template path strings that
@@ -758,16 +866,17 @@ function buildTemplateField(
   if (uiKind === "checkButton" && items.length > 0) onValues = [items[0]];
   const caption = singletonChild(node, "caption", context);
   const captionKeep = caption !== undefined ? effectiveSpace(caption, keep) : keep;
-  const captionValue =
+  // Caption labels normalize whitespace by default — EXCEPT where the
+  // document says it is significant (A-3, round 6; SPEC §1 step 4):
+  // normalizePreserving() (A-3, round 7) normalizes only the default
+  // segments and keeps a preserved descendant's newlines verbatim,
+  // even when the <caption> itself carries no preserve; a caption
+  // under preserve keeps its whitespace verbatim, as before.
+  const captionText =
     caption !== undefined
-      ? nodeText(singletonChild(caption, "value", context) ?? caption, 0, captionKeep)
+      ? normalizePreserving(singletonChild(caption, "value", context) ?? caption, captionKeep)
       : "";
-  // Caption labels normalize whitespace by default — EXCEPT under
-  // xml:space="preserve", where the document says the whitespace is
-  // significant (A-3, round 6; SPEC §1 step 4): a preserved caption
-  // keeps its newlines verbatim.
-  const label =
-    captionValue !== "" ? (captionKeep ? captionValue : normalizeSpace(captionValue)) : undefined;
+  const label = captionText !== "" ? captionText : undefined;
   const options = uiKind === "choiceList" ? itemTexts(node, keep) : [];
   return {
     somPath: fieldPath,
@@ -918,7 +1027,12 @@ function collectTemplateFields(
             throw new XfaError(
               `XFA template/datasets mismatch: exclGroup '${shortName(groupPath)}' has an unnamed option field with an explicit binding and cannot be reported`,
             );
-          const texts = itemTexts(optionField, groupKeep);
+          // The option field's OWN xml:space (A-3, round 7): its
+          // effective state — its own attribute over the group's —
+          // governs its items, so its own preserve is honoured and
+          // its own default can reset an inherited preserve, exactly
+          // as buildTemplateField() already does for named fields.
+          const texts = itemTexts(optionField, effectiveSpace(optionField, groupKeep));
           if (texts.length > 0) options.push(texts[0]);
           continue;
         }
@@ -952,11 +1066,13 @@ function collectTemplateFields(
       }
       const caption = singletonChild(child, "caption", `exclGroup '${shortName(groupPath)}'`);
       const captionKeep = caption !== undefined ? effectiveSpace(caption, groupKeep) : groupKeep;
-      const captionValue =
+      // Same per-subtree normalization as a field caption (A-3,
+      // round 7): a preserved descendant survives even when the group
+      // caption itself carries no preserve.
+      const captionText =
         caption !== undefined
-          ? nodeText(
+          ? normalizePreserving(
               singletonChild(caption, "value", `exclGroup '${shortName(groupPath)}'`) ?? caption,
-              0,
               captionKeep,
             )
           : "";
@@ -969,12 +1085,7 @@ function collectTemplateFields(
         bind,
         ref,
         options: options.length > 0 ? options : undefined,
-        label:
-          captionValue !== ""
-            ? captionKeep
-              ? captionValue
-              : normalizeSpace(captionValue)
-            : undefined,
+        label: captionText !== "" ? captionText : undefined,
       });
     } else {
       collectTemplateFields(child, pathSegments, scope, interner, depth + 1, out, pathBytes, keep);
@@ -1208,13 +1319,12 @@ function matchesSelectors(
  * The join index, built once per inspect: leaves by leaf name and by
  * stripped path, in document order. Indexing means a field only ever
  * looks up its own exact path or its own name — unrelated leaves cost
- * nothing. R-7 CORRECTION (round 6): the round-5 correction was
- * still unsound — scope construction (A-1) and selector parsing
- * (A-2) are pre-resolution amplification paths that none of the four
- * bounds charged: a 20,000-segment dataRef folded quadratically
- * (2,714 ms) and a 256 KiB selector was re-parsed per candidate
- * (8,299 ms), both without tripping anything. This round closes those
- * two paths directly, and the correction now states exactly what each
+ * nothing. R-7 CORRECTION (round 7): the round-6 correction was
+ * still unsound — shared onValues arrays let one merge grow fields
+ * the output-byte accounting never saw (A-1), and duplicate
+ * resolution re-serialized the accumulated field on every duplicate
+ * with no bound on the cumulative work (A-4). This round closes both
+ * paths directly, and the correction now states exactly what each
  * bound covers:
  * (a) construction work is bounded BEFORE resolution: dataRef segment
  * counts are capped at MAX_DATA_REF_SEGMENTS (100 — no dataset leaf
@@ -1222,7 +1332,10 @@ function matchesSelectors(
  * time, scopes are parent-linked (child() is O(1), no array copy),
  * and the aggregate internal path/index byte bound (4 MiB, charged
  * per leaf before the joined key string is built) caps index
- * construction;
+ * construction. Scope segment arrays are memoized per context object,
+ * not per interned identity (round-7 correction of the round-6
+ * comment: child() returns a fresh object per call) — still bounded,
+ * since a materialization walks at most 100 parent links;
  * (b) lookup work is bounded by parsing each selector ONCE per field
  * into a canonical form (never per candidate), rejecting over-long
  * selectors and out-of-range values at parse time, plus the aggregate
@@ -1232,15 +1345,41 @@ function matchesSelectors(
  * occurrence checks (a segment not ending in "]" has no selector; a
  * trailing "[N]" puts the bracket within a few characters of the
  * end);
- * (c) the on-values merge byte bound in joinFields (T-4): merged
- * checkbox on-values for one collapsed group — and for one merged
- * duplicate (A-4) — may not exceed the 1 MiB output bound;
+ * (c) duplicate work is bounded two ways: mergeDuplicate() keeps
+ * persistent merge state (one dedup Set per resolved field, created
+ * once) and returns the exact serialized byte delta of the merge, so
+ * a duplicate never re-serializes or re-scans the accumulated field
+ * — and every duplicate is additionally charged the merged field's
+ * retained serialized size against a cumulative 64 MiB
+ * duplicate-work budget (MAX_CUMULATIVE_DUPLICATE_BYTES), which
+ * fails closed past it. The merged on-values byte bound (T-4, 1 MiB)
+ * still applies to subgroup merges and to resolved-node merges;
  * (d) the output count/byte bounds (S-5): at most 10,000 resolved
- * fields totalling at most 1 MiB of serialized JSON.
+ * fields totalling at most 1 MiB of serialized JSON — now enforced
+ * twice: incrementally, because each resolved field owns its mutable
+ * merge state (toXfaField() copies onValues, so a merge can never
+ * grow a previously accounted field or a template unit), and finally
+ * by an exact JSON.stringify(result.fields) byte check before
+ * joinFields returns, so no accounting slip can emit more than the
+ * bound;
+ * (e) metadata compatibility is checked in BOTH merge paths:
+ * subgroup collapse applies the same options check as resolved-node
+ * merging (contents and order), while labels keep
+ * first-occurrence-wins within a subgroup (the W-9's repeat boxes
+ * carry per-occurrence captions) and fail closed on conflict only
+ * across subgroups;
+ * (f) xml:space is preserved through normalization: caption labels
+ * normalize only their default segments, keeping a preserved
+ * descendant's whitespace verbatim, and an unnamed option field's
+ * own effective state governs its items.
  * No single bound retires the others, and no coverage is claimed
- * beyond them: the depth gate still runs after dependency parsing,
- * and the byte budgets bound work done inside this module, not the
- * parser's internal work on up to 10 MiB of XML.
+ * beyond them: the depth gate still runs after dependency parsing;
+ * the byte budgets bound work done inside this module, not the
+ * parser's internal work on up to 10 MiB of XML; the per-packet size
+ * check runs after decoding (the decode budget is external); and the
+ * duplicate-work charge is a conservative over-approximation of the
+ * comparison work (1× retained size per merge), with the 64 MiB cap
+ * a calibration, not a proven-tight limit.
  */
 interface PathBucket {
   leaves: DataLeaf[];
@@ -1418,57 +1557,132 @@ function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string)
     value: leaf.value,
     type: leaf.markup ? "unsupported" : field.ui,
   };
+  // Options are shared read-only: no code path ever mutates an
+  // options array after construction (merges only assign or compare
+  // it), so sharing is safe — and it is what lets mergeDuplicate()
+  // compare options by reference in O(1) in the common case. onValues
+  // MUST be an owned copy (A-1, round 7): mergeDuplicate() pushes
+  // merged on-values onto the resolved field's array, and sharing the
+  // template unit's array let one merge corrupt every other field
+  // resolved from the same unit — and left those fields' growth
+  // uncharged by the output-byte bound.
   if (field.options) out.options = field.options;
   if (field.label) out.label = field.label;
-  if (field.onValues) out.onValues = field.onValues;
+  if (field.onValues) out.onValues = [...field.onValues];
   return out;
+}
+
+/** Byte length of one JSON string literal (quotes + escapes), UTF-8. */
+function jsonStringBytes(value: string): number {
+  return utf8Length(JSON.stringify(value));
+}
+
+/**
+ * One resolved field's retained merge accounting (A-4, round 7):
+ * the serialized size is kept incrementally (never re-serialized per
+ * duplicate), the on-values dedup set is created once at first push
+ * (never rebuilt per duplicate), and the merged on-values' byte total
+ * is kept alongside it for the T-4 bound.
+ */
+interface ResolvedFieldEntry {
+  field: XfaField;
+  somPath: string;
+  /** Serialized JSON byte length of `field`, plus 1 for its separator. */
+  bytes: number;
+  /** Persistent dedup set for the field's on-values. */
+  onValuesSeen: Set<string>;
+  /**
+   * Byte length of the field's merged on-values, charged in the T-4
+   * convention (JSON-literal bytes + 2 per value, matching the
+   * subgroup-collapse charge).
+   */
+  onValuesBytes: number;
 }
 
 /**
  * Merge a second occurrence of one resolved data node onto the field
- * already reported for it (A-4, round 6). Same node, so the value must
- * agree; the type, options, and label describe that one node, so they
- * must agree too when both sides state them — disagreement is a
- * genuine conflict between two template occurrences, not a merge, and
- * fails closed. Checkbox on-values union (dedup, first-seen order),
- * byte-bounded like the group merge in joinFields.
+ * already reported for it (A-4, round 6; accounting and persistent
+ * state round 7). Same node, so the value must agree; the type,
+ * options, and label describe that one node, so they must agree too
+ * when both sides state them — disagreement is a genuine conflict
+ * between two template occurrences, not a merge, and fails closed.
+ * Checkbox on-values union (dedup, first-seen order), byte-bounded
+ * like the group merge in joinFields.
+ *
+ * Round 7: the merge state is PERSISTENT, not rebuilt per duplicate —
+ * `onValuesSeen` is the resolved field's own Set, created once at
+ * first push, so a duplicate never re-scans the accumulated
+ * on-values (the old code rebuilt `new Set(existing.onValues)` and
+ * recounted accumulated strings on every duplicate). The function
+ * returns the exact byte delta the merge adds to the field's
+ * serialized JSON, so push() can re-charge the output bound
+ * incrementally instead of re-serializing the whole accumulated field
+ * per duplicate. Adding a key to a non-empty JSON object always costs
+ * exactly `,"key":value`, and appending to an array costs `,value`
+ * per element, so the delta is exact for any insertion position;
+ * byte lengths use the JSON literal form (escapes included).
  */
-function mergeDuplicate(existing: XfaField, incoming: XfaField, somPath: string): void {
+function mergeDuplicate(previous: ResolvedFieldEntry, incoming: XfaField): number {
+  const existing = previous.field;
+  const somPath = previous.somPath;
   const conflict = (detail: string): XfaError =>
     new XfaError(
       `XFA template/datasets mismatch: field '${shortName(somPath)}' has conflicting ${detail} for data node '${shortName(existing.name)}'`,
     );
   if (existing.type !== incoming.type) throw conflict("types");
   if (existing.value !== incoming.value) throw conflict("values");
+  let delta = 0;
   if (existing.options !== undefined && incoming.options !== undefined) {
-    if (JSON.stringify(existing.options) !== JSON.stringify(incoming.options))
+    // Reference fast path first: resolved fields built from one
+    // template unit share its options array, so the common case is
+    // O(1); only genuinely different arrays pay an element-wise
+    // comparison, never a re-serialization.
+    if (
+      existing.options !== incoming.options &&
+      (existing.options.length !== incoming.options.length ||
+        existing.options.some((option, index) => option !== incoming.options?.[index]))
+    )
       throw conflict("options");
   } else if (incoming.options !== undefined) {
     existing.options = incoming.options;
+    delta += 1 + utf8Length('"options":') + utf8Length(JSON.stringify(incoming.options));
   }
   if (existing.label !== undefined && incoming.label !== undefined) {
     if (existing.label !== incoming.label) throw conflict("labels");
   } else if (incoming.label !== undefined) {
     existing.label = incoming.label;
+    delta += 1 + utf8Length('"label":') + jsonStringBytes(incoming.label);
   }
   if (incoming.onValues !== undefined) {
     if (existing.onValues === undefined) {
       existing.onValues = [...incoming.onValues];
+      for (const value of incoming.onValues) previous.onValuesSeen.add(value);
+      previous.onValuesBytes = incoming.onValues.reduce(
+        (total, value) => total + utf8Length(value) + 2,
+        0,
+      );
+      if (previous.onValuesBytes > MAX_JOINED_BYTES)
+        throw new XfaError(
+          `XFA join produced more than ${MAX_JOINED_BYTES} bytes of checkbox on-values for field '${shortName(somPath)}'; refusing to report an unbounded result`,
+        );
+      delta += 1 + utf8Length('"onValues":') + utf8Length(JSON.stringify(incoming.onValues));
     } else {
-      const seen = new Set(existing.onValues);
-      let bytes = existing.onValues.reduce((total, value) => total + utf8Length(value) + 2, 0);
       for (const value of incoming.onValues) {
-        if (seen.has(value)) continue;
-        seen.add(value);
+        if (previous.onValuesSeen.has(value)) continue;
+        previous.onValuesSeen.add(value);
         existing.onValues.push(value);
-        bytes += utf8Length(value) + 2;
-        if (bytes > MAX_JOINED_BYTES)
+        // Appending one element to the serialized array: one comma
+        // plus the element's JSON literal.
+        delta += 1 + jsonStringBytes(value);
+        previous.onValuesBytes += utf8Length(value) + 2;
+        if (previous.onValuesBytes > MAX_JOINED_BYTES)
           throw new XfaError(
             `XFA join produced more than ${MAX_JOINED_BYTES} bytes of checkbox on-values for field '${shortName(somPath)}'; refusing to report an unbounded result`,
           );
       }
     }
   }
+  return delta;
 }
 
 /**
@@ -1602,8 +1816,28 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
             }
           }
         }
+        // Labels keep first-occurrence-wins (A-2, round 7): repeat
+        // occurrences of one field carry per-occurrence captions —
+        // the W-9's seven c1_1 boxes are captioned
+        // "Individual/sole proprietor", "C corporation", "S
+        // corporation", ... — and the collapsed field reports the
+        // first occurrence's caption by established convention, so
+        // differing labels within one subgroup are NOT a conflict
+        // (cross-subgroup label conflicts still fail closed in
+        // mergeDuplicate()). Options are different: they state the
+        // one field's value domain, so two occurrences of the same
+        // identity that disagree on options — contents or order —
+        // fail closed here, exactly as mergeDuplicate() does for
+        // resolved-node merges across subgroups.
         if (!merged.label && field.label) merged.label = field.label;
-        if (!merged.options && field.options) merged.options = field.options;
+        if (merged.options !== undefined && field.options !== undefined) {
+          if (JSON.stringify(merged.options) !== JSON.stringify(field.options))
+            throw new XfaError(
+              `XFA template/datasets mismatch: field '${shortName(somPath)}' has conflicting options`,
+            );
+        } else if (!merged.options && field.options) {
+          merged.options = field.options;
+        }
       }
       merged.onValues = onValues;
       units.push(merged);
@@ -1625,13 +1859,32 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   // at 1, not 0. Starting at 0 undercounted the full array by exactly
   // 1 byte.
   let outBytes = 1;
-  const resolvedByName = new Map<string, { field: XfaField; somPath: string; bytes: number }>();
+  const resolvedByName = new Map<string, ResolvedFieldEntry>();
+  // Cumulative duplicate-work budget (A-4, round 7): every duplicate
+  // merge is charged the merged field's retained serialized size —
+  // the work a naive re-serialization would have paid, and an upper
+  // bound on the comparison work the merge can do against that field
+  // (value/options/label comparisons each touch at most the field).
+  // Incoming-side work needs no charge here: each unit's on-values
+  // and options are built once from the template, so their total
+  // across all duplicates is bounded by the template input. Past the
+  // budget the inspect fails closed instead of letting duplicates ×
+  // retained field size grow without bound.
+  let duplicateWorkBytes = 0;
   const push = (field: XfaField, somPath: string): void => {
     const previous = resolvedByName.get(field.name);
     if (previous !== undefined) {
       if (previous.somPath !== somPath)
         throw new XfaError(
           `XFA template/datasets mismatch: fields '${shortName(previous.somPath)}' and '${shortName(somPath)}' resolve to the same data node '${shortName(field.name)}'`,
+        );
+      // Charge BEFORE merging (A-4, round 7): the charge is what
+      // bounds the work — tripping it must not require doing the
+      // merge first.
+      duplicateWorkBytes += previous.bytes;
+      if (duplicateWorkBytes > MAX_CUMULATIVE_DUPLICATE_BYTES)
+        throw new XfaError(
+          `XFA join exceeded ${MAX_CUMULATIVE_DUPLICATE_BYTES} bytes of cumulative duplicate-merge work; refusing to report an unbounded result`,
         );
       // Same template path, same resolved data node (A-4, round 6):
       // overlapping scopes split one somPath group into units that
@@ -1641,11 +1894,13 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       // public name twice. Scope ids alone cannot establish that two
       // units' resolved node sets are disjoint — the resolved node
       // is the identity, checked here. The merged field keeps its
-      // place in the output; only its serialized size is re-charged.
-      mergeDuplicate(previous.field, field, somPath);
-      const mergedBytes = utf8.encode(JSON.stringify(previous.field)).length + 1;
-      outBytes += mergedBytes - previous.bytes;
-      previous.bytes = mergedBytes;
+      // place in the output; only its serialized size is re-charged,
+      // incrementally (A-4, round 7) — mergeDuplicate() returns the
+      // exact byte delta, so the accumulated field is never
+      // re-serialized per duplicate.
+      const delta = mergeDuplicate(previous, field);
+      previous.bytes += delta;
+      outBytes += delta;
       if (outBytes > MAX_JOINED_BYTES)
         throw new XfaError(
           `XFA join produced more than ${MAX_JOINED_BYTES} bytes of resolved fields; refusing to report an unbounded result`,
@@ -1653,7 +1908,14 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       return;
     }
     const bytes = utf8.encode(JSON.stringify(field)).length + 1;
-    resolvedByName.set(field.name, { field, somPath, bytes });
+    resolvedByName.set(field.name, {
+      field,
+      somPath,
+      bytes,
+      onValuesSeen: new Set(field.onValues ?? []),
+      onValuesBytes:
+        field.onValues?.reduce((total, value) => total + utf8Length(value) + 2, 0) ?? 0,
+    });
     out.push(field);
     if (out.length > MAX_JOINED_FIELDS)
       throw new XfaError(
@@ -1696,6 +1958,18 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       );
     for (const match of matches) push(toXfaField(field, match), field.somPath);
   }
+  // Final output-byte verification (A-1, round 7): the running
+  // outBytes accounting is exact-incremental, but the 1 MiB guarantee
+  // is only as sound as every mutation staying charged — the round-6
+  // code proved a shared-array mutation could grow fields the
+  // accounting never saw. Verify the exact serialized size once,
+  // before returning, so no future accounting slip can emit more than
+  // MAX_JOINED_BYTES. One serialization of at most ~1 MiB of retained
+  // output; the bound it checks keeps that cost bounded.
+  if (utf8Length(JSON.stringify(out)) > MAX_JOINED_BYTES)
+    throw new XfaError(
+      `XFA join produced more than ${MAX_JOINED_BYTES} bytes of resolved fields; refusing to report an unbounded result`,
+    );
   return out;
 }
 

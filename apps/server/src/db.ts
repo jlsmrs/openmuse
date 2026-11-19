@@ -305,39 +305,97 @@ export function createPool(connectionString: string) {
   return pool;
 }
 
+/**
+ * Minimal pool/client shape the pg transaction runner needs (B-1,
+ * round 7). A real pg.Pool satisfies it; tests supply a fake that
+ * records releases, so the rollback-failure discard is asserted at
+ * mock level (no live PostgreSQL in this environment).
+ */
+export interface PgTransactionClient {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  /** pg's release: an error argument destroys the client instead of returning it to the pool. */
+  release: (error?: Error) => void;
+}
+export interface PgTransactionPool {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  connect: () => Promise<PgTransactionClient>;
+  end: () => Promise<void>;
+}
+
+/**
+ * The pg-backed Database: ordinary queries go straight to the pool;
+ * a transaction checks one client out for its whole lifetime.
+ *
+ * (B-1, round 7) A failed ROLLBACK must NOT return the client to the
+ * usable pool: the connection may still hold the abandoned
+ * transaction open (e.g. the work query timed out client-side while
+ * still executing server-side), and a later COMMIT on a reused
+ * connection could commit it. So a rollback failure discards the
+ * client through pg's error release path (release(error) destroys
+ * it), reports the cleanup failure via backgroundFailure, and still
+ * rethrows the ORIGINAL operation error — the rollback failure never
+ * masks it. The client is released exactly once on every path: the
+ * success path releases after COMMIT, the failure path releases
+ * after the ROLLBACK attempt (with or without the discard error).
+ */
+export function createPgDatabase(pool: PgTransactionPool): Database {
+  return {
+    query: async (sql, params) => pool.query(sql, params),
+    transaction: async (fn) => {
+      const client = await pool.connect();
+      let released = false;
+      const release = (error?: Error): void => {
+        if (released) return;
+        released = true;
+        if (error !== undefined) client.release(error);
+        else client.release();
+      };
+      try {
+        await client.query("BEGIN");
+        const result = await fn((sql, params) => client.query(sql, params));
+        try {
+          await client.query("COMMIT");
+        } catch (commitError) {
+          // The COMMIT may have completed server-side before the
+          // connection broke: the outcome is indeterminate, not a
+          // rollback. Mark it — the ROLLBACK attempt below is
+          // connection hygiene only and cannot prove a rollback
+          // happened, so the mark survives it.
+          throw markIndeterminateCommit(commitError);
+        }
+        release();
+        return result;
+      } catch (error) {
+        let rollbackError: unknown;
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackFailure) {
+          rollbackError = rollbackFailure;
+        }
+        if (rollbackError !== undefined) {
+          backgroundFailure("postgres rollback failed", rollbackError);
+          release(
+            rollbackError instanceof Error
+              ? rollbackError
+              : new Error("PostgreSQL ROLLBACK failed", { cause: rollbackError }),
+          );
+        } else {
+          release();
+        }
+        throw error;
+      }
+    },
+    close: () => pool.end(),
+  };
+}
+
 export async function createStore(
   options: { dataDir?: string; databaseUrl?: string } = {},
 ): Promise<Store> {
   let database: Database;
   if (options.databaseUrl) {
     const pool = createPool(options.databaseUrl);
-    database = {
-      query: async (sql, params) => pool.query(sql, params),
-      transaction: async (fn) => {
-        const client = await pool.connect();
-        try {
-          await client.query("BEGIN");
-          const result = await fn((sql, params) => client.query(sql, params));
-          try {
-            await client.query("COMMIT");
-          } catch (commitError) {
-            // The COMMIT may have completed server-side before the
-            // connection broke: the outcome is indeterminate, not a
-            // rollback. Mark it — the ROLLBACK attempt below is
-            // connection hygiene only and cannot prove a rollback
-            // happened, so the mark survives it.
-            throw markIndeterminateCommit(commitError);
-          }
-          return result;
-        } catch (error) {
-          await client.query("ROLLBACK").catch(() => undefined);
-          throw error;
-        } finally {
-          client.release();
-        }
-      },
-      close: () => pool.end(),
-    };
+    database = createPgDatabase(pool);
   } else {
     if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
     const embedded = new PGlite(options.dataDir);
