@@ -57,6 +57,27 @@ const MAX_XFA_TAGS = 200000;
 /** Recursive walks give up past this depth instead of overflowing the stack. */
 const MAX_XFA_DEPTH = 100;
 /**
+ * Cumulative bound on namespace-map copying (A-1, round 11): an
+ * element that declares a namespace gets a fresh copy of its
+ * parent's whole bindings map, so one wide ancestor (thousands of
+ * prefixes) times many declaring descendants multiplies retained
+ * map entries as their PRODUCT — depth bounds ancestor count, NOT
+ * declarations per ancestor, so the round-10 "O(depth²) and small"
+ * claim was wrong and is RETRACTED here (see the R-7 correction
+ * below). Each copy is charged its parent's map size plus the
+ * element's own declaration count, and the total across one packet
+ * conversion may not exceed this. 250,000 entries leaves ample
+ * room for legitimate forms (the W-9 declares a handful of
+ * namespaces; a form with 100 prefixes at its root and 1,000
+ * declaring descendants charges 100,000) while capping the
+ * amplification at a small multiple of the input: the worst
+ * retained map total is ~250k entries, reached only by failing
+ * closed with a 422 before the copy is made. Calibration is open:
+ * a legitimate form with an unusually wide namespace environment
+ * AND many declaring descendants could trip it.
+ */
+const MAX_CUMULATIVE_NS_BINDING_ENTRIES = 250_000;
+/**
  * Hard output bound for the SOM join: one template field can otherwise
  * resolve to thousands of repeat instances (P1-8). A form that would
  * report more than this many fields fails closed instead.
@@ -213,18 +234,26 @@ function isRecord(value: unknown): value is XmlRecord {
  * order. Keeping text interleaved with elements (instead of merging it
  * into one #text value) is what makes rich-text order recoverable.
  *
- * Namespace bindings (A-1, round 10): `ns` is the resolved namespace
- * URI of the element's own qualified name — the binding for its
- * prefix, or the in-scope default namespace for an unprefixed name —
- * or undefined when the element is in no namespace. `nsUnbound` is
- * true when the name carries a prefix with no binding in scope: its
- * namespace is UNKNOWN, not "none", and classification fails closed
- * on it. `bindings` is the full in-scope prefix→URI map ("" is the
- * default namespace) at this element, inherited down the walk: a
- * binding declared on an ancestor governs descendants until
- * redeclared, exactly as XML namespaces work. The map is shared,
- * never mutated after creation — an element that declares a namespace
- * gets a fresh copy — so sharing costs nothing per element.
+ * Namespace bindings (A-1, round 10; copying bounded A-1, round 11):
+ * `ns` is the resolved namespace URI of the element's own qualified
+ * name — the binding for its prefix, or the in-scope default
+ * namespace for an unprefixed name — or undefined when the element
+ * is in no namespace. `nsUnbound` is true when the name carries a
+ * prefix with no binding in scope: its namespace is UNKNOWN, not
+ * "none", and classification fails closed on it. `bindings` is the
+ * full in-scope prefix→URI map ("" is the default namespace) at
+ * this element, inherited down the walk: a binding declared on an
+ * ancestor governs descendants until redeclared, exactly as XML
+ * namespaces work. The map is shared, never mutated after creation
+ * — an element that declares a namespace gets a fresh copy — but
+ * that copy is NOT free: it copies every inherited entry, so a wide
+ * ancestor times many declaring descendants multiplies retained
+ * entries as their product (A-1, round 11). Copying is therefore
+ * charged against a cumulative per-packet budget
+ * (MAX_CUMULATIVE_NS_BINDING_ENTRIES) in namespaceBindingsFor(),
+ * which fails closed before a copy that would exceed it; depth
+ * bounds ancestor count, not declarations per ancestor, and no
+ * depth-based bound is claimed for this work.
  */
 interface XElement {
   name: string;
@@ -242,31 +271,56 @@ const ROOT_NS_BINDINGS: ReadonlyMap<string, string> = new Map([
 ]);
 
 /**
+ * Cumulative namespace-map copying charged so far in one packet
+ * conversion (A-1, round 11): every fresh bindings map is charged
+ * its parent's size (the entries copied) plus its own declaration
+ * count, so the sum bounds the total retained map entries for the
+ * packet. Created once per packet in parseXfaXml and threaded
+ * through convertEntries/convertEntry; never shared across packets.
+ */
+interface NsBindingBudget {
+  used: number;
+}
+
+/**
  * The in-scope namespace bindings for an element: its parent's map,
  * plus any `xmlns` / `xmlns:prefix` declaration the element itself
  * carries. A declaration of "" undeclares that prefix (or the default
  * namespace). Returns the parent map unchanged — shared, not copied —
- * when the element declares nothing.
+ * when the element declares nothing. When the element DOES declare,
+ * the fresh copy is charged against the packet's cumulative budget
+ * BEFORE it is made (A-1, round 11): if the charge would exceed
+ * MAX_CUMULATIVE_NS_BINDING_ENTRIES the inspect fails closed with a
+ * 422 instead of building the copy. The check runs before the copy,
+ * so no over-budget map is ever retained; a field-less template is
+ * charged too, because conversion runs before field collection.
  */
 function namespaceBindingsFor(
   rawAttrs: XmlRecord,
   parent: ReadonlyMap<string, string>,
+  packetName: string,
+  budget: NsBindingBudget,
 ): ReadonlyMap<string, string> {
-  let bindings: Map<string, string> | null = null;
+  const declarations: Array<{ prefix: string; value: string }> = [];
   for (const [key, value] of Object.entries(rawAttrs)) {
     if (typeof value !== "string") continue;
-    if (key !== "@_xmlns" && !key.startsWith("@_xmlns:")) continue;
-    if (bindings === null) bindings = new Map(parent);
-    if (key === "@_xmlns") {
-      if (value === "") bindings.delete("");
-      else bindings.set("", value);
-    } else {
-      const prefix = key.slice("@_xmlns:".length);
-      if (value === "") bindings.delete(prefix);
-      else bindings.set(prefix, value);
-    }
+    if (key === "@_xmlns") declarations.push({ prefix: "", value });
+    else if (key.startsWith("@_xmlns:"))
+      declarations.push({ prefix: key.slice("@_xmlns:".length), value });
   }
-  return bindings ?? parent;
+  if (declarations.length === 0) return parent;
+  const charge = parent.size + declarations.length;
+  if (budget.used + charge > MAX_CUMULATIVE_NS_BINDING_ENTRIES)
+    throw new XfaError(
+      `XFA ${shortName(packetName)} packet declares too many namespace bindings (cumulative copied bindings would exceed ${MAX_CUMULATIVE_NS_BINDING_ENTRIES} entries; refusing to build unbounded namespace maps)`,
+    );
+  budget.used += charge;
+  const bindings = new Map(parent);
+  for (const { prefix, value } of declarations) {
+    if (value === "") bindings.delete(prefix);
+    else bindings.set(prefix, value);
+  }
+  return bindings;
 }
 
 /** Resolve an element name against its in-scope bindings. */
@@ -325,6 +379,7 @@ function convertEntry(
   packetName: string,
   depth: number,
   bindings: ReadonlyMap<string, string> = ROOT_NS_BINDINGS,
+  budget: NsBindingBudget,
 ): XElement | string | null {
   if (!isRecord(entry)) return null;
   const keys = Object.keys(entry);
@@ -347,13 +402,13 @@ function convertEntry(
   }
   // Namespace bindings in scope at this element: its own xmlns
   // declarations on top of its parent's, carried down to its children.
-  const elementBindings = namespaceBindingsFor(rawAttrs, bindings);
+  const elementBindings = namespaceBindingsFor(rawAttrs, bindings, packetName, budget);
   const { ns, nsUnbound } = resolveElementNamespace(tagKey, elementBindings);
   return {
     name: tagKey,
     local: tagKey.split(":").at(-1) ?? tagKey,
     attrs,
-    content: convertEntries(childEntries, packetName, depth + 1, elementBindings),
+    content: convertEntries(childEntries, packetName, depth + 1, elementBindings, budget),
     ns,
     nsUnbound,
     bindings: elementBindings,
@@ -376,12 +431,13 @@ function convertEntries(
   packetName: string,
   depth: number,
   bindings: ReadonlyMap<string, string> = ROOT_NS_BINDINGS,
+  budget: NsBindingBudget,
 ): Array<XElement | string> {
   if (depth > MAX_XFA_DEPTH)
     throw new XfaError(`XFA ${shortName(packetName)} packet is nested too deeply`);
   const out: Array<XElement | string> = [];
   for (const entry of entries) {
-    const converted = convertEntry(entry, packetName, depth, bindings);
+    const converted = convertEntry(entry, packetName, depth, bindings, budget);
     if (converted !== null) out.push(converted);
   }
   const seen = new Map<string, string>();
@@ -1107,7 +1163,11 @@ function parseXfaXml(packetName: string, bytes: Uint8Array): XElement[] {
   }
   if (!Array.isArray(parsed))
     throw new XfaError(`XFA packet '${shortName(packetName)}' is not parseable XML`);
-  return convertEntries(parsed, packetName, 0).filter(
+  // One cumulative namespace-map budget per packet (A-1, round 11):
+  // conversion is where the maps are built, before any field is
+  // collected, so the budget must start here, not at the join.
+  const nsBudget: NsBindingBudget = { used: 0 };
+  return convertEntries(parsed, packetName, 0, ROOT_NS_BINDINGS, nsBudget).filter(
     (item): item is XElement => typeof item !== "string",
   );
 }
@@ -1678,8 +1738,10 @@ function strippedSegments(segments: string[]): string[] {
  * declares the XHTML URI on company data is indistinguishable from
  * genuine XHTML by any evidence the tree holds. Where the evidence
  * genuinely cannot distinguish — an unbound prefix (namespace
- * unknown, not "none"), or a skeleton child in a different
- * namespace from its container — the classifier fails closed.
+ * unknown, not "none"), or a skeleton element in a different
+ * namespace from its container, at ANY level of the subtree
+ * (A-2, round 11: the round-10 rule checked the first level only)
+ * — the classifier fails closed.
  */
 const XHTML_SKELETON = new Set(["html", "head", "body"]);
 
@@ -1692,18 +1754,58 @@ const XHTML_SKELETON = new Set(["html", "head", "body"]);
  * a different namespace, or with an unbound prefix, is data in that
  * namespace, not part of this document, so the whole container fails
  * closed instead of flattening a mixture.
+ *
+ * (A-2, round 11) The check runs over the WHOLE subtree, not just
+ * the first level: the skeleton is two levels deep (xhtml → html →
+ * head/body → text), and the round-10 rule stopped at the first
+ * level, so a mixed namespace one level down (<h:html> holding
+ * <c:body>/<c:head>) still flattened into a fabricated scalar.
+ * Every descendant element must share the container's namespace
+ * (URI equality, never an unbound prefix) and must not carry a
+ * dataGroup marking (by expanded `dataNode` name, any prefix) —
+ * a contradictory descendant namespace or a group marking on any
+ * descendant defeats the classification, and the walk then recurses
+ * into the subtree as ordinary data, so the children stay
+ * addressable. The <html> level is skeleton-shaped too: its element
+ * children must be <head>/<body> only. Below head/body the content
+ * is arbitrary XHTML markup (<p>, <b>, <span>, …), so only the
+ * namespace and group-marking checks apply there — no element-name
+ * restriction. The container's own dataGroup marking defeats it as
+ * well (the callers check it too; this is the same rule applied at
+ * the element itself).
  */
 function isXhtmlDocument(element: XElement): boolean {
   if (element.local !== "xhtml") return false;
   if (element.nsUnbound) return false;
   if (element.ns !== undefined && element.ns !== XHTML_NAMESPACE) return false;
+  if (dataNodeValue(element) === "dataGroup") return false;
   const children = elementChildren(element);
-  return (
-    children.length > 0 &&
-    children.every(
+  if (
+    children.length === 0 ||
+    !children.every(
       (child) => XHTML_SKELETON.has(child.local) && !child.nsUnbound && child.ns === element.ns,
     )
-  );
+  )
+    return false;
+  // Whole-subtree validation: every descendant shares the
+  // container's namespace, carries no unbound prefix and no
+  // dataGroup marking, and an <html> element's children are
+  // <head>/<body> only. Iterative — the tree is already
+  // depth-bounded by conversion, but no walk here assumes that.
+  const pending: XElement[] = [...children];
+  while (pending.length > 0) {
+    const descendant = pending.pop() as XElement;
+    if (descendant.nsUnbound || descendant.ns !== element.ns) return false;
+    if (dataNodeValue(descendant) === "dataGroup") return false;
+    const grandChildren = elementChildren(descendant);
+    if (
+      descendant.local === "html" &&
+      !grandChildren.every((child) => child.local === "head" || child.local === "body")
+    )
+      return false;
+    pending.push(...grandChildren);
+  }
+  return true;
 }
 
 /**
@@ -2096,8 +2198,32 @@ function matchesSelectors(
  * one character, or a 6-character named entity for the five results
  * that must not become markup (`<`, `>`, `&`, `"`, `'`), so the
  * decoded text is at most a small constant factor of the input.
- * What this still does NOT cover — restated plainly (R-7, round 10,
- * fifth pass): semantic classification is outside what any resource
+ * (h) namespace-map copying is bounded by a cumulative entries
+ * budget, NOT by depth (A-1, round 11 — sixth pass, RETRACTING the
+ * round-10 claim): the round-10 prompt head (§0b) said a fresh map
+ * copy happens only on a declaring element and depth is capped at
+ * 100, "so the worst-case copy work is O(depth²) and small". That
+ * is WRONG, and the sentence is replaced, not qualified: depth
+ * bounds ancestor count, NOT the number of namespace declarations
+ * on an ancestor, so one element declaring thousands of prefixes
+ * times many declaring descendants multiplies retained map entries
+ * as their product (a 10,000-prefix root × 50,000 declaring
+ * siblings ≈ 500M entries from a ~2.5 MB packet). What bounds the
+ * copying now is the cumulative budget in namespaceBindingsFor():
+ * each copy is charged its parent's map size plus the element's own
+ * declaration count, and the total across one packet conversion may
+ * not exceed MAX_CUMULATIVE_NS_BINDING_ENTRIES (250,000), checked
+ * BEFORE the copy is made, so the inspect fails closed with a 422
+ * instead of building an over-budget map. The budget covers
+ * pre-resolution conversion work — it runs before field collection,
+ * so a field-less template is charged too — and it bounds retained
+ * map entries (each map's entries are either copied, charged, or
+ * newly declared, charged), not lookup time: lookups are single
+ * Map.get calls on the retained maps. It does NOT cover the
+ * parser's own internal work on the packet, and it does NOT prove
+ * anything about namespace semantics — see below.
+ * What this still does NOT cover — restated plainly (R-7, round 11,
+ * sixth pass): semantic classification is outside what any resource
  * bound can establish (round 8, unchanged): the bounds cap work and
  * output size around whatever the dataset classification produces,
  * but they cannot prove the classification itself is right — a
@@ -2117,7 +2243,13 @@ function matchesSelectors(
  * data is indistinguishable from genuine XHTML, a namespace-less
  * skeleton-shaped element is accepted by the legacy no-namespace
  * convention, and an unbound prefix fails closed as unknown rather
- * than being read as "none". A decoded `&#13;` (CR) reports as LF
+ * than being read as "none". (A-2, round 11) The skeleton check now
+ * runs over the whole subtree, not just the first level, and a
+ * descendant group marking defeats classification — but that is
+ * still classification on the evidence the tree holds, not a bound:
+ * no byte or count budget can establish that a descendant in the
+ * XHTML namespace is genuine XHTML rather than company data
+ * declared under that URI. A decoded `&#13;` (CR) reports as LF
  * because the parser normalizes line endings on input. The
  * per-packet size check still runs after decoding (the decode
  * budget is external), the duplicate-work charge is still a
