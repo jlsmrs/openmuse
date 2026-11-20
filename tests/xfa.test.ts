@@ -5285,17 +5285,39 @@ test("B-2 (round 15): a <head> nested in body content keeps its text (probe V3 s
 });
 
 test("B-2 (round 15): a <head> in body content keeps inter-element spaces (probe V4 shape)", async () => {
-  // Same position defect with sibling <b> elements: the space between
-  // them is body content under a body-content <head>, not skeleton
-  // formatting — "A B", not "AB".
+  // Same position defect with sibling <b> elements: the whitespace
+  // between them is body content under a body-content <head>, not
+  // skeleton formatting. (Round 16 refinement: the whitespace is a
+  // NEWLINE, not a same-line space — a same-line space is kept
+  // under default handling too (S-3), so the old " " shape could
+  // not tell preserve from default. The newline is skipped under
+  // default and kept under preserve, so this test now distinguishes
+  // both: a regressed position-blind strip would drop it, and a
+  // dropped preserve would skip it — either way "A\nB" becomes
+  // "AB".)
   const bytes = await createXfaPdf(
     wrap(
       '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
-      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><head xml:space="preserve"><b>A</b> <b>B</b></head></body></xhtml></note>`,
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><head xml:space="preserve"><b>A</b>\n<b>B</b></head></body></xhtml></note>`,
     ),
   );
   const result = await inspectPdf(bytes);
-  assert.deepEqual(result.fields, [{ name: "form.note", value: "A B", type: "unsupported" }]);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "unsupported" }]);
+});
+
+test("B-2 (round 16): the V4 shape without preserve skips the newline (control)", async () => {
+  // Control for the refined V4 test above: the same body-content
+  // <head> shape with NO xml:space="preserve" anywhere skips the
+  // newline between the <b> elements as formatting ("AB") — the
+  // newline is kept only because the head preserves it.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><head><b>A</b>\n<b>B</b></head></body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
 });
 
 test("B-2 (round 15): whitespace under a body-content <head> is kept (probe V5 shape)", async () => {
@@ -5552,14 +5574,21 @@ test("B-5 (round 15): two unbound prefixes never agree with each other either", 
 test("B-6 (round 15): many repeat matches sharing a long URI still resolve (interned comparison)", async () => {
   // Repeat agreement used to re-compare raw URI strings per matched
   // leaf per segment, so a long URI shared by many matches multiplied
-  // the join work by its length (1,000 matches sharing a 5 KiB URI
-  // measured ~6x a short-URI control). URIs are now interned to ids
-  // once per inspect at leaf construction and compared as ids, so
-  // 200 repeats sharing a ~4 KiB URI resolve exactly like short-URI
-  // repeats. No timing assertion: the property under test is that
-  // the comparison path completes correctly without tripping the
-  // structural budget — the timing shape is pinned by the probe
-  // harness, not by a wall-clock assertion in the suite.
+  // the join work by its length. (Round 16 correction of this
+  // comment: the ~6x timing and ~7 s extrapolation it used to cite
+  // are removed — the timing did not isolate comparison work, and
+  // the extrapolation was not a measurement.) URIs are interned to
+  // ids once per inspect — once per element at walk time, through
+  // the parent-linked namespace path (round 16, C-5/C-6) — and
+  // compared as ids, so 200 repeats sharing a ~4 KiB URI resolve
+  // exactly like short-URI repeats. No timing assertion: the
+  // property under test is that the comparison path completes
+  // correctly without tripping the structural budget — the timing
+  // shape is pinned by the probe harness, not by a wall-clock
+  // assertion in the suite. This test checks count + endpoints
+  // only, as designed; the round-16 C-6 test pins the interning
+  // contract more directly (inherited bindings, interning by
+  // value across separately declared identical URIs).
   const longUri = `urn:${"x".repeat(4000)}`;
   const persons = Array.from(
     { length: 200 },
@@ -5637,4 +5666,391 @@ test("B-7 (round 15): plain space+newline in a caption is still skipped (caption
   );
   const result = await inspectPdf(bytes);
   assert.deepEqual(result.fields, [{ name: "form.note", value: "X", type: "text", label: "AB" }]);
+});
+
+// Regression tests for the six converged P1s (C-1 pooled-key
+// re-materialization, C-2 singleton unbound prefix, C-3 unbound
+// exData wrapper, C-4 same-leaf duplicate pooling, C-5 per-leaf
+// namespace arrays, C-6 per-leaf URI interning) plus the re-review's
+// test-adequacy items (body-content <html> boundary, wrapper-vs-inner
+// xml:space, direct-root skeleton-head exclusion). Probe shapes are
+// noted per test. All assertions are value/error assertions — no
+// timing thresholds anywhere in this block.
+
+test("C-1 (round 16): long-path overlapping pooling resolves once per leaf (probe shape)", async () => {
+  // 16 overlapping units of one template field — 16 sibling <subform
+  // name="s"> dataRef-scoped to the same 4-singleton chain + 8 KiB
+  // segment, one [0]/bare variant per ancestor — each resolving the
+  // same 50 <code> leaves. The round-15 pooling loop rebuilt the
+  // stripped key per match per unit (16 × 50 × 8 KiB of key
+  // construction here; 256 units × 50 × 8 KiB ≈ 100 MB in the probe
+  // shape) before any merge bound could fire. Pooling now keys by
+  // the canonical path id assigned once at index time and dedupes
+  // by leaf identity, so the 50 leaves report once each with the
+  // right values. Positive control by design: the old code reports
+  // the same 50 fields (slowly) — the fix is work-accounting, and
+  // no assertion-based test can observe removed key construction
+  // except through the fail-closed budgets, which this shape stays
+  // under (duplicate charges ≈ 6 MB of the 64 MiB budget; output
+  // ≈ 410 KB of the 1 MiB bound).
+  const longSeg = "a".repeat(8 * 1024);
+  const leaves = Array.from({ length: 50 }, (_, i) => `<code>V${i}</code>`).join("");
+  const units = Array.from({ length: 16 }, (_, variant) => {
+    const selectors = [0, 1, 2, 3].map((level) =>
+      (variant >> level) & 1 ? `a${level}[0]` : `a${level}`,
+    );
+    const ref = `$data.form.${selectors.join(".")}.${longSeg}`;
+    return `<subform name="s"><bind match="dataRef" ref="${ref}"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>`;
+  }).join("");
+  const bytes = await createXfaPdf(
+    wrap(units, `<a0><a1><a2><a3><${longSeg}>${leaves}</${longSeg}></a3></a2></a1></a0>`),
+  );
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 50);
+  assert.deepEqual(result.fields[0], {
+    name: `form.a0.a1.a2.a3.${longSeg}.code[0]`,
+    value: "V0",
+    type: "text",
+  });
+  assert.deepEqual(result.fields[49], {
+    name: `form.a0.a1.a2.a3.${longSeg}.code[49]`,
+    value: "V49",
+    type: "text",
+  });
+});
+
+test("C-2 (round 16): a singleton default lookup with an undeclared prefix fails closed (probe X1)", async () => {
+  // assertExpandedNamesAgree() used to return early when fewer than
+  // two matches were compared, so a lone <p:code>VALUE</p:code>
+  // with p undeclared resolved as form.code = "VALUE". The
+  // documented [N] boundary covers selecting one leaf in a KNOWN
+  // foreign namespace — an undeclared prefix has no expanded name,
+  // so the singleton fails closed on the unknown namespace.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<p:code>VALUE</p:code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.code.*unknown.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("C-2 (round 16): a singleton global lookup with an undeclared prefix fails closed (probe X1b)", async () => {
+  // The global path never called the agreement check at all, so the
+  // same undeclared-prefix singleton resolved there too. The
+  // first-same-named-leaf rule does not exempt the leaf from the
+  // unknown-namespace rule.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="global"/></field>',
+      `<p:code>VALUE</p:code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.code.*unknown.*unbound prefix/);
+    return true;
+  });
+});
+
+test("C-2 (round 16): a selector-narrowed singleton with an undeclared prefix fails closed (probe X1c)", async () => {
+  // A [0] selector narrowing to one leaf is not a repeat claim, but
+  // it is not an exemption from the unknown-namespace rule either:
+  // the selected leaf's prefix is undeclared, so its expanded name
+  // is unknown and the lookup fails closed.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.person[0].code"/></field>',
+      `<person><p:code>VALUE</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.code.*unknown.*unbound prefix/);
+    return true;
+  });
+});
+
+test("C-2 (round 16): a singleton in a DECLARED foreign namespace still resolves (probe X1d control)", async () => {
+  // Control for the X1/X1b/X1c regressions: the same singleton
+  // shape with p DECLARED (xmlns:p="urn:second") is the decided
+  // [N] boundary — one leaf in a known foreign namespace — and
+  // must still report "VALUE".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<p:code xmlns:p="urn:second">VALUE</p:code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.code", value: "VALUE", type: "text" }]);
+});
+
+test("C-3 (round 16): an unbound exData wrapper does not disappear into a rich-text binding (probe X3)", async () => {
+  // <p:exData> with p undeclared wrapping correctly-namespaced
+  // <h:xhtml> used to flatten to "Inside": isRichTextContainer
+  // checked the wrapper's local name/group/content-type/shape but
+  // never its namespace state, and the emitted leaf's path is the
+  // parent's, so the wrapper never appeared in any namespace check.
+  // The unknown wrapper now defeats classification — the parent
+  // recurses as ordinary data, so the field has no data node.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><p:exData contentType="text/html"><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body>Inside</h:body></h:html></h:xhtml></p:exData></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.note.*has no data node/);
+    assert.doesNotMatch(error.message, /Inside/);
+    return true;
+  });
+});
+
+test("C-3 (round 16): a DECLARED exData wrapper around genuine XHTML still flattens (probe X3b control)", async () => {
+  // Control for the X3 regression: the same wrapper with p
+  // DECLARED (xmlns:p="urn:wrapper") is the documented case of a
+  // known unrelated wrapper namespace around genuine inner XHTML,
+  // and must still report "Inside".
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><p:exData contentType="text/html" xmlns:p="urn:wrapper"><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body>Inside</h:body></h:html></h:xhtml></p:exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("C-4 (round 16): one leaf, two overlapping units, unbound prefix fails closed on the prefix — not on repeats (probe X2)", async () => {
+  // Two units scoped $data.form.person and $data.form.person[0] on
+  // ONE leaf with undeclared p used to throw a repeats error: the
+  // pooling loop appended the same DataLeaf twice and the agreement
+  // check compared it with itself. Pooling now dedupes by leaf
+  // identity, so the pooled set is one leaf — and the deduped
+  // singleton then fails closed on its unbound prefix (C-2), which
+  // is the correct failure: the message names the unknown
+  // namespace, never repeats.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><p:code>VALUE</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.s\.code.*unknown.*unbound prefix/);
+    assert.doesNotMatch(error.message, /repeats/);
+    return true;
+  });
+});
+
+test("C-4 (round 16): one leaf, two overlapping units, declared namespace resolves once (probe X2b control)", async () => {
+  // Control for the X2 regression: the same two-unit shape with p
+  // DECLARED resolves the one leaf once — the overlapping scopes
+  // merge onto the shared data node instead of reporting it twice.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><p:code xmlns:p="urn:first">VALUE</p:code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.person.code", value: "VALUE", type: "text" }]);
+});
+
+test("C-4 (round 16): one leaf, two overlapping units, no namespace resolves once (probe X2c control)", async () => {
+  // Control for the X2 regression: the same two-unit shape with no
+  // namespace at all likewise resolves the one leaf once.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><code>VALUE</code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.person.code", value: "VALUE", type: "text" }]);
+});
+
+test("C-5 (round 16): deep/wide field-less allocation reports zero fields", async () => {
+  // The probe shape: a 40-deep chain ending in 20,000 empty sibling
+  // leaves, under a field-less template — a form yielding ZERO
+  // fields. Every leaf used to retain three full namespace arrays
+  // before any index check ran. Leaf collection is now skipped
+  // entirely when the template has no fields (the datasets packet
+  // is still parsed and validated), and the leaves that ARE
+  // collected carry one parent-linked namespace path pointer, not
+  // per-leaf arrays. Assertion-based: the count/bound under test
+  // is the zero-field result itself, not wall-clock time.
+  let inner = Array.from({ length: 20000 }, (_, i) => `<f${i}/>`).join("");
+  for (let depth = 0; depth < 40; depth++) inner = `<d${depth}>${inner}</d${depth}>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"></subform></template>',
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form>${inner}</form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, []);
+});
+
+test("C-5 (round 16): a field-less form with a dataset classification error still reports zero fields", async () => {
+  // JUDGMENT CALL for the re-review to rule on: skipping leaf
+  // collection for field-less templates also skips
+  // classification-only errors inside the datasets — non-whitespace
+  // text directly under an XHTML skeleton element used to throw
+  // here during collection (isXhtmlDocument), and now reports zero
+  // fields instead. The datasets packet is still parsed and
+  // validated (malformed XML still fails closed); only the leaf
+  // classification a field-less report has nothing to classify for
+  // is skipped. If the panel prefers the throw, the skip must be
+  // narrowed to plain leaves.
+  const bytes = await createXfaPdf(
+    wrap(
+      "",
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><html>TEXT<body>Inside</body></html></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, []);
+});
+
+test("C-6 (round 16): repeat leaves inheriting the same long URI from separately declared parents still agree (interning by value)", async () => {
+  // Each <person> declares xmlns:p to the SAME ~4 KiB URI text, but
+  // each declaration is a distinct string object from the parser,
+  // and each <code> inherits the URI through its parent's bindings
+  // rather than declaring it. Interning must canonicalize by VALUE
+  // (one id for the one URI) and carry the id through the inherited
+  // binding — the round-15 code paid a per-leaf string-key lookup
+  // per segment for exactly this shape. Pins the interning contract
+  // more directly than the B-6 test, which checks count + endpoints
+  // only. No timing assertion.
+  const longUri = `urn:${"x".repeat(4000)}`;
+  const persons = Array.from(
+    { length: 200 },
+    (_, index) => `<person xmlns:p="${longUri}"><p:code>V${index}</p:code></person>`,
+  ).join("");
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      persons,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.equal(result.fields.length, 200);
+  assert.deepEqual(result.fields[0], { name: "form.person[0].code", value: "V0", type: "text" });
+  assert.deepEqual(result.fields[199], {
+    name: "form.person[199].code",
+    value: "V199",
+    type: "text",
+  });
+});
+
+test("C-7 (round 16): a body-content <html> with non-head/body children defeats rich text", async () => {
+  // The <html>-child shape rule stays whole-subtree (round 16
+  // ruling): an <html> nested inside <body> is body content, so
+  // its direct text is kept (see the B-2 body-content <html> test)
+  // — but an <html> whose children are not <head>/<body> only
+  // (<div> here) defeats the classification, wherever it sits.
+  // The container recurses as ordinary data, so the field bound to
+  // the group itself has no data node.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body><html><div>Deep</div></html></body></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.note.*has no data node/);
+    assert.doesNotMatch(error.message, /Deep/);
+    return true;
+  });
+});
+
+test("C-7 (round 16): a skeleton-position <html> with direct text still throws the skeleton error (contrast)", async () => {
+  // Contrast for the body-content defeat above: the SAME <html>
+  // shape at a skeleton position (direct child of the <xhtml>
+  // frame) with non-whitespace direct text is not a defeat — it is
+  // the skeleton-text error, because the text sits outside <body>.
+  // The two shapes must fail with different messages.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><html>TEXT<body>Inside</body></html></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(
+      error.message,
+      /non-whitespace text directly under an XHTML skeleton element 'html'/,
+    );
+    return true;
+  });
+});
+
+test("C-7 (round 16): an inner xhtml xml:space=default overrides a preserve wrapper", async () => {
+  // Wrapper-vs-inner xml:space disagreement: the wrapper carries
+  // preserve, the inner <xhtml> declares default. The inner
+  // element's own state governs its subtree (nodeText applies the
+  // inner element's attribute over the carried-in state), so the
+  // newline between the <p> elements is formatting and skipped
+  // ("AB") — the wrapper's preserve does not leak past the inner
+  // declaration.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html" xml:space="preserve"><xhtml xmlns="http://www.w3.org/1999/xhtml" xml:space="default"><body><p>A</p>\n<p>B</p></body></xhtml></exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "AB", type: "unsupported" }]);
+});
+
+test("C-7 (round 16): an inner xhtml xml:space=preserve overrides a default wrapper", async () => {
+  // The disagreement in the other direction: the wrapper carries
+  // no preserve, the inner <xhtml> declares preserve. The inner
+  // state governs, so the newline between the <p> elements is
+  // content and kept ("A\nB").
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><exData contentType="text/html"><xhtml xmlns="http://www.w3.org/1999/xhtml" xml:space="preserve"><body><p>A</p>\n<p>B</p></body></xhtml></exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "A\nB", type: "unsupported" }]);
+});
+
+test("C-7 (round 16): a <head> directly under the <xhtml> frame root is metadata, not body content", async () => {
+  // Direct-root skeleton-head metadata exclusion (B-4, round 15,
+  // extended to the frame root itself): a <head> that is a DIRECT
+  // child of the classified <xhtml> frame — not only a <head> under
+  // <html> — contributes nothing to the value. Its whole subtree
+  // (the <title> here) is XHTML metadata, so the value is the body
+  // text only.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><head><title>META</title></head><body>Body</body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Body", type: "unsupported" }]);
 });
