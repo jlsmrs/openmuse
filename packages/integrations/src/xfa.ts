@@ -850,8 +850,27 @@ function attrInNamespace(
  * a value. When `xfa` IS bound, the binding governs: bound to
  * anything else, the literal spelling is a different attribute and
  * is not a group marking.
+ *
+ * (D-3, round 17) Any OTHER `dataNode` attribute whose prefix is
+ * unbound fails closed HERE, before classification can proceed as
+ * if the attribute were absent: its expanded name is unknown, so
+ * silently ignoring it let `<note p:dataNode="dataGroup">` with `p`
+ * undeclared classify as rich text and report its body text. The
+ * literal-`xfa` exception above is the only unbound spelling that
+ * is read rather than rejected.
  */
 function dataNodeValue(element: XElement): string | undefined {
+  for (const [key] of Object.entries(element.attrs)) {
+    const raw = key.startsWith("@_") ? key.slice(2) : key;
+    const colon = raw.indexOf(":");
+    if (colon < 0) continue;
+    if (raw.slice(colon + 1) !== "dataNode") continue;
+    const prefix = raw.slice(0, colon);
+    if (prefix !== "xfa" && !element.bindings.has(prefix))
+      throw new XfaError(
+        `XFA template/datasets mismatch: element '${shortName(element.local)}' carries a 'dataNode' attribute whose namespace is unknown (an unbound prefix '${shortName(prefix)}'); refusing to classify it`,
+      );
+  }
   const resolved = attrInNamespace(element, "dataNode", XFA_DATA_NAMESPACE);
   if (resolved !== undefined) return resolved;
   if (!element.bindings.has("xfa")) return attr(element, "xfa:dataNode");
@@ -1208,6 +1227,43 @@ export function countXmlScanSteps(text: string): number {
 }
 
 /**
+ * Distinct leaves pooled by the most recent joinFields run in this
+ * process (b/j, round 17): the cross-unit pooling loop dedupes by
+ * leaf identity, so one leaf referenced by two overlapping units
+ * counts ONCE. A test diagnostic in the style of
+ * countXmlScanSteps — a deterministic counter for the dedupe
+ * claim, which no value/error assertion can observe (a deduped
+ * leaf and an un-deduped one report the same field). It is set at
+ * the start of every joinFields run (0 for a field-less inspect,
+ * which never joins) and read after the inspect returns; like any
+ * module-level diagnostic it assumes tests run sequentially within
+ * a file, as the node test runner does by default.
+ */
+let lastPooledLeafCount = 0;
+export function pooledLeafCount(): number {
+  return lastPooledLeafCount;
+}
+
+/**
+ * Lookup-key cache MISSES charged by the most recent joinFields run
+ * in this process (a, round 17): lookupSelectors charges the
+ * aggregate internal-path budget once per DISTINCT key and caches
+ * the key, so a second lookup under the same (scope, leaf name) /
+ * (ref, scope) is a hit and charges nothing. This counter is the
+ * deterministic observable for that claim — a hit/miss test in
+ * the style of pooledLeafCount (a budget-boundary test alone
+ * cannot show a hit: a key long enough to trip the budget without
+ * its hit would also make the resolved field's public name trip
+ * the 1 MiB output bound first). Reset at the start of every
+ * joinFields run, alongside lastPooledLeafCount; same
+ * sequential-test assumption.
+ */
+let lastLookupKeyMisses = 0;
+export function lookupKeyMissCount(): number {
+  return lastLookupKeyMisses;
+}
+
+/**
  * Parse one XFA packet to its ordered root elements. Well-formedness is
  * validated explicitly before parsing (the parser alone accepts a
  * template missing only its final closing tag), and namespace prefixes
@@ -1468,10 +1524,38 @@ function validateSomName(name: string, context: string | (() => string)): void {
 }
 
 /**
+ * Fail closed when an element that establishes field or binding
+ * semantics carries an unbound namespace prefix (D-2, round 17):
+ * its expanded name is unknown, so a `<p:field>`, `<p:subform>`,
+ * `<p:template>`/`<p:datasets>`/`<p:data>` root, or an `<exclGroup>`
+ * read by local name alone would silently establish semantics for
+ * a name the document never defines. Declared prefixes (any URI)
+ * and legacy no-namespace elements pass unchanged — only the
+ * unbound state fails. (Dispute recorded: Sonnet graded this
+ * P2/policy — roots recognised by local name by design, no value
+ * misattributed. The coordinator adopted it as P1: the panel was
+ * explicitly asked about "any other path" for silent unbound
+ * resolution, the adopted policy since round 11 is that unbound
+ * prefixes fail closed, and the C-2 singleton precedent — real
+ * value, unknown identity → P1 — governs.)
+ */
+function requireKnownNamespace(element: XElement, role: string): void {
+  if (!element.nsUnbound) return;
+  throw new XfaError(
+    `XFA packet has a <${shortName(element.name)}> element used as ${role} whose namespace is unknown (an unbound prefix); refusing to establish field or binding semantics from it`,
+  );
+}
+
+/**
  * Read a <bind> element. No <bind> at all means "default"; a match value
  * outside the known set (dataRef/global/none) is "unsupported" — never
  * coerced to "default", so an XFA-defined value like match="once" cannot
- * silently acquire a binding it was never given.
+ * silently acquire a binding it was never given. (D-2, round 17) An
+ * unbound <bind> element fails closed here, at every call site at
+ * once: a `<p:bind match="dataRef" ref="..."/>` with `p` undeclared
+ * used to redirect resolution to the ref's target, and a
+ * `<p:bind match="none"/>` was honoured as a none binding, both
+ * without any namespace check.
  */
 function parseBind(bindNode: XElement | undefined): {
   bind: BindKind;
@@ -1479,6 +1563,7 @@ function parseBind(bindNode: XElement | undefined): {
   rawMatch?: string;
 } {
   if (bindNode === undefined) return { bind: "default" };
+  requireKnownNamespace(bindNode, "a binding");
   const rawMatch = attr(bindNode, "match");
   const bind: BindKind =
     rawMatch === "global" || rawMatch === "none" || rawMatch === "dataRef"
@@ -1541,6 +1626,11 @@ function buildTemplateField(
   pathBytes: { bytes: number },
   preserve = false,
 ): TemplateField | undefined {
+  // (D-2, round 17) An unbound <p:field> establishes no field: its
+  // expanded name is unknown. This also covers option fields inside
+  // an exclGroup, which reach buildTemplateField directly rather
+  // than through collectTemplateFields' loop.
+  requireKnownNamespace(node, "a template field");
   const keep = effectiveSpace(node, preserve);
   const parentPath = (): string => segmentPath(pathSegments);
   // The binding is read BEFORE the name check (U-4, round 5): an
@@ -1719,6 +1809,9 @@ function collectTemplateFields(
   const keep = effectiveSpace(node, preserve);
   for (const child of elementChildren(node)) {
     if (child.local === "subform") {
+      // (D-2, round 17) A subform establishes scope, so an unbound
+      // <p:subform> fails closed here.
+      requireKnownNamespace(child, "a subform");
       const name = attr(child, "name");
       const childPath =
         typeof name === "string" && name !== "" ? [...pathSegments, name] : pathSegments;
@@ -1735,9 +1828,14 @@ function collectTemplateFields(
         keep,
       );
     } else if (child.local === "field") {
+      // (D-2) An unbound <p:field> is checked again inside
+      // buildTemplateField (which option fields also reach).
+      requireKnownNamespace(child, "a template field");
       const field = buildTemplateField(child, pathSegments, scope, pathBytes, keep);
       if (field) out.push(field);
     } else if (child.local === "exclGroup") {
+      // (D-2, round 17) An exclGroup establishes a group field.
+      requireKnownNamespace(child, "an exclGroup");
       const name = attr(child, "name");
       if (typeof name !== "string" || name === "") {
         // U-4, round 5: an unnamed group is dropped ONLY when it
@@ -1834,9 +1932,63 @@ function collectTemplateFields(
         label: captionText !== "" ? captionText : undefined,
       });
     } else {
+      // Any other template element is inert to resolution: it
+      // establishes no field, scope, or binding, so an unbound
+      // prefix on it alone is not checked here — its descendants
+      // are checked when they are reached as a subform, field,
+      // exclGroup, or bind above. (D-2, round 17.)
       collectTemplateFields(child, pathSegments, scope, interner, depth + 1, out, pathBytes, keep);
     }
   }
+}
+
+/**
+ * One segment of a leaf's dataset path (D-1, round 17): the segment
+ * string itself, a pointer to the parent segment's node, the segment
+ * count (`depth`), and the cumulative byte lengths of the path the
+ * node terminates — `bytes` for the raw joined path, `strippedBytes`
+ * for the index-stripped joined path (each including one dot per
+ * join, exactly as `segmentPath` / `strippedSegments(...).join(".")`
+ * would produce). Nodes are created once per element visited by
+ * collectDataLeaves and shared by the whole subtree below them, so
+ * a deep chain × many sibling leaves costs one node per element,
+ * not one array per leaf per segment. The cumulative bytes let
+ * buildJoinIndex charge the aggregate internal-path bound BEFORE
+ * materializing any key string (see there).
+ */
+interface SegPath {
+  segment: string;
+  parent: SegPath | null;
+  depth: number;
+  bytes: number;
+  strippedBytes: number;
+}
+
+/** Materialize a linked segment path as an array, root-first. */
+function segPathSegments(path: SegPath | null): string[] {
+  const reversed: string[] = [];
+  let current = path;
+  while (current !== null) {
+    reversed.push(current.segment);
+    current = current.parent;
+  }
+  return reversed.reverse();
+}
+
+/**
+ * A leaf's full segment array, materialized at most once and then
+ * memoized on the leaf (D-1, round 17). Callers that need only the
+ * leaf name, or only the cumulative byte counts, must NOT call
+ * this — use `leaf.segPath.segment` / `leaf.segPath.bytes` /
+ * `leaf.segPath.strippedBytes` instead, so unmatched leaves never
+ * pay for an array.
+ */
+function leafSegments(leaf: DataLeaf): string[] {
+  const cached = leaf.segmentsCache;
+  if (cached !== undefined) return cached;
+  const segments = segPathSegments(leaf.segPath);
+  leaf.segmentsCache = segments;
+  return segments;
 }
 
 interface DataLeaf {
@@ -1848,8 +2000,30 @@ interface DataLeaf {
    * carry their `[N]` suffix on the segment (`"repeat[1]"`). Segment
    * names can never contain "." / "[" / "]" (see validateSomName), so
    * joining the array with "." for the public SOM path is unambiguous.
+   *
+   * The path is PARENT-LINKED (D-1, round 17), not a retained array:
+   * one SegPath node per element on the walk down, shared by every
+   * leaf under it — a leaf holds a single pointer, exactly like its
+   * namespace path (NsPath, C-5/C-6). The round-16 shape retained
+   * one `segments` array per leaf, built by `[...path, segment]` per
+   * child before `buildJoinIndex` charged anything, so a 40-deep
+   * chain × 20,000 sibling leaves allocated ~840k segment
+   * references (plus one array object per leaf) with a field
+   * present — the field-less skip never ran. The array is now
+   * materialized only on demand, per leaf, by `leafSegments()`
+   * (memoized on the leaf), and only where a consumer actually
+   * needs the whole path; the leaf name is read O(1) off the
+   * terminal node, and the index charges path bytes from the
+   * node's cumulative byte counts BEFORE any materialization.
    */
-  segments: string[];
+  segPath: SegPath | null;
+  /**
+   * Memoized materialization of `segPath` (see leafSegments): built
+   * at most once per leaf, the first time a consumer needs the whole
+   * segment array. Leaves that are never matched, never indexed
+   * past their name, and never reported never pay for it.
+   */
+  segmentsCache?: string[];
   /**
    * The leaf's namespace path, PARENT-LINKED (C-5/C-6, round 16):
    * one NsPath node per element on the walk down, shared by every
@@ -1865,9 +2039,9 @@ interface DataLeaf {
    * node per element; repeat agreement materializes the arrays it
    * compares on demand, only for leaves actually being compared
    * (see nsPathArrays / assertExpandedNamesAgree). The path is
-   * kept parallel to `segments` (A-3, round 14), not folded into
-   * the segment strings, so the stripped-path join index — which
-   * keys leaves by local names only — can still tell two
+   * kept parallel to the segment path (A-3, round 14), not folded
+   * into the segment strings, so the stripped-path join index —
+   * which keys leaves by local names only — can still tell two
    * different-namespace same-local-name leaves under repeated
    * parents apart, and the public SOM path and every message that
    * prints a segment stay exactly as before.
@@ -1877,7 +2051,7 @@ interface DataLeaf {
    * Canonical id of the leaf's STRIPPED dataset path (C-1, round
    * 16): assigned once per distinct stripped path by
    * buildJoinIndex, so the cross-unit pooling loop keys by integer
-   * instead of rebuilding `strippedSegments(segments).join(".")`
+   * instead of rebuilding `strippedSegments(leafSegments(leaf)).join(".")`
    * per match per unit. -1 until the leaf has been indexed.
    */
   pathId: number;
@@ -1945,10 +2119,6 @@ function stripSegmentIndex(segment: string): string {
   // so return the original string instead of allocating a copy per
   // segment on every strip. Only a trailing "]" can hold a selector.
   return parseSegment(segment).name;
-}
-
-function leafNameOf(segments: string[]): string {
-  return stripSegmentIndex(segments.at(-1) ?? "");
 }
 
 function strippedSegments(segments: string[]): string[] {
@@ -2216,19 +2386,27 @@ function isRichTextContainer(child: XElement): boolean {
  * one stops the wrapper itself. A dataGroup marking needs no check
  * here: collectDataLeaves already defeats the node on its own
  * `dataNode`, and an empty dataGroup returns before this point.)
- * Namespace is deliberately NOT checked here any more: the round-9
- * version defeated a wrapper on its own default-namespace
- * declaration, which is only a proxy for the inner <xhtml>'s
- * namespace — and a wrong proxy for a prefixed genuine inner
- * <xhtml> (Z1c converse). The inner element's resolved namespace is
- * now judged directly, through its inherited bindings, by
+ * Namespace is deliberately NOT checked here any more as a
+ * wrapper-level `xmlns` proxy: the round-9 version defeated a wrapper
+ * on its own default-namespace declaration, which is only a proxy for
+ * the inner <xhtml>'s namespace — and a wrong proxy for a prefixed
+ * genuine inner <xhtml> (Z1c converse). The inner element's resolved
+ * namespace is now judged directly, through its inherited bindings, by
  * isXhtmlDocument() in the flattening condition below; a wrapper
  * whose default namespace the inner element inherits is defeated
  * there, and a wrapper around a genuinely XHTML-prefixed inner
- * element is not.
+ * element is not. (D-3/h, round 17) The wrapper's own UNBOUND prefix
+ * IS checked here, for node-side consistency with the parent-side
+ * check in isRichTextContainer (C-3): an unbound wrapper prefix is
+ * unknown, not "none", so standing ON the wrapper must defeat it
+ * exactly as flattening it from the parent does — otherwise its bare
+ * <xhtml> child would classify the wrapper itself as a rich-text
+ * leaf. A DECLARED unrelated namespace still does not defeat it
+ * here; that is judged on the inner <xhtml>, as above.
  */
 function exDataDefeated(element: XElement): boolean {
   if (element.local !== "exData") return false;
+  if (element.nsUnbound) return true;
   const contentType = attr(element, "contentType");
   return contentType !== undefined && contentType.trim().toLowerCase() !== "text/html";
 }
@@ -2243,7 +2421,7 @@ function exDataDefeated(element: XElement): boolean {
  */
 function collectDataLeaves(
   node: XElement,
-  path: string[],
+  segPath: SegPath | null,
   nsPath: NsPath | null,
   depth: number,
   out: DataLeaf[],
@@ -2273,7 +2451,7 @@ function collectDataLeaves(
     // and no trimming happens here either).
     const value = node.content.filter((item): item is string => typeof item === "string").join("");
     out.push({
-      segments: path,
+      segPath,
       nsPath,
       pathId: -1,
       value,
@@ -2353,7 +2531,7 @@ function collectDataLeaves(
     const inner = container.local === "exData" ? elementChildren(container)[0] : container;
     const flattenKeep = container.local === "exData" ? effectiveSpace(container, keep) : keep;
     out.push({
-      segments: path,
+      segPath,
       nsPath,
       pathId: -1,
       value: nodeText(inner, 0, flattenKeep, true),
@@ -2367,11 +2545,33 @@ function collectDataLeaves(
   for (const child of children) {
     // The diagnostic path is built lazily (thunk): it duplicates every
     // ancestor name, so building it per child would multiply a long
-    // ancestor name across every leaf (T-3, round 4).
-    validateSomName(child.local, () => `datasets element '${segmentPath([...path, child.local])}'`);
+    // ancestor name across every leaf (T-3, round 4). The thunk
+    // materializes the linked path only when validation actually
+    // fails — the per-child walk itself never builds an array.
+    validateSomName(
+      child.local,
+      () => `datasets element '${segmentPath([...segPathSegments(segPath), child.local])}'`,
+    );
     const index = seen.get(child.local) ?? 0;
     seen.set(child.local, index + 1);
     const segment = (counts.get(child.local) ?? 1) > 1 ? `${child.local}[${index}]` : child.local;
+    // (D-1, round 17) One segment-path node per element, shared by
+    // the whole subtree below it — the child carries a single
+    // pointer to its parent's path, never a `[...path, segment]`
+    // copy per child and never a retained array per leaf. The
+    // node's cumulative byte counts are computed from the parent's
+    // (one utf8Length per segment, once per element), so the index
+    // can charge them without materializing anything.
+    const childSegPath: SegPath = {
+      segment,
+      parent: segPath,
+      depth: (segPath?.depth ?? 0) + 1,
+      bytes: (segPath?.bytes ?? 0) + utf8Length(segment) + (segPath === null ? 0 : 1),
+      strippedBytes:
+        (segPath?.strippedBytes ?? 0) +
+        utf8Length(stripSegmentIndex(segment)) +
+        (segPath === null ? 0 : 1),
+    };
     // (C-5/C-6, round 16) One namespace-path node per element,
     // shared by the whole subtree below it: the interner lookup
     // happens here, once per element visited, and the child
@@ -2385,7 +2585,7 @@ function collectDataLeaves(
       parent: nsPath,
       depth: (nsPath?.depth ?? 0) + 1,
     };
-    collectDataLeaves(child, [...path, segment], childNsPath, depth + 1, out, keep, interner);
+    collectDataLeaves(child, childSegPath, childNsPath, depth + 1, out, keep, interner);
   }
 }
 
@@ -2572,9 +2772,13 @@ function matchesSelectors(
  * examined, so the key's bytes are charged to the aggregate
  * internal-path budget (MAX_INTERNAL_PATH_BYTES, shared with
  * index construction) from the segments' lengths, and the key is
- * cached per (scope, leaf name) / (ref, scope) so a long shared
- * scope is joined once per inspect, never once per field under
- * it. The pooled cross-unit check charges one comparison per
+ * cached per (scope, leaf name) / (ref, scope) — so a long shared
+ * scope is joined once per DISTINCT key, never once per field
+ * under it with that same leaf name (CORRECTION (g, round 17):
+ * the round-16 wording "once per inspect" overstated this — a
+ * shared scope under many field names pays one key join per
+ * name, and a cache hit still re-parses the selector array).
+ * The pooled cross-unit check charges one comparison per
  * distinct leaf pooled (see joinFields). No bound is claimed
  * beyond what is charged here.
  * (c) duplicate work is bounded two ways: mergeDuplicate() keeps
@@ -2708,9 +2912,15 @@ interface PathBucket {
    * an occurrence index at that segment position to the leaves whose
    * segment there has that occurrence — so a `[N]` selector narrows
    * to its branch BEFORE any filtering, instead of filtering the
-   * whole repeated-path bucket per field.
+   * whole repeated-path bucket per field. LAZY (D-1, round 17):
+   * built on the first indexed lookup against this bucket (see
+   * occurrenceIndex), never eagerly in buildJoinIndex — the eager
+   * build created one Map per segment position per DISTINCT path,
+   * so 20,000 distinct deep paths paid ~840,000 Maps before any
+   * lookup ran, most of them never queried with a selector.
+   * Undefined until that first indexed lookup.
    */
-  byOccurrence: Map<number, Map<number, DataLeaf[]>>;
+  byOccurrence?: Map<number, Map<number, DataLeaf[]>>;
 }
 
 interface JoinIndex {
@@ -2730,7 +2940,18 @@ interface JoinBudget {
    * DISTINCT key — see lookupSelectors), both against
    * MAX_INTERNAL_PATH_BYTES. Sharing one counter keeps the total
    * internal-path material — retained index keys and transient
-   * lookup keys alike — under one bound.
+   * lookup keys alike — under one bound. (D-1/d, round 17)
+   * BEHAVIOUR CHANGE, stated plainly: because lookup keys draw
+   * on the SAME 4 MiB counter as the index charge, a scope-heavy
+   * form can now fail closed on a lookup key even though its index
+   * alone fits — the effective bound for the index + lookups
+   * together is roughly halved for forms whose lookups re-join
+   * long shared scopes, shape-dependent (a form with many fields
+   * under one long scope charges that scope once per distinct
+   * (scope, leaf name) key, cached — see lookupSelectors — so
+   * the halving is per distinct key, not per field). This is the
+   * intended calibration of the round-16 shared budget, not a
+   * separate bound; see SPEC.md §1.
    */
   pathBytes: number;
 }
@@ -2780,36 +3001,63 @@ function buildJoinIndex(leaves: DataLeaf[], budget: JoinBudget): JoinIndex {
   // string per match.
   let nextPathId = 0;
   for (const leaf of leaves) {
-    const name = leafNameOf(leaf.segments);
+    // (D-1, round 17) The leaf name is read O(1) off the terminal
+    // segment-path node, and the stripped-path bytes are read off
+    // the node's cumulative count — both BEFORE any segment array
+    // is materialized, so the bound trips on the counts, not after
+    // building the strings. The stripped key string itself is
+    // still built once per leaf (it is the bucket key); its bytes
+    // are exactly the charged strippedBytes.
+    const name = stripSegmentIndex(leaf.segPath?.segment ?? "");
     chargePathBytes(budget, utf8Length(name), "index");
     const named = byName.get(name);
     if (named) named.push(leaf);
     else byName.set(name, [leaf]);
-    const strippedSegmentsList = strippedSegments(leaf.segments);
-    let strippedBytes = strippedSegmentsList.length - 1;
-    for (const segment of strippedSegmentsList) strippedBytes += utf8Length(segment);
-    chargePathBytes(budget, strippedBytes, "index");
-    const stripped = strippedSegmentsList.join(".");
+    chargePathBytes(budget, leaf.segPath?.strippedBytes ?? 0, "index");
+    const stripped = strippedSegments(leafSegments(leaf)).join(".");
     let bucket = byPath.get(stripped);
     if (!bucket) {
-      bucket = { id: nextPathId++, leaves: [], byOccurrence: new Map() };
+      bucket = { id: nextPathId++, leaves: [] };
       byPath.set(stripped, bucket);
     }
     leaf.pathId = bucket.id;
     bucket.leaves.push(leaf);
-    leaf.segments.forEach((segment, position) => {
-      const occurrence = leafOccurrence(segment);
-      let byOccurrence = bucket.byOccurrence.get(position);
-      if (!byOccurrence) {
-        byOccurrence = new Map();
-        bucket.byOccurrence.set(position, byOccurrence);
-      }
-      const list = byOccurrence.get(occurrence);
-      if (list) list.push(leaf);
-      else byOccurrence.set(occurrence, [leaf]);
-    });
+    // No eager byOccurrence build here (D-1, round 17): the
+    // occurrence index is built lazily, per bucket, on the first
+    // indexed lookup against it (see occurrenceIndex).
   }
   return { byName, byPath };
+}
+
+/**
+ * A bucket's occurrence index, built lazily on the first indexed
+ * lookup against the bucket (D-1, round 17) and cached on it
+ * thereafter. Building it costs one pass over the bucket's leaves
+ * (leafSegments is memoized per leaf, so a second indexed lookup
+ * against the same bucket pays nothing new); an unindexed lookup
+ * never builds it at all. Semantics are exactly the eager build's:
+ * byOccurrence.get(position).get(occurrence) is the leaves whose
+ * segment at that position carries that occurrence.
+ */
+function occurrenceIndex(bucket: PathBucket): Map<number, Map<number, DataLeaf[]>> {
+  const cached = bucket.byOccurrence;
+  if (cached !== undefined) return cached;
+  const byOccurrence = new Map<number, Map<number, DataLeaf[]>>();
+  for (const leaf of bucket.leaves) {
+    leafSegments(leaf).forEach((segment, position) => {
+      const occurrence = leafOccurrence(segment);
+      let byPosition = byOccurrence.get(position);
+      if (!byPosition) {
+        byPosition = new Map();
+        byOccurrence.set(position, byPosition);
+      }
+      const list = byPosition.get(occurrence);
+      if (list) list.push(leaf);
+      else byPosition.set(occurrence, [leaf]);
+    });
+  }
+  bucket.byOccurrence = byOccurrence;
+  return byOccurrence;
 }
 
 /**
@@ -2879,11 +3127,22 @@ function lookupSelectors(
   // internal-path budget from the segments' lengths BEFORE the
   // join, and the key is cached per cacheKey — one entry per
   // distinct (scope, leaf name) for `default`, one per (ref, scope)
-  // for `dataRef` (see findLeaves) — so a long shared scope is
-  // joined once per inspect, never once per field under it.
+  // for `dataRef` (see findLeaves). CORRECTION (g, round 17) of
+  // the round-16 comment, which said a long shared scope is
+  // "joined once per inspect": it is joined once per DISTINCT key,
+  // and a shared scope is joined once per (scopeId, leafName),
+  // not once per scope — every field name under one scope pays
+  // its own key join (charged, cached). A cache HIT still parses
+  // the selector array above (parseSegment per selector, O(depth)
+  // per lookup, bounded by the depth cap) — only the join and its
+  // charge are cached, not the parse. That is a known limitation,
+  // not a second cache: the parse is cheap next to the join it
+  // replaces, and caching parsed selectors per key would retain
+  // them for the whole inspect.
   const parsed = selectors.map(parseSegment);
   let key = keyCache.get(cacheKey);
   if (key === undefined) {
+    lastLookupKeyMisses += 1;
     let keyBytes = parsed.length - 1;
     for (const selector of parsed) keyBytes += utf8Length(selector.name);
     chargePathBytes(budget, keyBytes, "lookup");
@@ -2893,18 +3152,21 @@ function lookupSelectors(
   const bucket = index.byPath.get(key);
   if (!bucket) return [];
   let candidates: DataLeaf[] | undefined;
-  for (let position = 0; position < parsed.length; position++) {
-    const wanted = parsed[position].index;
-    if (wanted === undefined) continue;
-    const narrowed = bucket.byOccurrence.get(position)?.get(wanted) ?? [];
-    if (candidates === undefined || narrowed.length < candidates.length) candidates = narrowed;
+  if (parsed.some((selector) => selector.index !== undefined)) {
+    const byOccurrence = occurrenceIndex(bucket);
+    for (let position = 0; position < parsed.length; position++) {
+      const wanted = parsed[position].index;
+      if (wanted === undefined) continue;
+      const narrowed = byOccurrence.get(position)?.get(wanted) ?? [];
+      if (candidates === undefined || narrowed.length < candidates.length) candidates = narrowed;
+    }
   }
   const pool = candidates ?? bucket.leaves;
   const out: DataLeaf[] = [];
   for (const leaf of pool) {
     budget.comparisons += 1;
     checkComparisons(budget);
-    if (matchesSelectors(leaf.segments, parsed)) out.push(leaf);
+    if (matchesSelectors(leafSegments(leaf), parsed)) out.push(leaf);
   }
   return out;
 }
@@ -2968,31 +3230,52 @@ function assertExpandedNamesAgree(
   matches: DataLeaf[],
   budget: JoinBudget,
 ): void {
-  const arrays = matches.map((match) => nsPathArrays(match.nsPath));
-  // (C-2, round 16) Unknown-namespace state is checked for every
-  // matched leaf on its own, regardless of how many matches there
-  // are — a singleton with an unbound prefix fails closed here.
-  for (let index = 0; index < matches.length; index++) {
-    budget.comparisons += 1;
-    checkComparisons(budget);
-    const matchArrays = arrays[index];
-    for (let position = 0; position < matchArrays.ids.length; position++) {
-      if (matchArrays.unbound[position] === true) {
-        const local = stripSegmentIndex(matches[index].segments[position] ?? "");
-        throw new XfaError(
-          matches.length < 2
-            ? `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to a data node whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report it`
-            : `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report them as repeats of one field`,
-        );
-      }
-    }
-  }
+  // (D-1, round 17) Materialize ONE match's namespace-path arrays
+  // at a time, charging the comparison and checking that match's
+  // unbound state BEFORE materializing the next: the round-16 code
+  // ran `matches.map(nsPathArrays)` up front, materializing every
+  // matched path before its own charge and before rejecting an
+  // unbound prefix in the first match. The per-match charge and
+  // the per-position integer work are unchanged (see the header
+  // comment above); only the order is hardened.
+  if (matches.length === 0) return;
+  const firstArrays = nsPathArrays(matches[0].nsPath);
+  budget.comparisons += 1;
+  checkComparisons(budget);
+  checkMatchUnbound(field, matches[0], firstArrays, matches.length < 2);
   if (matches.length < 2) return;
   const first = matches[0];
   for (let index = 1; index < matches.length; index++) {
     budget.comparisons += 1;
     checkComparisons(budget);
-    assertExpandedNameAgreesWith(field, first, arrays[0], arrays[index]);
+    const matchArrays = nsPathArrays(matches[index].nsPath);
+    checkMatchUnbound(field, matches[index], matchArrays, false);
+    assertExpandedNameAgreesWith(field, first, firstArrays, matchArrays);
+  }
+}
+
+/**
+ * Fail closed when ONE matched leaf carries an unbound prefix at
+ * any segment position (C-2, round 16): its namespace is unknown,
+ * not "none", so it never agrees with a known URI, with
+ * no-namespace, or with another unbound segment. `singleton`
+ * selects the lone-match wording; a repeat set uses the plural.
+ */
+function checkMatchUnbound(
+  field: TemplateField,
+  match: DataLeaf,
+  matchArrays: { ids: number[]; unbound: boolean[] },
+  singleton: boolean,
+): void {
+  for (let position = 0; position < matchArrays.ids.length; position++) {
+    if (matchArrays.unbound[position] === true) {
+      const local = stripSegmentIndex(leafSegments(match)[position] ?? "");
+      throw new XfaError(
+        singleton
+          ? `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to a data node whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report it`
+          : `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report them as repeats of one field`,
+      );
+    }
   }
 }
 
@@ -3000,8 +3283,10 @@ function assertExpandedNamesAgree(
  * Compare ONE matched leaf against the representative of its repeat
  * set (C-1/C-2, round 16): the pairwise half of
  * assertExpandedNamesAgree, extracted so the pooling loop can run
- * it incrementally as each unit's matches are pooled, instead of a
- * second pass after all units resolved. The unbound check is
+ * it as each unit's matches are pooled, instead of a second pass
+ * after pooling. (Round 17 wording: "incremental" describes this
+ * within-pooling order only — all units resolve before pooling
+ * begins; see the pooling comment in joinFields.) The unbound check is
  * repeated here deliberately: a caller that compares without the
  * per-match loop (the pooling loop) must still fail closed on an
  * unknown namespace, never silently agree. `firstArrays` /
@@ -3015,15 +3300,20 @@ function assertExpandedNameAgreesWith(
   matchArrays: { ids: number[]; unbound: boolean[] },
 ): void {
   const length = Math.max(firstArrays.ids.length, matchArrays.ids.length);
+  const firstSegments = leafSegments(first);
   for (let position = 0; position < length; position++) {
-    const local = stripSegmentIndex(first.segments[position] ?? "");
+    // (f, round 17) The diagnostic segment name is materialized
+    // only inside the error branches: the old code called
+    // stripSegmentIndex on EVERY successful comparison position,
+    // paying a parse per position for a string that is only ever
+    // printed when the comparison fails.
     if (firstArrays.unbound[position] === true || matchArrays.unbound[position] === true)
       throw new XfaError(
-        `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes whose namespace for segment '${shortName(local)}' is unknown (an unbound prefix); refusing to report them as repeats of one field`,
+        `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes whose namespace for segment '${shortName(stripSegmentIndex(firstSegments[position] ?? ""))}' is unknown (an unbound prefix); refusing to report them as repeats of one field`,
       );
     if ((firstArrays.ids[position] ?? 0) !== (matchArrays.ids[position] ?? 0)) {
       throw new XfaError(
-        `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes in different namespaces for segment '${shortName(local)}'; refusing to report them as repeats of one field`,
+        `XFA template/datasets mismatch: field '${shortName(field.somPath)}' resolves to data nodes in different namespaces for segment '${shortName(stripSegmentIndex(firstSegments[position] ?? ""))}'; refusing to report them as repeats of one field`,
       );
     }
   }
@@ -3077,7 +3367,7 @@ function findLeaves(
 function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string): XfaField {
   // (C-1, round 16) The public name is built once per distinct
   // leaf and cached on it: the old code joined
-  // `segmentPath(leaf.segments)` per match, so overlapping units
+  // `segmentPath(leafSegments(leaf))` per match, so overlapping units
   // resolving one long-pathed leaf re-joined its path once per
   // unit, uncharged, before the duplicate budget in push() could
   // fire. A first push charges the field's full serialized size
@@ -3089,7 +3379,7 @@ function toXfaField(field: TemplateField, leaf: DataLeaf, nameOverride?: string)
   if (nameOverride !== undefined) {
     publicName = nameOverride;
   } else {
-    publicName = leaf.publicName ?? segmentPath(leaf.segments);
+    publicName = leaf.publicName ?? segmentPath(leafSegments(leaf));
     leaf.publicName = publicName;
   }
   const out: XfaField = {
@@ -3268,6 +3558,11 @@ function mergeDuplicate(previous: ResolvedFieldEntry, incoming: XfaField): numbe
  * in count or in bytes.
  */
 function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaField[] {
+  // Diagnostic counters (b/j/a, round 17): distinct leaves pooled
+  // and lookup-key cache misses charged by this run — reset here,
+  // counted in the pooling loop and in lookupSelectors below.
+  lastPooledLeafCount = 0;
+  lastLookupKeyMisses = 0;
   // Group occurrences by somPath, in first-occurrence order.
   const groups = new Map<string, TemplateField[]>();
   for (const field of templateFields) {
@@ -3420,8 +3715,11 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   const budget: JoinBudget = { comparisons: 0, pathBytes: 0 };
   // Lookup bucket-key cache (C-1, round 16): one entry per distinct
   // (scope, leaf name) / (ref, scope), shared by every unit in this
-  // inspect, so a long shared scope is joined once, never once per
-  // field under it.
+  // inspect. CORRECTION (g, round 17): a long shared scope is joined
+  // once per distinct (scopeId, leafName) — one cached key per field
+  // name under the scope — not once per scope and not once per
+  // inspect. A cache hit still re-parses its selector array (see
+  // lookupSelectors); only the join and its charge are cached.
   const keyCache = new Map<string, string>();
   const index = buildJoinIndex(leaves, budget);
   const out: XfaField[] = [];
@@ -3529,14 +3827,23 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   // no claim of repeats, but two units collectively reporting
   // repeats of one template field do.)
   // (C-1, round 16) Pooling is by canonical path ID, deduped by leaf
-  // identity, charged, and incremental. CORRECTION of the round-15
-  // comment, which claimed "the total key material here cannot
+  // identity, and charged. CORRECTION of the round-15 comment,
+  // which claimed "the total key material here cannot
   // exceed [the aggregate internal-path bound]": that was FALSE for
   // CUMULATIVE construction work — the old loop rebuilt
-  // `strippedSegments(leaf.segments).join(".")` per match per unit,
+  // `strippedSegments(leafSegments(leaf)).join(".")` per match per unit,
   // so 256 units × 50 leaves × 8 KiB ≈ 100 MB of key construction
   // while the index had charged the 50 leaves once (400 KiB), all
   // before the push() loop's duplicate/output bounds could fire.
+  // CORRECTION (c, round 17) of the round-16 comment, which called
+  // the pooling "incremental": it is incremental only WITHIN the
+  // pooling loop — a new leaf is compared against its bucket's
+  // representative as it is pooled, instead of a second pass after
+  // pooling. ALL units are resolved BEFORE pooling begins (the
+  // `resolved` loop above runs findLeaves for every unit first),
+  // so pooling is not incremental with respect to resolution: a
+  // cross-unit disagreement fails before later units are pooled
+  // or pushed, but only after every unit has already resolved.
   // What the loop does now: (a) each distinct leaf's stripped key
   // is its canonical pathId, assigned once per distinct stripped
   // path by buildJoinIndex — no key string is built per match;
@@ -3548,15 +3855,13 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
   // structural comparison, so pooling work is bounded by the same
   // 1,000,000 budget that bounds candidate examination, and the
   // bound fires during pooling, before push(); (d) agreement is
-  // checked incrementally as each unit's matches are pooled — a
-  // new leaf is compared against its bucket's representative
-  // immediately, per unit, instead of a second pass after every
-  // unit resolved — so a cross-unit disagreement fails before
-  // later units are pooled or pushed. The deduped singleton still
-  // goes through findLeaves' unknown-namespace check (C-2), so
-  // dedupe alone never turns an unbound prefix into a silent
-  // resolution: one leaf, two units, unbound prefix fails closed
-  // on the prefix, not on repeats.
+  // checked as each unit's matches are pooled — a new leaf is
+  // compared against its bucket's representative immediately,
+  // per unit, instead of a second pass after pooling. The deduped
+  // singleton still goes through findLeaves' unknown-namespace
+  // check (C-2), so dedupe alone never turns an unbound prefix
+  // into a silent resolution: one leaf, two units, unbound prefix
+  // fails closed on the prefix, not on repeats.
   for (const { units: groupUnits } of unitGroups) {
     const resolved: Array<{ field: TemplateField; matches: DataLeaf[] }> = [];
     for (const field of groupUnits) {
@@ -3582,6 +3887,7 @@ function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaFie
       for (const leaf of matches) {
         if (seenLeaves.has(leaf)) continue;
         seenLeaves.add(leaf);
+        lastPooledLeafCount += 1;
         budget.comparisons += 1;
         checkComparisons(budget);
         const entry = pooled.get(leaf.pathId);
@@ -3644,13 +3950,20 @@ export function inspectXfa(doc: PDFDocument): {
   const templateRoot = templateParsed.find((element) => element.local === "template");
   if (!templateRoot)
     throw new XfaError("XFA form is malformed: template packet has no <template> element");
+  // (D-2, round 17) The packet and data roots are selected by local
+  // name, so an unbound <p:template> / <p:datasets> / <p:data> would
+  // otherwise resolve silently. Only the unbound state fails here —
+  // a declared prefix (any URI) and a legacy no-namespace root pass.
+  requireKnownNamespace(templateRoot, "the template root");
   const datasetsParsed = parseXfaXml("datasets", datasetsBytes);
   const datasetsRoot = datasetsParsed.find((element) => element.local === "datasets");
   if (!datasetsRoot)
     throw new XfaError("XFA form is malformed: datasets packet has no <datasets> element");
+  requireKnownNamespace(datasetsRoot, "the datasets root");
   const dataRoot = singletonChild(datasetsRoot, "data", "the datasets packet");
   if (dataRoot === undefined)
     throw new XfaError("XFA form is malformed: datasets packet has no <data> element");
+  requireKnownNamespace(dataRoot, "the data root");
   const templateFields: TemplateField[] = [];
   const interner = new ScopeInterner();
   collectTemplateFields(templateRoot, [], interner.root, interner, 0, templateFields, {
@@ -3672,12 +3985,17 @@ export function inspectXfa(doc: PDFDocument): {
   // malformed packet still fails closed; only the leaf collection
   // is skipped, and with it any classification-only error inside
   // it (e.g. skeleton text under an XHTML frame no field reads) —
-  // a field-less report has nothing to classify for. joinFields
+  // a field-less report has nothing to classify for. (e, round 17)
+  // The skip is broader than "no leaves": collection-time SOM-name
+  // validation (validateSomName) runs inside collectDataLeaves, so
+  // a field-less form with a dotted dataset name such as `<a.b>`
+  // now passes, while the same datasets under a one-field template
+  // fail closed with a 422 — see SPEC.md §1. joinFields
   // returns [] for zero units without building the index, as before.
   if (templateFields.length > 0) {
     collectDataLeaves(
       dataRoot,
-      [],
+      null,
       null,
       0,
       leaves,
