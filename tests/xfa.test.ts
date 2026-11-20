@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createSamplePdf, fillPdf, inspectPdf } from "../packages/integrations/src/pdf.ts";
-import { countXmlScanSteps } from "../packages/integrations/src/xfa.ts";
+import {
+  countXmlScanSteps,
+  lookupKeyMissCount,
+  pooledLeafCount,
+} from "../packages/integrations/src/xfa.ts";
 import { createXfaPdf, staticDatasetsXml, staticTemplateXml } from "./xfa-fixtures.ts";
 
 const fixture = (name: string): Uint8Array =>
@@ -6053,4 +6057,521 @@ test("C-7 (round 16): a <head> directly under the <xhtml> frame root is metadata
   );
   const result = await inspectPdf(bytes);
   assert.deepEqual(result.fields, [{ name: "form.note", value: "Body", type: "unsupported" }]);
+});
+
+// --- B1 fix round 17 (re-review #16, cross-check panel, Nov 20, 2026) -----
+// Regression tests for the three converged P1s (D-1 parent-linked
+// segment paths, D-2 unbound structural names, D-3 unbound dataNode
+// attribute) plus the re-review's test-adequacy items (lookup-key
+// cache hit/miss, "join lookup exceeds", separate C-6 tests,
+// dedupe counter, field-less SOM-name scope, exData node-side
+// consistency). Probe shapes are noted per test. All assertions
+// are value/error/counter assertions — no timing thresholds except
+// the one gross-slowness guard on the D-1 shape, in the style of
+// the existing U2 guard.
+// Test-breakdown correction (4a): the round-16 brief claimed C-1 ×2,
+// C-5 ×3, C-6 ×2, C-7 ×3; the diff actually has C-1 ×1, C-5 ×2,
+// C-6 ×1, C-7 ×5 (total still 19). The missing tests are added
+// here: lookup-key-cache (hit + miss), field-present deep/wide
+// (D-1), separate C-6 tests, "join lookup exceeds", keyCache
+// hit/miss.
+
+test("D-1 (round 17): a field-present deep/wide form resolves its one field (probe D1 shape)", async () => {
+  // The round-16 C-5 test is field-less and never reaches this path:
+  // one bound field makes collection run over the whole dataset.
+  // The probe shape (40-deep chain, 20,000 empty sibling leaves)
+  // used to retain one `segments` array per leaf, built by
+  // `[...path, segment]` per child before the index budget charged
+  // anything (1,936 ms / +263 MiB probed on round-16 code). The
+  // segment path is now parent-linked (one SegPath node per
+  // element, shared by the subtree), the occurrence index is built
+  // lazily per bucket, and the 20,000 sibling leaves are never
+  // pooled — the deterministic counter below pins that last point
+  // (pooledLeafCount() === 1: only the matched `ok` leaf).
+  // Assertion-based: the one field, its value, and the pooled
+  // count; the gross time guard is the U2-style slowness guard only.
+  let inner = Array.from({ length: 20000 }, (_, i) => `<leaf${i}/>`).join("");
+  for (let d = 40; d >= 1; d--) inner = `<d${d}>${inner}</d${d}>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="ok"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok>${inner}</form></xfa:data></xfa:datasets>`,
+  });
+  const started = Date.now();
+  const result = await inspectPdf(bytes);
+  assert.ok(Date.now() - started < 20000, `D-1 inspect took ${Date.now() - started}ms`);
+  assert.deepEqual(result.fields, [{ name: "form.ok", value: "V", type: "text" }]);
+  assert.equal(pooledLeafCount(), 1);
+});
+
+test("D-1 (round 17): the bind-none variant of the deep/wide shape also resolves (probe D1b shape)", async () => {
+  // One `bind match="none"` field brings the whole allocation back
+  // on round-16 code (1,482 ms / +263.9 MiB probed): the field-less
+  // skip only triggers at zero fields, so a single unbound field
+  // still collects the entire dataset. The parent-linked path
+  // covers it the same way — the field never consults the leaves
+  // it forces collection of.
+  let inner = Array.from({ length: 20000 }, (_, i) => `<leaf${i}/>`).join("");
+  for (let d = 40; d >= 1; d--) inner = `<d${d}>${inner}</d${d}>`;
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="ok"><ui><textEdit/></ui><bind match="none"/></field></subform></template>',
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><ok>V</ok>${inner}</form></xfa:data></xfa:datasets>`,
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.ok", value: "", type: "unsupported" }]);
+});
+
+test("D-2 (round 17): an unbound <p:data> wrapper fails closed (probe D2)", async () => {
+  // The data root was selected by local name without checking
+  // nsUnbound, so <p:data> with `p` undeclared resolved silently.
+  const wrapped = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><p:data><form><code>VALUE</code></form></p:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(wrapped), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:data.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): an unbound <p:datasets> wrapper fails closed (probe D2b)", async () => {
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<p:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>VALUE</code></form></xfa:data></p:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:datasets.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): an unbound <p:template> root fails closed (probe D2c)", async () => {
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<p:template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></p:template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>VALUE</code></form></xfa:data></xfa:datasets>',
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:template.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): a DECLARED <p:data> wrapper still resolves (probe D2d control)", async () => {
+  // Control: the same wrapper with `p` DECLARED (a known foreign
+  // namespace) is not an unknown name and must still report "VALUE".
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xmlns:p="urn:example:data"><p:data><form><code>VALUE</code></form></p:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.code", value: "VALUE", type: "text" }]);
+});
+
+test("D-2 (round 17): an unbound <p:subform> fails closed", async () => {
+  // A subform establishes scope, so an unbound <p:subform> is a
+  // structural name that must fail closed, not a wrapper to skip.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<p:subform name="s"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></p:subform>',
+      `<s><code>VALUE</code></s>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:subform.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): an unbound <p:exclGroup> fails closed", async () => {
+  // An exclGroup establishes a group field, so an unbound
+  // <p:exclGroup> fails closed like an unbound <p:field>.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<p:exclGroup name="pay"><bind match="global"/><field name="card"><ui><checkButton/></ui><items><text>card</text></items><bind match="global"/></field></p:exclGroup>',
+      `<pay>card</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:exclGroup.*unbound prefix/);
+    return true;
+  });
+});
+
+test('D-2 (round 17): an unbound <p:bind match="none"/> fails closed (probe D3)', async () => {
+  // The bind was honoured without a namespace check, so the field
+  // reported blank/unsupported as if `none` had been declared.
+  // An undeclared prefix is unknown, not "none" — fail closed.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><p:bind match="none"/></field>',
+      `<code>VALUE</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:bind.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): an unbound <p:field> fails closed (probe D3b)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<p:field name="code"><ui><textEdit/></ui><bind match="default"/></p:field>',
+      `<code>VALUE</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:field.*unbound prefix/);
+    assert.doesNotMatch(error.message, /VALUE/);
+    return true;
+  });
+});
+
+test("D-2 (round 17): a DECLARED <p:field> still resolves (probe D3c control)", async () => {
+  // Control: the same field with `p` DECLARED on the template root
+  // is a known foreign namespace and must still report "VALUE".
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><p:field name="code"><ui><textEdit/></ui><bind match="default"/></p:field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>VALUE</code></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.code", value: "VALUE", type: "text" }]);
+});
+
+test('D-2 (round 17): an unbound <p:bind match="dataRef"/> fails closed (probe E1)', async () => {
+  // The binding element's unknown namespace was ignored AND it
+  // redirected resolution: the field reported form.other = "OTHER"
+  // from an uninterpretable binding element. (Dispute recorded in
+  // requireKnownNamespace: Sonnet graded this P2/policy; the
+  // coordinator adopted it as P1 per the round-11 unbound-prefix
+  // policy and the C-2 singleton precedent.)
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><p:bind match="dataRef" ref="$data.form.other"/></field>',
+      `<other>OTHER</other><code>CODE</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:bind.*unbound prefix/);
+    assert.doesNotMatch(error.message, /OTHER/);
+    return true;
+  });
+});
+
+test('D-2 (round 17): a DECLARED <p:bind match="dataRef"/> still redirects (probe E1b control)', async () => {
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><p:bind match="dataRef" ref="$data.form.other"/></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><other>OTHER</other><code>CODE</code></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.other", value: "OTHER", type: "text" }]);
+});
+
+test('D-2 (round 17): a plain <bind match="dataRef"/> still redirects (probe E1c control)', async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="dataRef" ref="$data.form.other"/></field>',
+      `<other>OTHER</other><code>CODE</code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.other", value: "OTHER", type: "text" }]);
+});
+
+test("D-3 (round 17): an unbound p:dataNode attribute fails closed (probe D4)", async () => {
+  // attrInNamespace() ignored the unresolvable prefix and the
+  // fallback applied only to the literal `xfa:dataNode` spelling,
+  // so <note p:dataNode="dataGroup"> with `p` undeclared classified
+  // as rich text and reported "Inside" despite the unknown
+  // attribute namespace.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note p:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /dataNode.*unbound prefix/);
+    assert.doesNotMatch(error.message, /Inside/);
+    return true;
+  });
+});
+
+test("D-3 (round 17): a literal xfa:dataNode still defeats the group (probe D4b control)", async () => {
+  // Control: the documented literal-`xfa:dataNode` fallback — the
+  // `xfa` prefix UNDECLARED — is still read as the XFA marking, so
+  // the field has no data node.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xfa:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.note.*has no data node/);
+    return true;
+  });
+});
+
+test("D-3 (round 17): a DECLARED p:dataNode still defeats the group (probe D4c control)", async () => {
+  // Control: `p` DECLARED to the XFA data namespace — the marking
+  // is a known expanded name and still defeats the group.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:p="http://www.xfa.org/schema/xfa-data/1.0/" p:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.note.*has no data node/);
+    return true;
+  });
+});
+
+test("D-3/h (round 17): an unbound <p:exData> wrapper standing as the bound node fails closed", async () => {
+  // Node-side consistency with the parent-side C-3 check: when the
+  // walk stands ON an unbound <p:exData> wrapper (here the field
+  // binds to the wrapper node itself, with a sibling so the parent
+  // does not classify as rich text first), its bare <xhtml> child
+  // must not classify the wrapper as a rich-text leaf.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<note><other>X</other><p:exData contentType="text/html"><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body>Inside</h:body></h:html></h:xhtml></p:exData></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /mismatch.*form\.note\.exData.*has no data node/);
+    assert.doesNotMatch(error.message, /Inside/);
+    return true;
+  });
+});
+
+test("D-3/h (round 17): a DECLARED <p:exData> wrapper standing as the bound node still flattens (control)", async () => {
+  // Control for the node-side check above: the same wrapper with
+  // `p` DECLARED is a known namespace and still flattens to
+  // "Inside" as an unsupported rich-text leaf.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="note"><field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<note><other>X</other><p:exData contentType="text/html" xmlns:p="urn:wrapper"><h:xhtml xmlns:h="http://www.w3.org/1999/xhtml"><h:html><h:body>Inside</h:body></h:html></h:xhtml></p:exData></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.note.exData", value: "Inside", type: "unsupported" },
+  ]);
+});
+
+test("C-1 (round 17): a second lookup under the same scope and leaf name reuses the cached key (hit)", async () => {
+  // Deterministic counter for the keyCache hit claim (4a): two
+  // template fields under the same interned scope (one subform
+  // dataRef-bound absolutely, one relatively — both fold to the
+  // same scope id) with the same leaf name look up the same key
+  // twice, but the aggregate budget is charged once: the second
+  // lookup is a hit. The two fields resolve to the same data node
+  // and fail closed on the public-name collision — the collision
+  // error (not a budget error) is itself the evidence the second
+  // lookup ran, and lookupKeyMissCount() === 1 proves it was a
+  // hit. A budget-boundary test alone cannot show a hit: a key
+  // long enough to trip the budget without its hit would also
+  // make the resolved field's public name trip the 1 MiB output
+  // bound first (see the lookup-exceeds test below).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.shared"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="t"><bind match="dataRef" ref="shared"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<shared><code>VALUE</code></shared>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /resolve to the same data node/);
+    assert.doesNotMatch(error.message, /join lookup exceeds/);
+    return true;
+  });
+  assert.equal(lookupKeyMissCount(), 1);
+});
+
+test("C-1 (round 17): two leaf names under one scope charge two lookup keys (miss)", async () => {
+  // Companion to the hit test: two DIFFERENT leaf names under one
+  // scope are two distinct keys, so both lookups miss and charge.
+  // Both fields resolve, so the counter is read after a success.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.shared"/><field name="code1"><ui><textEdit/></ui><bind match="default"/></field><field name="code2"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<shared><code1>ONE</code1><code2>TWO</code2></shared>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.shared.code1", value: "ONE", type: "text" },
+    { name: "form.shared.code2", value: "TWO", type: "text" },
+  ]);
+  assert.equal(lookupKeyMissCount(), 2);
+});
+
+test('C-1 (round 17): a lookup key past the shared budget fails closed as a lookup ("join lookup exceeds")', async () => {
+  // The shared pathBytes budget (4 MiB, index + lookups together):
+  // one leaf under a 2.5 MiB ancestor charges ~2.5 MiB at index
+  // time (under the bound), and its lookup key charges another
+  // ~2.5 MiB — the total trips on the LOOKUP charge, so the
+  // message names the lookup site, not the index. (4d documents
+  // the shared-budget behaviour change in code + SPEC.)
+  const longSeg = "a".repeat(2_500_000);
+  const bytes = await createXfaPdf({
+    templateXml: `<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><subform name="s"><bind match="dataRef" ref="$data.form.${longSeg}"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform></subform></template>`,
+    datasetsXml: `<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><${longSeg}><code>VALUE</code></${longSeg}></form></xfa:data></xfa:datasets>`,
+  });
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /join lookup exceeds 4194304 bytes/);
+    return true;
+  });
+});
+
+test("C-6 (round 17): repeat leaves under different prefixes bound to the SAME URI still agree", async () => {
+  // Interning is by namespace URI VALUE, not by prefix spelling:
+  // <p:code> and <q:code> with p and q both bound to urn:shared
+  // are the same expanded name, so the repeats agree.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person xmlns:p="urn:shared"><p:code>V0</p:code></person><person xmlns:q="urn:shared"><q:code>V1</q:code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[0].code", value: "V0", type: "text" },
+    { name: "form.person[1].code", value: "V1", type: "text" },
+  ]);
+});
+
+test("C-6 (round 17): repeat leaves in URIs differing only by case fail closed as different namespaces", async () => {
+  // The converse pin: interning compares the URI string exactly,
+  // so urn:AAA and urn:aaa are different namespaces and the
+  // repeats fail closed instead of reporting as one field.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="person"><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person xmlns:p="urn:AAA"><p:code>V0</p:code></person><person xmlns:p="urn:aaa"><p:code>V1</p:code></person>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /different namespaces for segment 'code'/);
+    return true;
+  });
+});
+
+test("C-4 (round 17): dedupe is observable — one leaf, two overlapping units, pooled once (counter)", async () => {
+  // (4b) The X2 test does not discriminate dedupe: it fails in
+  // findLeaves() before pooling. This shape does: two units of one
+  // template field resolve overlapping leaf sets (unit 1: both
+  // person codes; unit 2: person[0] only), and the pooled-leaf
+  // counter proves the shared leaf was pooled ONCE (2, not 3) —
+  // the deterministic counter in the style of countXmlScanSteps.
+  // A value assertion alone cannot observe dedupe: deduped and
+  // un-deduped runs report the same two fields.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><code>V0</code></person><person><code>V1</code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.person[0].code", value: "V0", type: "text" },
+    { name: "form.person[1].code", value: "V1", type: "text" },
+  ]);
+  assert.equal(pooledLeafCount(), 2);
+});
+
+test("C-4 (round 17): the X2b control pools its one shared leaf once (counter)", async () => {
+  // Companion to the dedupe test above, on the existing X2b
+  // control shape (one leaf, two overlapping units, DECLARED
+  // namespace): the leaf resolves once and is pooled once.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<subform name="s"><bind match="dataRef" ref="$data.form.person"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
+        '<subform name="s"><bind match="dataRef" ref="$data.form.person[0]"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>',
+      `<person><code xmlns:p="urn:first">VALUE</code></person>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.person.code", value: "VALUE", type: "text" }]);
+  assert.equal(pooledLeafCount(), 1);
+});
+
+test("C-5/e (round 17): the field-less skip also drops collection-time SOM-name validation", async () => {
+  // (4e) The skip is broader than "no leaves": validateSomName runs
+  // inside collectDataLeaves, so a field-less form with a dotted
+  // dataset name (<a.b>) passes while the same datasets under a
+  // one-field template fail closed. Documented in SPEC.md §1; this
+  // test pins the behaviour.
+  const fieldless = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><a.b>X</a.b></form></xfa:data></xfa:datasets>',
+  });
+  assert.deepEqual((await inspectPdf(fieldless)).fields, []);
+  const withField = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<a.b>X</a.b><code>VALUE</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(withField), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /cannot be represented in a SOM path/);
+    return true;
+  });
 });
