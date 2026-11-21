@@ -1572,6 +1572,43 @@ function requireKnownNamespace(element: XElement, role: string): void {
 }
 
 /**
+ * The same unknown-namespace rule, for the text DESCENDANTS of a
+ * consumed template-text subtree (F-1, round 19): `nodeText()` and
+ * `collectTextSegments()` recurse into ALL descendants with no
+ * namespace check, so an unbound `<p:text>` inside a caption
+ * `<value>` (or an unbound `<p:b>` inside an `<items>` `<text>`)
+ * contributed its text to the field's label / on-values even
+ * though the wrapper elements themselves were guarded (E-3, round
+ * 18). Every element descendant of the subtree is checked here —
+ * declared prefixes (any URI) and no-namespace descendants pass
+ * unchanged, only the unbound state fails — before the subtree is
+ * flattened. SCOPE: this runs ONLY at the template-metadata call
+ * sites (`itemTexts` and the two caption paths below), never inside
+ * the shared `nodeText()` flattener: dataset rich-text values are
+ * flattened by the same function and their unbound descendants are
+ * handled by the classifier (`isXhtmlDocument` etc.), so a blanket
+ * throw inside `nodeText()` would break dataset handling. The
+ * subtree root itself is checked too, so the helper is
+ * self-contained at each call site; the root is already guarded by
+ * its caller in every current use, so that check never fires twice
+ * with a different message. The walk is iterative (explicit stack),
+ * and the tree is already depth-bounded by the conversion pass, so
+ * no depth guard is needed here.
+ */
+function requireKnownTextDescendants(node: XElement, role: string): void {
+  const stack: XElement[] = [node];
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (current === undefined) break;
+    if (current.nsUnbound)
+      throw new XfaError(
+        `XFA packet has a <${shortName(current.name)}> element inside ${role} whose namespace is unknown (an unbound prefix); refusing to establish field metadata from it`,
+      );
+    for (const child of elementChildren(current)) stack.push(child);
+  }
+}
+
+/**
  * Read a <bind> element. No <bind> at all means "default"; a match value
  * outside the known set (dataRef/global/none) is "unsupported" — never
  * coerced to "default", so an XFA-defined value like match="once" cannot
@@ -1633,6 +1670,14 @@ function itemTexts(node: XElement, preserve = false): string[] {
     const keep = effectiveSpace(items, preserve);
     for (const text of childrenNamed(items, "text")) {
       requireKnownNamespace(text, "an item text");
+      // (F-1, round 19) The text itself is guarded above, but
+      // nodeText() below recurses into ALL descendants unchecked —
+      // an unbound descendant's text would become the option /
+      // on-value. Guard the whole consumed subtree first; the
+      // shared flattener itself is untouched (dataset rich text
+      // goes through the classifier instead — see
+      // requireKnownTextDescendants).
+      requireKnownTextDescendants(text, "an item text");
       out.push(nodeText(text, 0, keep));
     }
   }
@@ -1759,8 +1804,17 @@ function buildTemplateField(
   // changed only which whitespace-only segments reach the
   // normalizer — an NBSP-only caption was already absent before
   // B-7 and stays absent.)
+  // (F-1, round 19) normalizePreserving() (via
+  // collectTextSegments()) recurses into ALL descendants unchecked
+  // — an unbound descendant inside the consumed subtree (<value>
+  // when present, else the bare caption) would become the label.
+  // Guard the consumed subtree first; the shared flatteners are
+  // untouched (dataset rich text goes through the classifier
+  // instead — see requireKnownTextDescendants).
+  const captionTextRoot = caption !== undefined ? (captionValue ?? caption) : undefined;
+  if (captionTextRoot !== undefined) requireKnownTextDescendants(captionTextRoot, "a caption");
   const captionText =
-    caption !== undefined ? normalizePreserving(captionValue ?? caption, captionKeep) : "";
+    captionTextRoot !== undefined ? normalizePreserving(captionTextRoot, captionKeep) : "";
   const label = captionText !== "" ? captionText : undefined;
   const options = uiKind === "choiceList" ? itemTexts(node, keep) : [];
   return {
@@ -1978,8 +2032,17 @@ function collectTemplateFields(
       // Same per-subtree normalization as a field caption (A-3,
       // round 7): a preserved descendant survives even when the group
       // caption itself carries no preserve.
+      // (F-1, round 19) Same descendant gap as a field caption:
+      // normalizePreserving() recurses unchecked, so guard the
+      // consumed subtree (<value> when present, else the bare
+      // caption) before flattening it.
+      const groupCaptionTextRoot = caption !== undefined ? (captionValue ?? caption) : undefined;
+      if (groupCaptionTextRoot !== undefined)
+        requireKnownTextDescendants(groupCaptionTextRoot, "a caption");
       const captionText =
-        caption !== undefined ? normalizePreserving(captionValue ?? caption, captionKeep) : "";
+        groupCaptionTextRoot !== undefined
+          ? normalizePreserving(groupCaptionTextRoot, captionKeep)
+          : "";
       out.push({
         somPath: groupPath,
         leafName: name,
