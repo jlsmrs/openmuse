@@ -6766,7 +6766,11 @@ test("E-3 (round 18): a DECLARED <p:checkButton/> still makes a checkbox (probe 
 // rich-text flattening, where unbound descendants are handled by the
 // classifier — so the guard lives at the call sites, not in the
 // shared flatteners. Controls pin the boundary: declared-prefix and
-// no-namespace descendants keep their labels/on-values.
+// unprefixed nested markup (in the default template namespace —
+// wrap() declares it on <template>, so the <b> in F1c/F2c inherits
+// it; they do NOT pin the genuine no-namespace case) keep their
+// labels/on-values. The genuine no-namespace case (xmlns="") is
+// pinned by the H-1 controls in round 20.
 
 test("F-1 (round 19): an unbound descendant inside a caption <value> fails closed (probe F1)", async () => {
   // E-3 guarded the <caption>/<value> wrappers, but
@@ -6803,8 +6807,12 @@ test("F-1 (round 19): a DECLARED descendant inside a caption <value> still label
 });
 
 test("F-1 (round 19): plain nested markup inside a caption <value> still labels (probe F1c control)", async () => {
-  // Control: a no-namespace nested element is legacy markup, not an
-  // unknown namespace — its text still supplies the label.
+  // Control: an unprefixed nested element is legacy markup in the
+  // default template namespace — NOT a no-namespace element (wrap()
+  // declares xmlns="http://www.xfa.org/schema/xfa-template/3.3/" on
+  // <template>, so the <b> inherits it) — and its text still
+  // supplies the label. (H-1, round 20: reworded; the genuine
+  // no-namespace case is pinned by the H-1 control below.)
   const bytes = await createXfaPdf(
     wrap(
       '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><b>PLAIN-LABEL</b></value></caption></field>',
@@ -6850,6 +6858,11 @@ test("F-1 (round 19): a DECLARED descendant inside an <items> <text> still suppl
 });
 
 test("F-1 (round 19): plain nested markup inside an <items> <text> still supplies the on-value (probe F2c control)", async () => {
+  // Control: same unprefixed nested markup as F1c (in the default
+  // template namespace via wrap(), NOT no-namespace) — its text
+  // still supplies the on-value. (H-1, round 20: comment added;
+  // the genuine no-namespace case is pinned by the H-1 control
+  // below.)
   const bytes = await createXfaPdf(
     wrap(
       '<field name="code"><ui><checkButton/></ui><items><text><b>PLAIN-ON</b></text><text>0</text></items><bind match="default"/></field>',
@@ -7027,6 +7040,133 @@ test("F-3 (round 19): a later unbound dataNode attribute still fails closed alon
     assert.equal((error as { status?: number }).status, 422);
     assert.match(error.message, /dataNode.*unbound prefix/);
     assert.doesNotMatch(error.message, /Inside/);
+    return true;
+  });
+});
+
+// --- B1 fix round 20 (re-review #19, EXPANDED PANEL, Nov 21, 2026) --------
+// Test-only round: no production-code change. H-1 rewords the F1c/F2c
+// "no-namespace" description (the <b> there inherits wrap()'s default
+// template namespace — it is unprefixed nested markup, not
+// no-namespace markup) and adds xmlns="" companion controls pinning
+// the genuine no-namespace boundary. H-2 adds four defect-regression
+// tests for the F-1 guard paths re-review #19 left unpinned (depth-2
+// caption descendant, second <items> <text>, choiceList option text,
+// unnamed exclGroup option text). Probe shapes are noted per test.
+
+test("H-1 (round 20): a genuine no-namespace descendant inside a caption <value> still labels (probe G7 control)", async () => {
+  // Control: the <b> here carries an explicit xmlns="" — it is in NO
+  // namespace, unlike the <b> in F1c, which inherits wrap()'s default
+  // template namespace. A no-namespace descendant passes the F-1
+  // guard unchanged and its text still supplies the label.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><b xmlns="">PLAIN-NS0</b></value></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "V", type: "text", label: "PLAIN-NS0" },
+  ]);
+});
+
+test("H-1 (round 20): a genuine no-namespace descendant inside an <items> <text> still supplies the on-value (probe G8 control)", async () => {
+  // Control: same genuine no-namespace shape as G7, on the items
+  // path — the <b xmlns=""> is in no namespace, unlike the <b> in
+  // F2c, which inherits wrap()'s default template namespace. Its
+  // text still supplies the on-value.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><checkButton/></ui><items><text><b xmlns="">PLAIN-NS0-ON</b></text><text>0</text></items><bind match="default"/></field>',
+      `<code>0</code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "0", type: "checkbox", onValues: ["PLAIN-NS0-ON"] },
+  ]);
+});
+
+test("H-2 (round 20): an unbound descendant at depth 2 inside a caption <value> fails closed (probe G3)", async () => {
+  // The F-1 guard walks the whole consumed subtree, so an unbound
+  // descendant nested one level deeper (<span><p:text>) must still
+  // fail closed rather than contributing "UNBOUND-DEEP" to the label.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><span><p:text>UNBOUND-DEEP</p:text></span></value></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:text.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-DEEP/);
+    return true;
+  });
+});
+
+test("H-2 (round 20): an unbound descendant in the SECOND <items> <text> of a checkButton fails closed (probe G1)", async () => {
+  // The second <text> is the checkButton's off-value and is never
+  // reported — only items[0] becomes the on-value. itemTexts()
+  // guards EVERY <text> anyway, so an unbound descendant there still
+  // fails closed. This pins the over-breadth behaviour as INTENDED
+  // (H-3, re-review #19): narrowing the guard to only-consumed
+  // texts would re-open the same class of hole E-3 closed, and the
+  // fail-closed policy treats an unbound prefix as a rejected state
+  // wherever it appears in consumed template text. NOT a defect.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><checkButton/></ui><items><text>ON</text><text><p:b>UNBOUND-OFF</p:b></text></items><bind match="default"/></field>',
+      `<code>ON</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:b.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-OFF/);
+    return true;
+  });
+});
+
+test("H-2 (round 20): an unbound descendant in a choiceList option text fails closed (probe G4)", async () => {
+  // F-2 covered only the checkButton option path; the choiceList
+  // option path runs through the same itemTexts() guard, so an
+  // unbound descendant in an option <text> must fail closed rather
+  // than contributing "UNBOUND-OPT" to the options.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><choiceList/></ui><items><text><p:b>UNBOUND-OPT</p:b></text><text>A</text></items><bind match="default"/></field>',
+      `<code>A</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:b.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-OPT/);
+    return true;
+  });
+});
+
+test("H-2 (round 20): an unbound descendant in an unnamed exclGroup option text fails closed (probe G5)", async () => {
+  // The unnamed-option branch never reaches buildTemplateField, so
+  // the option's <text> is consumed on the exclGroup path — the F-1
+  // guard there must fail closed rather than contributing
+  // "UNBOUND-OPT" to the group's options.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<exclGroup name="pay"><bind match="default"/><field><items><text><p:b>UNBOUND-OPT</p:b></text></items></field></exclGroup>',
+      `<pay>OPT</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:b.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-OPT/);
     return true;
   });
 });
