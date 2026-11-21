@@ -2,16 +2,113 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 import pg from "pg";
-import { backgroundFailure } from "./log.ts";
+import { reportBackgroundFailure } from "./log.ts";
 
 type Row = { data: Record<string, unknown> };
+
+/**
+ * A promise-chain mutex: each holder runs alone, in call order. Used to
+ * serialize every operation on the embedded PGlite connection (see
+ * createStore): PGlite is a single connection, and a plain query issued
+ * while a transaction is open on that connection joins the open
+ * transaction — it can be committed by another transaction's COMMIT or
+ * rolled back by its ROLLBACK. The mutex keeps a whole transaction
+ * (including its awaits) and every ordinary query mutually exclusive, so
+ * neither can leak into the other.
+ */
+function createMutex(): <T>(fn: () => Promise<T>) => Promise<T> {
+  let tail: Promise<void> = Promise.resolve();
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = tail;
+    tail = previous.then(() => gate);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
+
 interface Database {
   query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  /**
+   * Run `fn` inside one database transaction: every query `fn` issues
+   * commits together or rolls back together. The pg implementation
+   * checks a single client out of the pool for the whole transaction
+   * (pool.query would not be atomic — BEGIN and the writes could land on
+   * different clients). The PGlite implementation uses PGlite's
+   * transaction API with its transaction-scoped query handle, and the
+   * whole transaction is additionally serialized against ALL other
+   * access to the embedded connection (see createMutex): sequential
+   * BEGIN/COMMIT on the single connection is NOT atomic under async
+   * callbacks — an await inside one transaction lets another
+   * transaction's queries interleave, and a plain query issued
+   * mid-transaction joins the open transaction. A nested call just
+   * joins the ambient transaction.
+   *
+   * A failure in the COMMIT step is marked indeterminate (B-1, round
+   * 6): the COMMIT may have completed server-side before the
+   * connection broke, so the outcome is unknown, not a rollback —
+   * see markIndeterminateCommit / isIndeterminateCommit.
+   */
+  transaction: <T>(fn: (query: Database["query"]) => Promise<T>) => Promise<T>;
   close: () => Promise<void>;
+}
+
+/**
+ * Indeterminate COMMIT marker (B-1, round 6; non-mutating, round 8): a transaction whose
+ * COMMIT step failed may or may not have committed server-side — a
+ * lost acknowledgement is indistinguishable from a rollback from the
+ * client's seat. The pg transaction marks such failures with this
+ * symbol so callers that do destructive cleanup on failure
+ * (Files.pull deleting the bytes file) can tell "outcome unknown"
+ * from "rolled back". The marker is advisory, not sufficient on its
+ * own: callers must ALSO treat any failure after their work callback
+ * completed as indeterminate, because a wrapper (or a later step) can
+ * throw after a successful commit — which no backend marker can see.
+ *
+ * Round 8: the mark lives in a WeakSet keyed by the error object,
+ * NOT as a property on the error. Assigning a symbol property throws
+ * on a frozen/non-extensible error, which would replace the COMMIT
+ * error with the assignment failure; a WeakSet add never mutates the
+ * object, so marking works on frozen errors too, and the mark dies
+ * with the error (no retention beyond the error's own lifetime).
+ */
+const indeterminateCommits = new WeakSet<object>();
+export function markIndeterminateCommit(error: unknown): unknown {
+  if (typeof error === "object" && error !== null) {
+    indeterminateCommits.add(error);
+  }
+  return error;
+}
+export function isIndeterminateCommit(error: unknown): boolean {
+  return typeof error === "object" && error !== null && indeterminateCommits.has(error);
 }
 
 export class Store {
   constructor(private readonly db: Database) {}
+  /**
+   * Run `work` with a transactional view of this store: every put/remove
+   * inside `work` commits together or rolls back together. Used by
+   * Files.pull so the artifact copy and its audit entry are one unit —
+   * a failed audit write can never leave a visible, unaudited copy.
+   */
+  async transaction<T>(work: (tx: Store) => Promise<T>): Promise<T> {
+    return this.db.transaction(async (query) => {
+      const txDatabase: Database = {
+        query,
+        // Already inside a transaction: join it.
+        transaction: (fn) => fn(query),
+        close: async () => {},
+      };
+      return work(new Store(txDatabase));
+    });
+  }
   /** Liveness probe: true when the database answers, false otherwise. Never throws. */
   async ping(): Promise<boolean> {
     try {
@@ -207,8 +304,125 @@ export class Store {
 /** Idle clients can be disconnected by a database restart; without a listener pg's `error` event crashes the process. */
 export function createPool(connectionString: string) {
   const pool = new pg.Pool({ connectionString, max: 5 });
-  pool.on("error", (error) => backgroundFailure("postgres pool", error));
+  pool.on("error", (error) => reportBackgroundFailure("postgres pool", error));
   return pool;
+}
+
+/**
+ * Minimal pool/client shape the pg transaction runner needs (B-1,
+ * round 7). A real pg.Pool satisfies it; tests supply a fake that
+ * records releases, so the rollback-failure discard is asserted at
+ * mock level (no live PostgreSQL in this environment).
+ */
+export interface PgTransactionClient {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  /** pg's release: an error argument destroys the client instead of returning it to the pool. */
+  release: (error?: Error) => void;
+}
+export interface PgTransactionPool {
+  query: (sql: string, params?: unknown[]) => Promise<{ rows: Row[] }>;
+  connect: () => Promise<PgTransactionClient>;
+  end: () => Promise<void>;
+}
+
+/**
+ * The pg-backed Database: ordinary queries go straight to the pool;
+ * a transaction checks one client out for its whole lifetime.
+ *
+ * (B-1, round 7) A failed ROLLBACK must NOT return the client to the
+ * usable pool: the connection may still hold the abandoned
+ * transaction open (e.g. the work query timed out client-side while
+ * still executing server-side), and a later COMMIT on a reused
+ * connection could commit it. So a rollback failure discards the
+ * client through pg's error release path (release(error) destroys
+ * it), reports the cleanup failure via the shared non-throwing
+ * reportBackgroundFailure, and still rethrows the ORIGINAL operation
+ * error — the rollback failure never masks it. The client is released
+ * exactly once on every path: the success path releases after COMMIT,
+ * the failure path releases after the ROLLBACK attempt (with or
+ * without the discard error). A ROLLBACK that rejects with
+ * `undefined` still counts as a failure (B-2, round 9): the failure
+ * is tracked with a separate boolean, never by comparing the caught
+ * value against `undefined`.
+ * (B-1, round 8) release() and the cleanup logging are themselves
+ * guarded: a throwing release or a throwing logger is reported, never
+ * propagated, so cleanup can never mask the original error — or, on
+ * the success path, turn a committed transaction into a thrown error.
+ * (B-1, round 9) The guard is now the shared reportBackgroundFailure
+ * in log.ts, used by the pull-level caller too — one implementation
+ * for both call sites, not a local copy here.
+ */
+export function createPgDatabase(pool: PgTransactionPool): Database {
+  return {
+    query: async (sql, params) => pool.query(sql, params),
+    transaction: async (fn) => {
+      const client = await pool.connect();
+      let released = false;
+      // (B-1, round 9) Cleanup must never mask the operation error:
+      // client.release() itself can throw, and so can the cleanup
+      // logging (backgroundFailure) — either would otherwise replace
+      // the original error with a cleanup failure, or, on the success
+      // path, turn a committed transaction into a thrown error. Every
+      // cleanup failure is therefore reported through the shared
+      // non-throwing wrapper reportBackgroundFailure (log.ts), which
+      // the pull-level caller in files.ts uses too — the local
+      // reportCleanupFailure from round 8 is replaced by it, so the
+      // guarantee is one implementation, not two.
+      const release = (error?: Error): void => {
+        if (released) return;
+        released = true;
+        try {
+          if (error !== undefined) client.release(error);
+          else client.release();
+        } catch (releaseFailure) {
+          reportBackgroundFailure("postgres release failed", releaseFailure);
+        }
+      };
+      try {
+        await client.query("BEGIN");
+        const result = await fn((sql, params) => client.query(sql, params));
+        try {
+          await client.query("COMMIT");
+        } catch (commitError) {
+          // The COMMIT may have completed server-side before the
+          // connection broke: the outcome is indeterminate, not a
+          // rollback. Mark it — the ROLLBACK attempt below is
+          // connection hygiene only and cannot prove a rollback
+          // happened, so the mark survives it.
+          throw markIndeterminateCommit(commitError);
+        }
+        release();
+        return result;
+      } catch (error) {
+        // (B-2, round 9) Rollback failure is tracked with a separate
+        // boolean: a query rejecting with `undefined` must still count
+        // as a rollback failure — the old `rollbackError !== undefined`
+        // check read it as success and returned the client to the pool
+        // instead of discarding it. `rollbackError` itself is still
+        // kept for the report and for the discard error's cause.
+        let rollbackFailed = false;
+        let rollbackError: unknown;
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackFailure) {
+          rollbackFailed = true;
+          rollbackError = rollbackFailure;
+        }
+        if (rollbackFailed) {
+          reportBackgroundFailure("postgres rollback failed", rollbackError);
+          release(
+            rollbackError instanceof Error
+              ? rollbackError
+              : new Error("PostgreSQL ROLLBACK failed", { cause: rollbackError }),
+          );
+        } else {
+          release();
+        }
+        throw error;
+      }
+    },
+    close: () => pool.end(),
+  };
 }
 
 export async function createStore(
@@ -217,13 +431,23 @@ export async function createStore(
   let database: Database;
   if (options.databaseUrl) {
     const pool = createPool(options.databaseUrl);
-    database = { query: async (sql, params) => pool.query(sql, params), close: () => pool.end() };
+    database = createPgDatabase(pool);
   } else {
     if (options.dataDir) await mkdir(dirname(options.dataDir), { recursive: true, mode: 0o700 });
     const embedded = new PGlite(options.dataDir);
     await embedded.waitReady;
+    // One lock for the whole embedded connection: a transaction callback
+    // holds it from its first query to its commit/rollback, and every
+    // ordinary query holds it for its single statement. The lock is held
+    // only by the outermost operation — the transaction-scoped query
+    // handle below never re-acquires it, so there is no re-entrancy.
+    const exclusive = createMutex();
     database = {
-      query: (sql, params) => embedded.query<Row>(sql, params),
+      query: (sql, params) => exclusive(() => embedded.query<Row>(sql, params)),
+      transaction: async (fn) =>
+        exclusive(() =>
+          embedded.transaction(async (tx) => fn((sql, params) => tx.query<Row>(sql, params))),
+        ),
       close: () => embedded.close(),
     };
   }

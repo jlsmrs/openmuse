@@ -21,6 +21,8 @@ import {
   rgb,
   StandardFonts,
 } from "pdf-lib";
+import type { FormKind } from "../../../packages/domain/src/index.ts";
+import { hasXfa, inspectXfa, XfaError } from "./xfa.ts";
 
 const MAX_PDF_BYTES = 10 * 1024 * 1024;
 const MAX_PDF_PAGES = 500;
@@ -52,7 +54,18 @@ async function pdfOperation<T>(operation: () => Promise<T>, fallback: string): P
 
 export interface PdfInspection {
   pageCount: number;
-  fields: { name: string; value: string; type: "text" | "checkbox" | "unsupported" }[];
+  fields: {
+    name: string;
+    value: string;
+    type: "text" | "checkbox" | "unsupported";
+    /** Dropdown/radio option list (XFA choiceList / exclGroup). */
+    options?: string[];
+    /** Template caption text, when present. */
+    label?: string;
+    /** Checkbox on-values, one per template occurrence (XFA only). */
+    onValues?: string[];
+  }[];
+  formKind: FormKind;
 }
 
 // pdf-lib decompresses object and cross-reference streams while loading, with no output limit,
@@ -2459,9 +2472,6 @@ async function loadPdfInner(
       if (decrypted) throw new PdfError("Encrypted PDFs are not supported");
       return loadPdfInner(decryptPdfWithEmptyPassword(bytes, budget), budget, true);
     }
-    if (doc.catalog.lookupMaybe(PDFName.of("AcroForm"), PDFDict)?.has(PDFName.of("XFA"))) {
-      throw new PdfError("Unsupported XFA PDF form");
-    }
     if (doc.getPageCount() < 1 || doc.getPageCount() > MAX_PDF_PAGES)
       throw new PdfError("PDF must contain between 1 and 500 pages");
     return doc;
@@ -2528,8 +2538,30 @@ function inspectField(field: PDFField): PdfInspection["fields"][number] {
 
 export async function inspectPdf(bytes: Uint8Array): Promise<PdfInspection> {
   return pdfOperation(async () => {
-    const doc = await loadPdf(bytes);
-    return { pageCount: doc.getPageCount(), fields: doc.getForm().getFields().map(inspectField) };
+    // XFA packet decoding runs inside its own decode budget (loadPdf's
+    // budget ends when loadPdf returns): a hostile packet still cannot
+    // expand without bound after the document itself has loaded.
+    return decodeBudget.run({ remaining: MAX_DECODED_BYTES }, async () => {
+      const doc = await loadPdf(bytes);
+      const pageCount = doc.getPageCount();
+      if (hasXfa(doc)) {
+        // Read packets BEFORE any getForm() call: pdf-lib's getForm()
+        // deletes the /XFA entry from the loaded document.
+        try {
+          const xfa = inspectXfa(doc);
+          return { pageCount, fields: xfa.fields, formKind: xfa.formKind };
+        } catch (error) {
+          if (error instanceof XfaError) throw new PdfError(error.message, { cause: error });
+          throw error;
+        }
+      }
+      const fields = doc.getForm().getFields().map(inspectField);
+      return {
+        pageCount,
+        fields,
+        formKind: fields.length > 0 ? "acroform" : "none",
+      };
+    });
   }, "Cannot inspect PDF: the document contains malformed or unsupported form fields");
 }
 
@@ -2556,6 +2588,10 @@ export async function fillPdf(
 ): Promise<Uint8Array> {
   return pdfOperation(async () => {
     const doc = await loadPdf(bytes);
+    // Fill is B2: never let getForm() silently delete the XFA entry and
+    // fill only the AcroForm twin of a hybrid form.
+    if (hasXfa(doc))
+      throw new PdfError("Unsupported XFA PDF form: filling XFA forms is not supported yet");
     const form = doc.getForm();
     const fields = new Map(form.getFields().map((field) => [field.getName(), field]));
     const filled: PDFField[] = [];

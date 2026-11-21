@@ -1,14 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve, sep } from "node:path";
-import type { Artifact } from "../../../packages/domain/src/index.ts";
+import type { Artifact, FormKind } from "../../../packages/domain/src/index.ts";
 import { fillPdf, inspectPdf, type PdfInspection } from "../../../packages/integrations/src/pdf.ts";
 import type { Auth } from "./auth.ts";
 import type { Config } from "./config.ts";
-import type { Store } from "./db.ts";
+import { isIndeterminateCommit, type Store } from "./db.ts";
 import { isExtractableDocumentMime } from "./engine/document-text.ts";
 import { isConvertibleImageMime, isVisionMime } from "./engine/vision.ts";
 import { AppError } from "./errors.ts";
+import { reportBackgroundFailure } from "./log.ts";
 
 const FILE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -23,6 +24,19 @@ export function sanitizeFileName(name: string): string {
 }
 
 export const MAX_FILE_BYTES = 10 * 1024 * 1024;
+
+/** One audited cross-company pull: who pulled what, from where, to where, when. */
+export interface FilePullAudit {
+  id: string;
+  who: string;
+  fileId: string;
+  fileName: string;
+  sourceId: string;
+  from: string;
+  to: string;
+  when: string;
+}
+export const FILE_PULL_AUDIT_COLLECTION = "file-pull-audit";
 
 // MIME types the workspace recognises by file extension. Anything else is
 // still accepted and stored — it is recorded as application/octet-stream and
@@ -198,6 +212,98 @@ export function deterministicFileId(owner: string, operationKey: string): string
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
+/** One row of a file's lineage: provenance only. No field values, no
+ * applied field map, and no signed URL ever cross owners here — the
+ * chain (ids, names, times) is what lineage reconstructs, and
+ * the full Artifact rows stay behind the owner-scoped `get`. (M5,
+ * round 4: the old comment promised "owners" here, but this entry
+ * carries no owner field — the chain is identified by ids, names, and
+ * times, and the starting file's owner is the caller's.) */
+export interface FileLineageEntry {
+  id: string;
+  name: string;
+  mimeType: string;
+  size: number;
+  pageCount: number;
+  formKind: FormKind;
+  source: string;
+  parentId?: string;
+  createdAt: string;
+}
+
+/**
+ * Strict ISO date/datetime validation for search `from`/`to` (re-review
+ * #2 minor): `Date.parse` alone is not calendar-strict — "2026-02-30"
+ * normalizes to March 2 instead of rejecting. Only ISO date-only
+ * (YYYY-MM-DD) and ISO datetimes are accepted, and the calendar date
+ * must really exist (month 1–12, day within the month, leap years
+ * honoured) with a valid time of day. Returns the epoch-ms instant, or
+ * throws a 422 naming the value. The days-in-month check is arithmetic
+ * (M3, round 4), never `new Date(Date.UTC(year, month, 0))`: Date.UTC
+ * remaps years 0–99 to 1900–1999, which wrongly rejected the valid
+ * leap date 0000-02-29. Timezone-less datetimes are interpreted in the
+ * server's local timezone (M4, round 4): that is `Date.parse`
+ * behaviour, documented in the SPEC's date semantics — a bare
+ * `2026-11-18T12:00:00` is not UTC unless it carries a `Z` or offset.
+ */
+export function parseSearchDate(value: string): number {
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  const match =
+    dateOnly ??
+    /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/.exec(
+      value,
+    );
+  if (!match) throw new AppError(`Search date '${value}' is not a valid ISO date`, 422);
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  // Arithmetic leap years (proleptic Gregorian): divisible by 4, except
+  // centuries, except centuries divisible by 400. Year 0 is divisible
+  // by 400, so 0000-02-29 exists; 0100-02-29 does not.
+  const isLeapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth =
+    month >= 1 && month <= 12
+      ? [31, isLeapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]
+      : 0;
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth)
+    throw new AppError(`Search date '${value}' is not a real calendar date`, 422);
+  if (match[4] !== undefined) {
+    const hour = Number(match[4]);
+    const minute = Number(match[5]);
+    const second = match[6] === undefined ? 0 : Number(match[6]);
+    if (hour > 23 || minute > 59 || second > 59)
+      throw new AppError(`Search date '${value}' is not a valid time`, 422);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed))
+    throw new AppError(`Search date '${value}' is not a valid ISO date`, 422);
+  return parsed;
+}
+
+/** True when the value is a strict ISO date/datetime (see parseSearchDate). */
+export function isValidSearchDate(value: string): boolean {
+  try {
+    parseSearchDate(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function toLineageEntry(file: Artifact): FileLineageEntry {
+  return {
+    id: file.id,
+    name: file.name,
+    mimeType: file.mimeType,
+    size: file.size,
+    pageCount: file.pageCount,
+    formKind: file.formKind ?? "none",
+    source: file.source,
+    ...(file.parentId !== undefined ? { parentId: file.parentId } : {}),
+    createdAt: file.createdAt,
+  };
+}
+
 export class Files {
   constructor(
     private readonly db: Store,
@@ -306,6 +412,7 @@ export class Files {
       size: bytes.length,
       pageCount: metadata?.pageCount ?? 0,
       fields: metadata?.fields,
+      formKind: metadata?.formKind ?? "none",
       url: "",
       createdAt: new Date().toISOString(),
       source,
@@ -319,7 +426,16 @@ export class Files {
     return this.signed(owner, persisted ?? (await this.get(owner, id)));
   }
   signed(owner: string, file: Artifact): Artifact {
-    return { ...file, url: this.auth.sign(owner, `/api/files/${file.id}/content`) };
+    // The returned Artifact projection: legacy rows imported before B1
+    // have no formKind on their row, and they report "none" until
+    // re-imported (the pre-B1 kind is never guessed). The fallback lives
+    // here so list() and search() — both of which project through
+    // signed() — report it, not just the search filter.
+    return {
+      ...file,
+      formKind: file.formKind ?? "none",
+      url: this.auth.sign(owner, `/api/files/${file.id}/content`),
+    };
   }
   async list(owner: string) {
     return (await this.db.list<Artifact>(owner, "files")).map((file) => this.signed(owner, file));
@@ -329,6 +445,168 @@ export class Files {
     const file = await this.db.get<Artifact>(owner, "files", id);
     if (!file) throw new AppError("File not found", 404);
     return file;
+  }
+  /**
+   * Search the caller's own files (milestone 1: filter-over-list — the
+   * corpus is hundreds of files, not millions). Substring match over the
+   * file name and over field names/values, plus formKind and createdAt
+   * filters. Owner-scoped: another owner's files can never match.
+   * Returned rows keep the existing Artifact shape, INCLUDING field
+   * values — search returns full Artifact rows to their owner, exactly
+   * as list() does. The no-snippet rule only prevents a SEPARATE
+   * snippet surface (field values excerpted into logs or other
+   * surfaces); it does not redact the rows themselves. Including field
+   * values in search results is Josh's P1-1 decision (Nov 18, 2026:
+   * INCLUDE) — search stays as-is.
+   * Date-interval semantics: `from` is inclusive of its start (a bare
+   * date means the start of that day); `to` is inclusive of the whole
+   * day when given as a bare date (2026-11-18 matches files created at
+   * any time that day) and inclusive of the instant when given as a full
+   * timestamp. `from` after `to` is a 422, and so is a date that is not
+   * a real calendar date (`2026-02-30` normalizes under `Date.parse`,
+   * so bounds are validated strictly — see parseSearchDate).
+   */
+  async search(
+    owner: string,
+    query: { q?: string; formKind?: FormKind; from?: string; to?: string },
+  ): Promise<Artifact[]> {
+    const needle = query.q?.trim().toLowerCase();
+    const from = query.from === undefined ? Number.NaN : parseSearchDate(query.from);
+    let to = query.to === undefined ? Number.NaN : parseSearchDate(query.to);
+    if (Number.isFinite(to) && /^\d{4}-\d{2}-\d{2}$/.test(query.to ?? "")) to += 86400000 - 1;
+    if (Number.isFinite(from) && Number.isFinite(to) && from > to)
+      throw new AppError("Search date range is invalid: 'from' must be on or before 'to'", 422);
+    return (await this.list(owner)).filter((file) => {
+      if (query.formKind !== undefined && (file.formKind ?? "none") !== query.formKind)
+        return false;
+      const createdAt = Date.parse(file.createdAt);
+      if (Number.isFinite(from) && createdAt < from) return false;
+      if (Number.isFinite(to) && createdAt > to) return false;
+      if (!needle) return true;
+      if (file.name.toLowerCase().includes(needle)) return true;
+      return (file.fields ?? []).some(
+        (field) =>
+          field.name.toLowerCase().includes(needle) || field.value.toLowerCase().includes(needle),
+      );
+    });
+  }
+  /**
+   * Cross-company pull: an explicit, audited COPY of one file into
+   * another owner's workspace. Type-agnostic — bytes + the metadata row
+   * are copied as-is, so PDFs, Office docs, text, images, audio/video,
+   * archives, and application/octet-stream all pull the same way; no
+   * PDF-specific logic lives anywhere in this path. The source row is
+   * untouched and the copy gets a fresh id, `parentId` = source id, and
+   * `source` = "Pulled from <source-owner>/<id>". The audit entry is
+   * written in the same database transaction as the copy, so the two
+   * commit or roll back together: a failed audit write can never leave
+   * a visible, unaudited copy. The bytes file is written before the
+   * transaction and removed again if the transaction fails before its
+   * work completes (a removal failure is logged loudly, never
+   * swallowed). Once the work has completed, the outcome is
+   * unknown-or-committed — a lost COMMIT acknowledgement, a
+   * commit-phase failure, or a wrapper throwing after commit — and the
+   * bytes are RETAINED, never deleted (B-1, round 6): only a failure
+   * inside the work callback establishes a rollback. Retained bytes
+   * from a genuinely rolled-back commit are orphaned files under
+   * dataDir/files, left for operator reconciliation.
+   */
+  async pull(owner: string, id: string, toOwner: string): Promise<Artifact> {
+    if (typeof toOwner !== "string" || toOwner.trim() === "" || toOwner !== toOwner.trim())
+      throw new AppError("A target workspace is required", 422);
+    // Same hygiene as sanitizeFileName: no path separators, no control characters.
+    if (
+      toOwner.includes("/") ||
+      toOwner.includes("\\") ||
+      [...toOwner].some((ch) => ch.charCodeAt(0) < 32 || ch.charCodeAt(0) === 127)
+    )
+      throw new AppError("Target workspace is invalid", 422);
+    if (toOwner === owner) throw new AppError("File is already in this workspace", 422);
+    // Read access to the source is required: without it this is a 404,
+    // not a 403 with details — existence must not leak.
+    const source = await this.get(owner, id);
+    const bytes = await this.bytes(owner, id);
+    const newId = randomUUID();
+    const directory = join(this.config.dataDir, "files");
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const path = this.pathFor(newId, source.name);
+    await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
+    const when = new Date().toISOString();
+    const artifact: Artifact = {
+      ...source,
+      id: newId,
+      url: "",
+      createdAt: when,
+      source: `Pulled from ${owner}/${id}`,
+      parentId: id,
+    };
+    const audit: FilePullAudit = {
+      id: randomUUID(),
+      who: owner,
+      fileId: newId,
+      fileName: source.name,
+      sourceId: id,
+      from: owner,
+      to: toOwner,
+      when,
+    };
+    // The bytes file is removed ONLY when non-commit is established:
+    // the work callback threw before COMMIT was attempted, so the
+    // transaction rolled the copy and the audit entry back together
+    // (B-1, round 6). Once the work completed, the outcome is
+    // unknown-or-committed — a lost COMMIT acknowledgement, a
+    // commit-phase failure (marked indeterminate by the pg
+    // transaction), or a wrapper that threw after commit — and
+    // deleting the bytes could destroy a committed copy's data, so
+    // they are retained and the failure is logged loudly for
+    // reconciliation instead. A removal failure is logged loudly,
+    // never swallowed.
+    let workCompleted = false;
+    try {
+      await this.db.transaction(async (tx) => {
+        await tx.put(toOwner, "files", artifact);
+        await tx.put("system", FILE_PULL_AUDIT_COLLECTION, audit);
+        workCompleted = true;
+      });
+    } catch (error) {
+      if (!workCompleted && !isIndeterminateCommit(error)) {
+        await rm(path, { force: true }).catch((removeError: unknown) =>
+          reportBackgroundFailure("file pull cleanup", removeError),
+        );
+      } else {
+        // (B-1, round 9) The log call is the shared non-throwing
+        // wrapper: a throwing logger must never replace the original
+        // transaction error the `throw error` below rethrows.
+        reportBackgroundFailure("file pull indeterminate commit — bytes retained", error);
+      }
+      throw error;
+    }
+    return this.signed(toOwner, artifact);
+  }
+  /**
+   * Full lineage of a file, oldest → newest, by walking parentId links
+   * across owners (a hop lives under its target owner, so the walk reads
+   * the whole files table, not one owner's rows). Rows are
+   * provenance-only (see FileLineageEntry): the chain (ids, names,
+   * times) — never field values or signed URLs. A missing or deleted
+   * ancestor ends the chain; a cycle cannot loop forever.
+   */
+  async lineage(owner: string, id: string): Promise<FileLineageEntry[]> {
+    const start = await this.get(owner, id);
+    const byId = new Map(
+      (await this.db.scan<Artifact>("files")).map((row) => [row.value.id, row.value]),
+    );
+    const chain: FileLineageEntry[] = [toLineageEntry(start)];
+    const seen = new Set([start.id]);
+    let current = start;
+    while (current.parentId !== undefined && !seen.has(current.parentId)) {
+      const parent = byId.get(current.parentId);
+      if (!parent) break;
+      seen.add(parent.id);
+      chain.push(toLineageEntry(parent));
+      current = parent;
+    }
+    return chain.reverse();
   }
   private pathFor(id: string, name?: string): string {
     assertFileId(id);

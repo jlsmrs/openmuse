@@ -3,6 +3,50 @@
 These fixtures support the PDF-import fix (F5). Each is a separate case;
 do not merge them into one omnibus file.
 
+## XFA fixtures (B1, feat/api-xfa-b1)
+
+- `fw9.pdf` — IRS Form W-9 (Rev. March 2024), the real-world static hybrid
+  XFA test case. Downloaded 2026-11-18 from
+  https://www.irs.gov/pub/irs-pdf/fw9.pdf (public domain), 140,815 bytes,
+  SHA-256
+  `2d420cbb4123dcf1fb82595b2359cfbb5d81f00b9df9d359fcc7af361d093f53`,
+  6 pages, not encrypted. Inspects to 17 fields (15 text `f1_01`–`f1_15`,
+  2 checkbox `c1_1`, `c1_2`), values `""` / `"0"`, `formKind: "xfa-static"`.
+- `xfa-static.pdf` — synthetic static hybrid XFA (generator:
+  `tests/xfa-fixtures.ts`): 3 text + 1 checkbox + 1 dropdown + 1 radio,
+  known values; template fields mirror the datasets tree. 2,524 bytes,
+  SHA-256 `6ed6e0fa2713bf2ccf5fb84094689d0f986bcaab8aac8309d31cf6bb4bf2a49d`.
+- `xfa-dynamic.pdf` — synthetic dynamic XFA (same generator): no AcroForm
+  twin, `/NeedsRendering true`, one repeating subform with 2 instances
+  pre-filled. 1,471 bytes, SHA-256
+  `d78b5aa2b2934f8d110cf6e5875654a781ca2d5d1c1da2293264d9c9019f4cf6`.
+- `xfa-fieldless.pdf` — synthetic XFA with template + datasets packets and
+  zero `<field>` elements; stores with `fields: []`. 2,266 bytes, SHA-256
+  `ca2281574fa72c75b3c784df96f7883a785395d9ec9b8e6a8bae4d0694343027`.
+- `xfa-malformed-xxe.pdf` (2,511 bytes, SHA-256
+  `64f8b8e8cd581997717c5e9658f4acd53b666aa336ec4f3851888169ec7321a1`),
+  `xfa-malformed-unclosed.pdf` (2,508 bytes, SHA-256
+  `02530da13a23f02543d26f470310f86ae1a121670817a2bb6223e66e859b0257`),
+  `xfa-malformed-no-datasets.pdf` (2,253 bytes, SHA-256
+  `e705027c61805b0836acf171545e879dd39450af7d63d297954ec8a2a37be50b`),
+  `xfa-malformed-no-template.pdf` (2,082 bytes, SHA-256
+  `c403fa400bf3fef93e2e036f3b42afa3e6c8ae0cd31b6a4e4abfb1e0e1f06021`),
+  `xfa-malformed-mismatch.pdf` (2,542 bytes, SHA-256
+  `7a048669437df8ba8dd2fd4456136846895065a53b3cf3395fba532fbf53bbad`),
+  `xfa-malformed-oversized.pdf` (13,691 bytes, SHA-256
+  `426f188a0144744798129ce80aa53d1d005a50e29b06dffffa4faae989ff725c`) —
+  malformed XFA fixtures (built through the same generator with bad XML);
+  each must reject with a 422 naming the problem.
+- `xfa-encrypted.pdf` — the static fixture re-encrypted with an empty user
+  password (PR #55 decryptor path + XFA inspect interaction). 4,186 bytes,
+  SHA-256 `2f14b597a71210789c4cae58316537bf8828b6790f3941ddd3e99475af314aa3`.
+  NOTE: regenerating via `tests/xfa-generate-fixtures.mts` is
+  content-equivalent but not byte-identical — pdf-lib assigns fresh
+  document IDs per save and pypdf fresh encryption IDs, so SHAs change
+  on regeneration; the SHAs above are the committed bytes.
+
+## PDF-import fix (F5) fixtures
+
 - `pdf-test.pdf` — THE INCIDENT FILE. Exact live bytes captured from
   https://www.orimi.com/pdf-test.pdf (the public test PDF from orimi.com),
   20,597 bytes, SHA-256

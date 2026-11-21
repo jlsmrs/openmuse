@@ -24,7 +24,7 @@ import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
-import { Files } from "./files.ts";
+import { Files, isValidSearchDate } from "./files.ts";
 import { GeneratedImages } from "./generated-images.ts";
 import { GoogleAuth } from "./google-auth.ts";
 import {
@@ -340,6 +340,17 @@ export async function createApp(
     return c.json({ ok: true });
   });
   app.get("/api/files", async (c) => c.json(await files.list(c.get("owner"))));
+  app.get("/api/files/search", async (c) => {
+    const query = z
+      .object({
+        q: z.string().max(500).optional(),
+        formKind: z.enum(["acroform", "xfa-static", "xfa-dynamic", "none"]).optional(),
+        from: z.string().refine(isValidSearchDate, "from must be a valid date").optional(),
+        to: z.string().refine(isValidSearchDate, "to must be a valid date").optional(),
+      })
+      .parse(c.req.query());
+    return c.json(await files.search(c.get("owner"), query));
+  });
   app.get("/api/generated-images", async (c) => c.json(await generatedImages.list(c.get("owner"))));
   app.get("/api/generated-images/:name/content", async (c) => {
     const { bytes, mimeType } = await generatedImages.bytes(c.req.param("name"));
@@ -407,6 +418,10 @@ export async function createApp(
       .object({ fields: z.record(z.string(), z.union([z.string(), z.boolean()])) })
       .parse(await c.req.json());
     return c.json(await files.fill(c.get("owner"), c.req.param("id"), body.fields), 201);
+  });
+  app.post("/api/files/:id/pull", async (c) => {
+    const body = z.object({ toOwner: z.string().min(1).max(200) }).parse(await c.req.json());
+    return c.json(await files.pull(c.get("owner"), c.req.param("id"), body.toOwner), 201);
   });
   app.post("/api/mail/import-attachment", async (c) => {
     const body = z.object({ reference: z.string() }).parse(await c.req.json());

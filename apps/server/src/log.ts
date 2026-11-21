@@ -14,6 +14,25 @@ export function backgroundFailure(phase: string, error: unknown) {
   });
 }
 
+/**
+ * Non-throwing background-failure report (B-1, round 9): the shared
+ * wrapper for every cleanup path that must never let logging replace
+ * the error already being handled. A throwing logger (a broken
+ * console, a throwing transport) is unreportable by definition, so
+ * the failure is swallowed here — the caller's original error, and
+ * its control flow, always stand. Used by the pg transaction runner
+ * (`db.ts`, replacing its local `reportCleanupFailure`) and by the
+ * pull-level cleanup in `files.ts`.
+ */
+export function reportBackgroundFailure(phase: string, error: unknown): void {
+  try {
+    backgroundFailure(phase, error);
+  } catch {
+    // Logging must never mask the operation error either; a logging
+    // failure is unreportable by definition.
+  }
+}
+
 /** Provider failures keep status and request ID for support, never bodies or credentials. */
 export function providerFailure(phase: string, error: unknown) {
   const detail = error && typeof error === "object" ? (error as Record<string, unknown>) : {};
