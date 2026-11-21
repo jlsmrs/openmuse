@@ -7112,10 +7112,11 @@ test("H-2 (round 20): an unbound descendant in the SECOND <items> <text> of a ch
   // reported — only items[0] becomes the on-value. itemTexts()
   // guards EVERY <text> anyway, so an unbound descendant there still
   // fails closed. This pins the over-breadth behaviour as INTENDED
-  // (H-3, re-review #19): narrowing the guard to only-consumed
-  // texts would re-open the same class of hole E-3 closed, and the
-  // fail-closed policy treats an unbound prefix as a rejected state
-  // wherever it appears in consumed template text. NOT a defect.
+  // (H-3, re-review #19): the fail-closed policy treats an unbound
+  // prefix as a rejected state wherever it appears in consumed
+  // template text, and guarding every <text> keeps the rule
+  // consistent and simple rather than tracking which texts are
+  // consumed. NOT a defect.
   const bytes = await createXfaPdf(
     wrap(
       '<field name="code"><ui><checkButton/></ui><items><text>ON</text><text><p:b>UNBOUND-OFF</p:b></text></items><bind match="default"/></field>',
@@ -7132,7 +7133,7 @@ test("H-2 (round 20): an unbound descendant in the SECOND <items> <text> of a ch
 });
 
 test("H-2 (round 20): an unbound descendant in a choiceList option text fails closed (probe G4)", async () => {
-  // F-2 covered only the checkButton option path; the choiceList
+  // probe F2 covered only the checkButton option path; the choiceList
   // option path runs through the same itemTexts() guard, so an
   // unbound descendant in an option <text> must fail closed rather
   // than contributing "UNBOUND-OPT" to the options.
