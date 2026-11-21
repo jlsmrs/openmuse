@@ -816,30 +816,6 @@ const XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
 const XFA_DATA_NAMESPACE = "http://www.xfa.org/schema/xfa-data/1.0/";
 
 /**
- * The value of the attribute whose EXPANDED name is
- * `{namespaceUri}localName` on this element (A-2, round 10): the
- * attribute's prefix is resolved through the element's in-scope
- * bindings, so any prefix bound to that namespace matches and a
- * prefix bound elsewhere does not. An unprefixed attribute is in no
- * namespace, so it never matches a namespaced lookup. Returns
- * undefined when no such attribute is present.
- */
-function attrInNamespace(
-  element: XElement,
-  localName: string,
-  namespaceUri: string,
-): string | undefined {
-  for (const [key, value] of Object.entries(element.attrs)) {
-    const raw = key.startsWith("@_") ? key.slice(2) : key;
-    const colon = raw.indexOf(":");
-    if (colon < 0) continue;
-    if (raw.slice(colon + 1) !== localName) continue;
-    if (element.bindings.get(raw.slice(0, colon)) === namespaceUri) return value;
-  }
-  return undefined;
-}
-
-/**
  * The dataset's `dataNode` marking on this element, by expanded name
  * (A-2, round 10): `{http://www.xfa.org/schema/xfa-data/1.0/}dataNode`,
  * whatever prefix the document chose for that namespace. One
@@ -858,22 +834,42 @@ function attrInNamespace(
  * undeclared classify as rich text and report its body text. The
  * literal-`xfa` exception above is the only unbound spelling that
  * is read rather than rejected.
+ *
+ * (E-2, round 18) A namespace DECLARATION is not a `dataNode`
+ * marking: `<note xmlns:dataNode="urn:x">` declares a prefix named
+ * `dataNode`, it does not carry a `dataNode` attribute — the
+ * declaration's prefix is `xmlns`, which is never in `bindings`,
+ * so the unbound check below must skip `xmlns`-prefixed keys
+ * instead of rejecting the declaration as an unknown prefix.
+ * The unbound check and the resolution below are one pass over
+ * the attributes (merged, round 18): the loop collects the first
+ * resolved value and the first literal-`xfa` fallback value while
+ * still throwing on ANY unbound `dataNode` prefix before either
+ * is returned, so a later unbound attribute cannot be masked by
+ * an earlier resolvable one.
  */
 function dataNodeValue(element: XElement): string | undefined {
-  for (const [key] of Object.entries(element.attrs)) {
+  let resolved: string | undefined;
+  let literalXfa: string | undefined;
+  for (const [key, value] of Object.entries(element.attrs)) {
     const raw = key.startsWith("@_") ? key.slice(2) : key;
     const colon = raw.indexOf(":");
     if (colon < 0) continue;
     if (raw.slice(colon + 1) !== "dataNode") continue;
     const prefix = raw.slice(0, colon);
+    if (prefix === "xmlns") continue;
     if (prefix !== "xfa" && !element.bindings.has(prefix))
       throw new XfaError(
         `XFA template/datasets mismatch: element '${shortName(element.local)}' carries a 'dataNode' attribute whose namespace is unknown (an unbound prefix '${shortName(prefix)}'); refusing to classify it`,
       );
+    if (typeof value !== "string") continue;
+    if (element.bindings.get(prefix) === XFA_DATA_NAMESPACE && resolved === undefined)
+      resolved = value;
+    else if (prefix === "xfa" && !element.bindings.has("xfa") && literalXfa === undefined)
+      literalXfa = value;
   }
-  const resolved = attrInNamespace(element, "dataNode", XFA_DATA_NAMESPACE);
   if (resolved !== undefined) return resolved;
-  if (!element.bindings.has("xfa")) return attr(element, "xfa:dataNode");
+  if (!element.bindings.has("xfa")) return literalXfa;
   return undefined;
 }
 
@@ -1245,18 +1241,47 @@ export function pooledLeafCount(): number {
 }
 
 /**
+ * Segment arrays materialized by the most recent joinFields run in
+ * this process (E-4, round 18): `leafSegments()` builds a leaf's
+ * array at most once (memoized — a cache hit counts nothing), so
+ * this counts DISTINCT leaves whose whole segment array was
+ * actually built, always after that leaf's index charge (see
+ * buildJoinIndex). It pins the lazy-memoized materialization
+ * mechanism: the index is the consumer that needs every leaf's
+ * whole path, so on a deep/wide shape it reads the leaf count.
+ * It does NOT, by itself, prove the D-1 allocation fix — the fix
+ * removed array construction BEFORE any charge (the round-16
+ * `[...path, segment]` copy per child), and no counter on the new
+ * code can observe work the new code no longer does. The D-1
+ * defect is proven by the heap probe (panel/probe-rereview17.mts
+ * E5: +39.5 MiB on round-17 code vs +263.0 MiB on round-16 code);
+ * this counter pins the mechanism that replaced it, and the
+ * pooled-leaf counter pins pooling (which the D-1 fix did not
+ * change — see the D-1 test comment). Reset at the start of every
+ * joinFields run, alongside lastPooledLeafCount; same
+ * sequential-test assumption.
+ */
+let lastSegmentArrayCount = 0;
+export function segmentArrayCount(): number {
+  return lastSegmentArrayCount;
+}
+
+/**
  * Lookup-key cache MISSES charged by the most recent joinFields run
  * in this process (a, round 17): lookupSelectors charges the
  * aggregate internal-path budget once per DISTINCT key and caches
  * the key, so a second lookup under the same (scope, leaf name) /
  * (ref, scope) is a hit and charges nothing. This counter is the
  * deterministic observable for that claim — a hit/miss test in
- * the style of pooledLeafCount (a budget-boundary test alone
- * cannot show a hit: a key long enough to trip the budget without
- * its hit would also make the resolved field's public name trip
- * the 1 MiB output bound first). Reset at the start of every
- * joinFields run, alongside lastPooledLeafCount; same
- * sequential-test assumption.
+ * the style of pooledLeafCount (E-9c, round 18 — the earlier
+ * wording claimed a budget-boundary test CANNOT show a hit: that
+ * is not universal. The two boundary designs tried in round 17
+ * (L=1.4M hit, L=600k miss) both made the resolved field's public
+ * name trip the 1 MiB output bound first, so those designs fail —
+ * but a budget-boundary design may exist, and this counter pin
+ * stands on its own rather than as proof that none does). Reset
+ * at the start of every joinFields run, alongside
+ * lastPooledLeafCount; same sequential-test assumption.
  */
 let lastLookupKeyMisses = 0;
 export function lookupKeyMissCount(): number {
@@ -1599,8 +1624,17 @@ function fieldTypeFromUi(uiKind: string): XfaFieldType {
 function itemTexts(node: XElement, preserve = false): string[] {
   const out: string[] = [];
   for (const items of childrenNamed(node, "items")) {
+    // (E-3, round 18) An <items> list establishes a field's options
+    // (or a checkButton's on-values), and each <text> child carries
+    // one option — both are read by local name, so an unbound
+    // prefix on either fails closed here rather than contributing
+    // metadata from an unknown namespace.
+    requireKnownNamespace(items, "an items list");
     const keep = effectiveSpace(items, preserve);
-    for (const text of childrenNamed(items, "text")) out.push(nodeText(text, 0, keep));
+    for (const text of childrenNamed(items, "text")) {
+      requireKnownNamespace(text, "an item text");
+      out.push(nodeText(text, 0, keep));
+    }
   }
   return out;
 }
@@ -1627,9 +1661,12 @@ function buildTemplateField(
   preserve = false,
 ): TemplateField | undefined {
   // (D-2, round 17) An unbound <p:field> establishes no field: its
-  // expanded name is unknown. This also covers option fields inside
-  // an exclGroup, which reach buildTemplateField directly rather
-  // than through collectTemplateFields' loop.
+  // expanded name is unknown. This covers NAMED option fields
+  // inside an exclGroup, which reach buildTemplateField directly
+  // rather than through collectTemplateFields' loop — but NOT
+  // UNNAMED option fields, which the option loop handles without
+  // ever calling this function: those are guarded at the top of
+  // the option loop in collectTemplateFields (E-1, round 18).
   requireKnownNamespace(node, "a template field");
   const keep = effectiveSpace(node, preserve);
   const parentPath = (): string => segmentPath(pathSegments);
@@ -1679,6 +1716,13 @@ function buildTemplateField(
   const context = `field '${shortName(fieldPath)}'`;
   const uiNode = singletonChild(node, "ui", context);
   const uiChildren = uiNode ? elementChildren(uiNode) : [];
+  // (E-3, round 18) The <ui> wrapper and its child establish the
+  // field's type (a <checkButton> makes it a checkbox) and, with
+  // <items>, its on-values — both are read by local name, so an
+  // unbound prefix on either fails closed here rather than setting
+  // field metadata from an unknown namespace.
+  if (uiNode !== undefined) requireKnownNamespace(uiNode, "the ui of a template field");
+  for (const uiChild of uiChildren) requireKnownNamespace(uiChild, "a user-interface element");
   // More than one UI element in one field is malformed: reading the
   // first key off an array-valued ui used to yield a nonsense uiKind.
   if (uiChildren.length > 1)
@@ -1693,6 +1737,13 @@ function buildTemplateField(
   if (uiKind === "checkButton" && items.length > 0) onValues = [items[0]];
   const caption = singletonChild(node, "caption", context);
   const captionKeep = caption !== undefined ? effectiveSpace(caption, keep) : keep;
+  // (E-3, round 18) A caption establishes the field's label, and
+  // its <value> child carries the label text — both are read by
+  // local name, so an unbound prefix on either fails closed here.
+  if (caption !== undefined) requireKnownNamespace(caption, "the caption of a template field");
+  const captionValue =
+    caption !== undefined ? singletonChild(caption, "value", context) : undefined;
+  if (captionValue !== undefined) requireKnownNamespace(captionValue, "a caption value");
   // Caption labels normalize whitespace by default — EXCEPT where the
   // document says it is significant (A-3, round 6; SPEC §1 step 4):
   // normalizePreserving() (A-3, round 7) normalizes only the default
@@ -1709,9 +1760,7 @@ function buildTemplateField(
   // normalizer — an NBSP-only caption was already absent before
   // B-7 and stays absent.)
   const captionText =
-    caption !== undefined
-      ? normalizePreserving(singletonChild(caption, "value", context) ?? caption, captionKeep)
-      : "";
+    caption !== undefined ? normalizePreserving(captionValue ?? caption, captionKeep) : "";
   const label = captionText !== "" ? captionText : undefined;
   const options = uiKind === "choiceList" ? itemTexts(node, keep) : [];
   return {
@@ -1829,7 +1878,7 @@ function collectTemplateFields(
       );
     } else if (child.local === "field") {
       // (D-2) An unbound <p:field> is checked again inside
-      // buildTemplateField (which option fields also reach).
+      // buildTemplateField (which NAMED option fields also reach).
       requireKnownNamespace(child, "a template field");
       const field = buildTemplateField(child, pathSegments, scope, pathBytes, keep);
       if (field) out.push(field);
@@ -1862,6 +1911,14 @@ function collectTemplateFields(
       const options: string[] = [];
       const childBinds: { bind: BindKind; ref: string | undefined }[] = [];
       for (const optionField of childrenNamed(child, "field")) {
+        // (E-1, round 18) Guard FIRST, before the name branches:
+        // an UNNAMED option field never reaches buildTemplateField
+        // (its branch `continue`s below after reading <items>), so
+        // without this check an unbound <p:field> option
+        // contributed public options from an unknown namespace.
+        // Named options are checked again inside
+        // buildTemplateField, as before.
+        requireKnownNamespace(optionField, "a template field");
         const optionName = attr(optionField, "name");
         if (typeof optionName !== "string" || optionName === "") {
           // U-4: an unnamed option inside a NAMED group — a <bind>
@@ -1910,16 +1967,19 @@ function collectTemplateFields(
       }
       const caption = singletonChild(child, "caption", `exclGroup '${shortName(groupPath)}'`);
       const captionKeep = caption !== undefined ? effectiveSpace(caption, groupKeep) : groupKeep;
+      // (E-3, round 18) Same guard as a field caption: the group's
+      // caption and its <value> child establish the group label.
+      if (caption !== undefined) requireKnownNamespace(caption, "the caption of an exclGroup");
+      const captionValue =
+        caption !== undefined
+          ? singletonChild(caption, "value", `exclGroup '${shortName(groupPath)}'`)
+          : undefined;
+      if (captionValue !== undefined) requireKnownNamespace(captionValue, "a caption value");
       // Same per-subtree normalization as a field caption (A-3,
       // round 7): a preserved descendant survives even when the group
       // caption itself carries no preserve.
       const captionText =
-        caption !== undefined
-          ? normalizePreserving(
-              singletonChild(caption, "value", `exclGroup '${shortName(groupPath)}'`) ?? caption,
-              captionKeep,
-            )
-          : "";
+        caption !== undefined ? normalizePreserving(captionValue ?? caption, captionKeep) : "";
       out.push({
         somPath: groupPath,
         leafName: name,
@@ -1954,7 +2014,13 @@ function collectTemplateFields(
  * a deep chain × many sibling leaves costs one node per element,
  * not one array per leaf per segment. The cumulative bytes let
  * buildJoinIndex charge the aggregate internal-path bound BEFORE
- * materializing any key string (see there).
+ * materializing any key string (see there). (E-8, round 18)
+ * `bytes` and `depth` are read ONLY while constructing the next
+ * child's cumulative state in collectDataLeaves (each child's
+ * counts are computed from its parent's) — no downstream consumer
+ * reads them beyond that. That narrower observation replaces the
+ * "dead state" claim: they are live construction inputs, not dead
+ * fields, and must NOT be deleted.
  */
 interface SegPath {
   segment: string;
@@ -1980,12 +2046,18 @@ function segPathSegments(path: SegPath | null): string[] {
  * memoized on the leaf (D-1, round 17). Callers that need only the
  * leaf name, or only the cumulative byte counts, must NOT call
  * this — use `leaf.segPath.segment` / `leaf.segPath.bytes` /
- * `leaf.segPath.strippedBytes` instead, so unmatched leaves never
- * pay for an array.
+ * `leaf.segPath.strippedBytes` instead. (E-8, round 18) The
+ * "unmatched leaves never pay" reading of that advice is FALSE
+ * once the index runs: buildJoinIndex materializes EVERY indexed
+ * leaf's array (after charging its bytes — see there), so the
+ * avoidance matters only for callers that would pay BEFORE the
+ * index charge. Only leaves that never reach the index — a
+ * field-less inspect skips collection entirely — never pay.
  */
 function leafSegments(leaf: DataLeaf): string[] {
   const cached = leaf.segmentsCache;
   if (cached !== undefined) return cached;
+  lastSegmentArrayCount += 1;
   const segments = segPathSegments(leaf.segPath);
   leaf.segmentsCache = segments;
   return segments;
@@ -2010,18 +2082,25 @@ interface DataLeaf {
    * chain × 20,000 sibling leaves allocated ~840k segment
    * references (plus one array object per leaf) with a field
    * present — the field-less skip never ran. The array is now
-   * materialized only on demand, per leaf, by `leafSegments()`
-   * (memoized on the leaf), and only where a consumer actually
-   * needs the whole path; the leaf name is read O(1) off the
-   * terminal node, and the index charges path bytes from the
-   * node's cumulative byte counts BEFORE any materialization.
+   * materialized on demand, per leaf, by `leafSegments()`
+   * (memoized on the leaf) — and the index is the consumer that
+   * needs EVERY leaf's whole path, after charging it (E-8, round
+   * 18: the earlier "only where a consumer actually needs the
+   * whole path" wording understated that; every indexed leaf pays
+   * once). The leaf name is read O(1) off the terminal node, and
+   * the index charges path bytes from the node's cumulative byte
+   * counts BEFORE any materialization.
    */
   segPath: SegPath | null;
   /**
    * Memoized materialization of `segPath` (see leafSegments): built
    * at most once per leaf, the first time a consumer needs the whole
-   * segment array. Leaves that are never matched, never indexed
-   * past their name, and never reported never pay for it.
+   * segment array. (E-8, round 18) That consumer is, in practice,
+   * buildJoinIndex, which materializes every indexed leaf's array
+   * (after its charge) — so "never matched, never indexed past
+   * their name, and never reported never pay" holds only for leaves
+   * that never reach the index at all, i.e. a field-less inspect,
+   * which skips collection entirely.
    */
   segmentsCache?: string[];
   /**
@@ -3558,11 +3637,13 @@ function mergeDuplicate(previous: ResolvedFieldEntry, incoming: XfaField): numbe
  * in count or in bytes.
  */
 function joinFields(templateFields: TemplateField[], leaves: DataLeaf[]): XfaField[] {
-  // Diagnostic counters (b/j/a, round 17): distinct leaves pooled
-  // and lookup-key cache misses charged by this run — reset here,
-  // counted in the pooling loop and in lookupSelectors below.
+  // Diagnostic counters (b/j/a, round 17; E-4, round 18): distinct
+  // leaves pooled, lookup-key cache misses charged, and segment
+  // arrays materialized by this run — reset here, counted in the
+  // pooling loop and in lookupSelectors below.
   lastPooledLeafCount = 0;
   lastLookupKeyMisses = 0;
+  lastSegmentArrayCount = 0;
   // Group occurrences by somPath, in first-occurrence order.
   const groups = new Map<string, TemplateField[]>();
   for (const field of templateFields) {
