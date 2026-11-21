@@ -6357,8 +6357,8 @@ test("D-3 (round 17): a literal xfa:dataNode still defeats the group (probe D4b 
   // at all. This version declares no `xfa` prefix anywhere: the
   // datasets roots are unprefixed <datasets>/<data>, and the note
   // carries the literal spelling only. The declared-prefix spelling
-  // is covered by the D4c control below (same attrInNamespace path,
-  // any prefix bound to the XFA data namespace).
+  // is covered by the D4c control below (the resolved branch of
+  // dataNodeValue, any prefix bound to the XFA data namespace).
   const bytes = await createXfaPdf({
     templateXml:
       '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="note"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
@@ -6754,4 +6754,279 @@ test("E-3 (round 18): a DECLARED <p:checkButton/> still makes a checkbox (probe 
   assert.deepEqual(result.fields, [
     { name: "form.code", value: "1", type: "checkbox", onValues: ["1"] },
   ]);
+});
+
+// --- B1 fix round 19 (re-review #18, EXPANDED PANEL, Nov 21, 2026) --------
+// Regression tests for the converged findings F-1 (unbound descendants
+// in consumed template text), F-2 (stale attrInNamespace reference in
+// the D4b comment — comment-only, no test), and F-3 (unpinned guards).
+// Probe shapes are noted per test. F-1's guard is scoped to the
+// template-metadata call sites (itemTexts + the two caption paths):
+// nodeText()/collectTextSegments() themselves are shared with dataset
+// rich-text flattening, where unbound descendants are handled by the
+// classifier — so the guard lives at the call sites, not in the
+// shared flatteners. Controls pin the boundary: declared-prefix and
+// no-namespace descendants keep their labels/on-values.
+
+test("F-1 (round 19): an unbound descendant inside a caption <value> fails closed (probe F1)", async () => {
+  // E-3 guarded the <caption>/<value> wrappers, but
+  // normalizePreserving() recursed into their descendants unchecked,
+  // so <p:text>UNBOUND-LABEL</p:text> became the field's label.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><p:text>UNBOUND-LABEL</p:text></value></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:text.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-LABEL/);
+    return true;
+  });
+});
+
+test("F-1 (round 19): a DECLARED descendant inside a caption <value> still labels (probe F1b control)", async () => {
+  // Control: the same descendant with `p` DECLARED is a known
+  // foreign namespace and must still supply the label.
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><p:text>DECLARED-LABEL</p:text></value></caption></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>V</code></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "V", type: "text", label: "DECLARED-LABEL" },
+  ]);
+});
+
+test("F-1 (round 19): plain nested markup inside a caption <value> still labels (probe F1c control)", async () => {
+  // Control: a no-namespace nested element is legacy markup, not an
+  // unknown namespace — its text still supplies the label.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><value><b>PLAIN-LABEL</b></value></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "V", type: "text", label: "PLAIN-LABEL" },
+  ]);
+});
+
+test("F-1 (round 19): an unbound descendant inside an <items> <text> fails closed (probe F2)", async () => {
+  // E-3 guarded the <items>/<text> wrappers, but nodeText() recursed
+  // into their descendants unchecked, so <p:b>UNBOUND-ON</p:b> became
+  // the checkButton's on-value — semantic metadata, not display text.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><checkButton/></ui><items><text><p:b>UNBOUND-ON</p:b></text><text>0</text></items><bind match="default"/></field>',
+      `<code>0</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:b.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-ON/);
+    return true;
+  });
+});
+
+test("F-1 (round 19): a DECLARED descendant inside an <items> <text> still supplies the on-value (probe F2b control)", async () => {
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><field name="code"><ui><checkButton/></ui><items><text><p:b>DECLARED-ON</p:b></text><text>0</text></items><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>0</code></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "0", type: "checkbox", onValues: ["DECLARED-ON"] },
+  ]);
+});
+
+test("F-1 (round 19): plain nested markup inside an <items> <text> still supplies the on-value (probe F2c control)", async () => {
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><checkButton/></ui><items><text><b>PLAIN-ON</b></text><text>0</text></items><bind match="default"/></field>',
+      `<code>0</code>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "0", type: "checkbox", onValues: ["PLAIN-ON"] },
+  ]);
+});
+
+test("F-1 (round 19): an unbound descendant inside an exclGroup caption fails closed (probe F3)", async () => {
+  // Same gap in the group caption path: the exclGroup's caption is
+  // normalized through the same normalizePreserving() call, so an
+  // unbound descendant there became the group's label.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<exclGroup name="pay"><bind match="default"/><caption><value><p:text>UNBOUND-GROUP-LABEL</p:text></value></caption><field><items><text>OPT</text></items></field></exclGroup>',
+      `<pay>OPT</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:text.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-GROUP-LABEL/);
+    return true;
+  });
+});
+
+test("F-1 (round 19): a DECLARED descendant inside an exclGroup caption still labels (probe F3b control)", async () => {
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><exclGroup name="pay"><bind match="default"/><caption><value><p:text>DECLARED-GROUP-LABEL</p:text></value></caption><field><items><text>OPT</text></items></field></exclGroup></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><pay>OPT</pay></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    {
+      name: "form.pay",
+      value: "OPT",
+      type: "unsupported",
+      options: ["OPT"],
+      label: "DECLARED-GROUP-LABEL",
+    },
+  ]);
+});
+
+test("F-1 (round 19): an unbound descendant inside a bare caption fails closed (probe F4)", async () => {
+  // No <value> child: the caption itself is the consumed subtree,
+  // so the same descendant gap applies without any wrapper at all.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><p:text>UNBOUND-BARE-LABEL</p:text></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:text.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNBOUND-BARE-LABEL/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): an unbound <p:items> wrapper fails closed", async () => {
+  // Pin: the <items> guard (E-3) is exercised directly — the list
+  // itself carries the unbound prefix, not its <text> child.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><p:items><text>OPT</text></p:items><bind match="default"/></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:items.*unbound prefix/);
+    assert.doesNotMatch(error.message, /OPT/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): an unbound <p:text> inside <items> fails closed", async () => {
+  // Pin: the <text> child itself carries the unbound prefix (the
+  // F-1 defect was its DESCENDANT; this pins the wrapper itself).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><items><p:text>OPT</p:text></items><bind match="default"/></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:text.*unbound prefix/);
+    assert.doesNotMatch(error.message, /OPT/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): an unbound <p:caption> wrapper fails closed", async () => {
+  // Pin: the <caption> itself carries the unbound prefix.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><p:caption><value>LABEL</value></p:caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:caption.*unbound prefix/);
+    assert.doesNotMatch(error.message, /LABEL/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): an unbound <p:value> inside a caption fails closed", async () => {
+  // Pin: the <value> child itself carries the unbound prefix (the
+  // F-1 defect was its DESCENDANT; this pins the wrapper itself).
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><textEdit/></ui><bind match="default"/><caption><p:value>LABEL</p:value></caption></field>',
+      `<code>V</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:value.*unbound prefix/);
+    assert.doesNotMatch(error.message, /LABEL/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): an unbound <p:caption> on an exclGroup fails closed", async () => {
+  // Pin: the exclGroup caption guard (E-3) exercised directly — the
+  // group's own caption carries the unbound prefix.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<exclGroup name="pay"><bind match="default"/><p:caption><value>GROUP-LABEL</value></p:caption><field><items><text>OPT</text></items></field></exclGroup>',
+      `<pay>OPT</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:caption.*unbound prefix/);
+    assert.doesNotMatch(error.message, /GROUP-LABEL/);
+    return true;
+  });
+});
+
+test("F-3 (round 19): a later unbound dataNode attribute still fails closed alongside an earlier resolvable one", async () => {
+  // Pin: dataNodeValue's single merged pass (E-2, round 18) collects
+  // the first resolved value but still throws on ANY unbound
+  // dataNode prefix before returning it — so an earlier resolvable
+  // `p:dataNode` (bound to the XFA data namespace) must NOT mask a
+  // later unbound `q:dataNode`. The shape would otherwise resolve
+  // to "has no data node" (the marking defeats the group); the
+  // unbound-prefix error must win instead, and "Inside" must never
+  // be reported.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:p="http://www.xfa.org/schema/xfa-data/1.0/" p:dataNode="dataGroup" q:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /dataNode.*unbound prefix/);
+    assert.doesNotMatch(error.message, /Inside/);
+    return true;
+  });
 });
