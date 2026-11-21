@@ -6,6 +6,7 @@ import {
   countXmlScanSteps,
   lookupKeyMissCount,
   pooledLeafCount,
+  segmentArrayCount,
 } from "../packages/integrations/src/xfa.ts";
 import { createXfaPdf, staticDatasetsXml, staticTemplateXml } from "./xfa-fixtures.ts";
 
@@ -6066,9 +6067,13 @@ test("C-7 (round 16): a <head> directly under the <xhtml> frame root is metadata
 // cache hit/miss, "join lookup exceeds", separate C-6 tests,
 // dedupe counter, field-less SOM-name scope, exData node-side
 // consistency). Probe shapes are noted per test. All assertions
-// are value/error/counter assertions — no timing thresholds except
-// the one gross-slowness guard on the D-1 shape, in the style of
-// the existing U2 guard.
+// are value/error/counter assertions, with ONE timing assertion:
+// the D-1 test's gross-slowness guard (elapsed < 20 s, in the style
+// of the existing U2 guard) — a slowness guard, not a performance
+// measurement. (E-9a, round 18) The earlier wording here ("no timing
+// thresholds except the one gross-slowness guard") understated it:
+// the D-1 test DOES assert on elapsed time, and that is the only
+// timing assertion in this block.
 // Test-breakdown correction (4a): the round-16 brief claimed C-1 ×2,
 // C-5 ×3, C-6 ×2, C-7 ×3; the diff actually has C-1 ×1, C-5 ×2,
 // C-6 ×1, C-7 ×5 (total still 19). The missing tests are added
@@ -6086,10 +6091,18 @@ test("D-1 (round 17): a field-present deep/wide form resolves its one field (pro
   // segment path is now parent-linked (one SegPath node per
   // element, shared by the subtree), the occurrence index is built
   // lazily per bucket, and the 20,000 sibling leaves are never
-  // pooled — the deterministic counter below pins that last point
-  // (pooledLeafCount() === 1: only the matched `ok` leaf).
-  // Assertion-based: the one field, its value, and the pooled
-  // count; the gross time guard is the U2-style slowness guard only.
+  // pooled (pooledLeafCount() === 1: only the matched `ok` leaf).
+  // (E-4, round 18) The pooled-leaf counter does NOT pin the
+  // allocation fix — pooling is unchanged by it (the siblings were
+  // never pooled on round-16 code either); it pins pooling only.
+  // segmentArrayCount() === 20,001 pins the lazy-memoized
+  // materialization mechanism instead: every indexed leaf's array
+  // is built exactly once, after its charge (20,000 siblings + the
+  // `ok` leaf). The allocation fix itself is proven by the heap
+  // probe (panel/probe-rereview17.mts E5), not by either counter.
+  // Assertion-based: the one field, its value, and the two
+  // counters; the gross time guard is the U2-style slowness guard
+  // only — and it IS a timing assertion (see the block header).
   let inner = Array.from({ length: 20000 }, (_, i) => `<leaf${i}/>`).join("");
   for (let d = 40; d >= 1; d--) inner = `<d${d}>${inner}</d${d}>`;
   const bytes = await createXfaPdf({
@@ -6102,6 +6115,7 @@ test("D-1 (round 17): a field-present deep/wide form resolves its one field (pro
   assert.ok(Date.now() - started < 20000, `D-1 inspect took ${Date.now() - started}ms`);
   assert.deepEqual(result.fields, [{ name: "form.ok", value: "V", type: "text" }]);
   assert.equal(pooledLeafCount(), 1);
+  assert.equal(segmentArrayCount(), 20001);
 });
 
 test("D-1 (round 17): the bind-none variant of the deep/wide shape also resolves (probe D1b shape)", async () => {
@@ -6335,14 +6349,22 @@ test("D-3 (round 17): an unbound p:dataNode attribute fails closed (probe D4)", 
 
 test("D-3 (round 17): a literal xfa:dataNode still defeats the group (probe D4b control)", async () => {
   // Control: the documented literal-`xfa:dataNode` fallback — the
-  // `xfa` prefix UNDECLARED — is still read as the XFA marking, so
-  // the field has no data node.
-  const bytes = await createXfaPdf(
-    wrap(
-      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
-      `<note xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/" xfa:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
-    ),
-  );
+  // `xfa` prefix UNDECLARED anywhere in scope — is still read as
+  // the XFA marking, so the field has no data node. (E-5, round
+  // 18) The earlier version of this test declared `xmlns:xfa` on
+  // the <note> AND inherited it from wrap()'s datasets root, so it
+  // never reached the fallback path (`!element.bindings.has("xfa")`)
+  // at all. This version declares no `xfa` prefix anywhere: the
+  // datasets roots are unprefixed <datasets>/<data>, and the note
+  // carries the literal spelling only. The declared-prefix spelling
+  // is covered by the D4c control below (same attrInNamespace path,
+  // any prefix bound to the XFA data namespace).
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/"><subform name="form" layout="tb"><field name="note"><ui><textEdit/></ui><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<datasets><data><form><note xfa:dataNode="dataGroup"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note></form></data></datasets>',
+  });
   await assert.rejects(inspectPdf(bytes), (error: unknown) => {
     assert.ok(error instanceof Error);
     assert.equal((error as { status?: number }).status, 422);
@@ -6374,6 +6396,11 @@ test("D-3/h (round 17): an unbound <p:exData> wrapper standing as the bound node
   // binds to the wrapper node itself, with a sibling so the parent
   // does not classify as rich text first), its bare <xhtml> child
   // must not classify the wrapper as a rich-text leaf.
+  // (E-6, round 18) This test discriminates on the ERROR MESSAGE,
+  // not on the 422-vs-value outcome: without the node-side guard
+  // the same shape still fails closed via the C-2 parent-side
+  // check, with different wording — only the "has no data node"
+  // wording for the bound node itself pins the node-side guard.
   const bytes = await createXfaPdf(
     wrap(
       '<subform name="note"><field name="exData"><ui><textEdit/></ui><bind match="default"/></field></subform>',
@@ -6415,10 +6442,13 @@ test("C-1 (round 17): a second lookup under the same scope and leaf name reuses 
   // and fail closed on the public-name collision — the collision
   // error (not a budget error) is itself the evidence the second
   // lookup ran, and lookupKeyMissCount() === 1 proves it was a
-  // hit. A budget-boundary test alone cannot show a hit: a key
-  // long enough to trip the budget without its hit would also
-  // make the resolved field's public name trip the 1 MiB output
-  // bound first (see the lookup-exceeds test below).
+  // hit. (E-9c, round 18) The earlier wording claimed a
+  // budget-boundary test alone CANNOT show a hit: that is not
+  // universal. The two boundary designs tried in round 17 (L=1.4M
+  // hit, L=600k miss) both made the resolved field's public name
+  // trip the 1 MiB output bound first, so those designs fail — but
+  // a budget-boundary design may exist, and this counter pin stands
+  // on its own rather than as proof that none does.
   const bytes = await createXfaPdf(
     wrap(
       '<subform name="s"><bind match="dataRef" ref="$data.form.shared"/><field name="code"><ui><textEdit/></ui><bind match="default"/></field></subform>' +
@@ -6574,4 +6604,154 @@ test("C-5/e (round 17): the field-less skip also drops collection-time SOM-name 
     assert.match(error.message, /cannot be represented in a SOM path/);
     return true;
   });
+});
+
+// --- B1 fix round 18 (re-review #17, SONNET TEST, Nov 21, 2026) --------
+// Regression tests for the converged findings (E-1 unnamed unbound
+// exclGroup option — the round-17 P1; E-2 xmlns:dataNode false
+// rejection; E-3 unbound ui/items/caption/value metadata) plus the
+// re-review's test-adequacy items (E-4 segment-array counter in the
+// D-1 test, E-5 genuine undeclared-xfa D4b, E-6 (h) message
+// discrimination, E-9a timing wording, E-9c cache-hit wording —
+// those five are comment/test-shape corrections in the round-17
+// block above, not new tests here). Probe shapes are noted per
+// test. All assertions are value/error/counter assertions; no test
+// in this block asserts on elapsed time.
+
+test("E-1 (round 18): an unnamed unbound option field in an exclGroup fails closed (probe E1)", async () => {
+  // The unnamed-option branch read <items> and contributed the
+  // option without ever reaching buildTemplateField, so its
+  // requireKnownNamespace never ran: form.pay reported options
+  // ["UNDEFINED-OPTION"] from an unbound <p:field>. The guard now
+  // runs at the top of the option loop, before the name branches.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<exclGroup name="pay"><bind match="default"/><p:field><items><text>UNDEFINED-OPTION</text></items></p:field></exclGroup>',
+      `<pay>VALUE</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:field.*unbound prefix/);
+    assert.doesNotMatch(error.message, /UNDEFINED-OPTION/);
+    return true;
+  });
+});
+
+test("E-1 (round 18): a DECLARED unnamed option field in an exclGroup still reports (probe E1b control)", async () => {
+  // Control: the same option with `p` DECLARED is a known foreign
+  // namespace and must still report as the group's option.
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><exclGroup name="pay"><bind match="default"/><p:field><items><text>DECLARED-OPTION</text></items></p:field></exclGroup></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><pay>VALUE</pay></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.pay", value: "VALUE", type: "unsupported", options: ["DECLARED-OPTION"] },
+  ]);
+});
+
+test("E-1 (round 18): a NAMED unbound option field in an exclGroup still fails closed (probe E1c control)", async () => {
+  // Control: the named path was already guarded (via
+  // buildTemplateField) — the hole was exactly the unnamed branch.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<exclGroup name="pay"><bind match="default"/><p:field name="x"><items><text>OPT</text></items></p:field></exclGroup>',
+      `<pay>VALUE</pay>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:field.*unbound prefix/);
+    assert.doesNotMatch(error.message, /OPT/);
+    return true;
+  });
+});
+
+test("E-2 (round 18): a legal xmlns:dataNode declaration is not an unbound prefix (probe E2)", async () => {
+  // `<note xmlns:dataNode="urn:x">` DECLARES a prefix named
+  // `dataNode`; it carries no dataNode attribute. The old
+  // dataNodeValue loop read the declaration's `xmlns` prefix
+  // against `bindings` (which never contains "xmlns") and threw
+  // "unbound prefix 'xmlns'". The note is plain rich text and must
+  // report "Inside", exactly like the E2c control.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note xmlns:dataNode="urn:x"><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("E-2 (round 18): a plain rich-text note still reports its body text (probe E2c control)", async () => {
+  // Control: no dataNode attribute at all — the note classifies as
+  // rich text and reports "Inside". (The E2b control — a DECLARED
+  // p:dataNode="dataGroup" failing closed with "has no data node" —
+  // is the round-17 D4c test; not duplicated here.)
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="note"><ui><textEdit/></ui><bind match="default"/></field>',
+      `<note><xhtml xmlns="http://www.w3.org/1999/xhtml"><body>Inside</body></xhtml></note>`,
+    ),
+  );
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [{ name: "form.note", value: "Inside", type: "unsupported" }]);
+});
+
+test("E-3 (round 18): an unbound <p:checkButton/> inside <ui> fails closed (probe E3)", async () => {
+  // The <ui> child was read by local name without a namespace
+  // check, so an unbound <p:checkButton/> still made the field a
+  // checkbox with on-values ["1"]. The value itself was correct —
+  // this is a policy-completeness gap (P2), not a wrong value.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><ui><p:checkButton/></ui><items><text>1</text><text>0</text></items><bind match="default"/></field>',
+      `<code>1</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:checkButton.*unbound prefix/);
+    return true;
+  });
+});
+
+test("E-3 (round 18): an unbound <p:ui> wrapper fails closed (probe E3b)", async () => {
+  // The <ui> element itself was read by local name, so an unbound
+  // <p:ui> wrapper around a checkButton likewise established UI
+  // semantics from an unknown namespace.
+  const bytes = await createXfaPdf(
+    wrap(
+      '<field name="code"><p:ui><checkButton/></p:ui><items><text>1</text><text>0</text></items><bind match="default"/></field>',
+      `<code>1</code>`,
+    ),
+  );
+  await assert.rejects(inspectPdf(bytes), (error: unknown) => {
+    assert.ok(error instanceof Error);
+    assert.equal((error as { status?: number }).status, 422);
+    assert.match(error.message, /p:ui.*unbound prefix/);
+    return true;
+  });
+});
+
+test("E-3 (round 18): a DECLARED <p:checkButton/> still makes a checkbox (probe E3c control)", async () => {
+  // Control: the same UI with `p` DECLARED is a known foreign
+  // namespace — checkbox type and on-values ["1"] are correct.
+  const bytes = await createXfaPdf({
+    templateXml:
+      '<template xmlns="http://www.xfa.org/schema/xfa-template/3.3/" xmlns:p="urn:example:tmpl"><subform name="form" layout="tb"><field name="code"><ui><p:checkButton/></ui><items><text>1</text><text>0</text></items><bind match="default"/></field></subform></template>',
+    datasetsXml:
+      '<xfa:datasets xmlns:xfa="http://www.xfa.org/schema/xfa-data/1.0/"><xfa:data><form><code>1</code></form></xfa:data></xfa:datasets>',
+  });
+  const result = await inspectPdf(bytes);
+  assert.deepEqual(result.fields, [
+    { name: "form.code", value: "1", type: "checkbox", onValues: ["1"] },
+  ]);
 });
